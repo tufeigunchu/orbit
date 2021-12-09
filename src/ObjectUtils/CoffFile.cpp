@@ -16,9 +16,10 @@
 
 #include <system_error>
 
+#include "GrpcProtos/symbol.pb.h"
+#include "ObjectUtils/WindowsBuildIdUtils.h"
 #include "OrbitBase/Logging.h"
 #include "OrbitBase/Result.h"
-#include "symbol.pb.h"
 
 namespace orbit_object_utils {
 
@@ -45,6 +46,7 @@ class CoffFileImpl : public CoffFile {
  private:
   ErrorMessageOr<uint64_t> GetSectionOffsetForSymbol(const llvm::object::SymbolRef& symbol_ref);
   ErrorMessageOr<SymbolInfo> CreateSymbolInfo(const llvm::object::SymbolRef& symbol_ref);
+  [[nodiscard]] bool AreDebugSymbolsEmpty() const;
   const std::filesystem::path file_path_;
   llvm::object::OwningBinary<llvm::object::ObjectFile> owning_binary_;
   llvm::object::COFFObjectFile* object_file_;
@@ -111,7 +113,30 @@ ErrorMessageOr<ModuleSymbols> CoffFileImpl::LoadDebugSymbols() {
   return module_symbols;
 }
 
-bool CoffFileImpl::HasDebugSymbols() const { return has_debug_info_; }
+bool CoffFileImpl::HasDebugSymbols() const { return has_debug_info_ && !AreDebugSymbolsEmpty(); }
+
+bool CoffFileImpl::AreDebugSymbolsEmpty() const {
+  const auto dwarf_context = llvm::DWARFContext::create(*owning_binary_.getBinary());
+  if (dwarf_context == nullptr) {
+    ERROR("Could not create DWARF context.");
+    return true;
+  }
+
+  for (const auto& info_section : dwarf_context->compile_units()) {
+    for (uint32_t index = 0; index < info_section->getNumDIEs(); ++index) {
+      llvm::DWARFDie full_die = info_section->getDIEAtIndex(index);
+      if (!full_die.isSubprogramDIE()) continue;
+
+      uint64_t low_pc;
+      uint64_t high_pc;
+      uint64_t unused_section_index;
+      if (full_die.getLowAndHighPC(low_pc, high_pc, unused_section_index)) {
+        return false;
+      }
+    }
+  }
+  return true;
+}
 
 const std::filesystem::path& CoffFileImpl::GetFilePath() const { return file_path_; }
 
@@ -160,15 +185,7 @@ std::string CoffFileImpl::GetBuildId() const {
     LOG("WARNING: No PDB debug info found, cannot form build id (ignoring).");
     return "";
   }
-  std::string build_id;
-  for (const uint8_t& byte : pdb_debug_info.value().guid) {
-    absl::StrAppend(&build_id, absl::Hex(byte, absl::kZeroPad2));
-  }
-
-  // The dash ("-") is intentional to make it easy to distinguish the age when debugging issues
-  // related to build id.
-  absl::StrAppend(&build_id, absl::StrFormat("-%i", pdb_debug_info.value().age));
-  return build_id;
+  return ComputeWindowsBuildId(pdb_debug_info.value().guid, pdb_debug_info.value().age);
 }
 
 }  // namespace

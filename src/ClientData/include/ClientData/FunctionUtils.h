@@ -12,9 +12,9 @@
 #include <string>
 
 #include "ClientData/ModuleData.h"
+#include "ClientProtos/capture_data.pb.h"
+#include "GrpcProtos/symbol.pb.h"
 #include "ProcessData.h"
-#include "capture_data.pb.h"
-#include "symbol.pb.h"
 
 namespace orbit_client_data::function_utils {
 
@@ -43,6 +43,8 @@ namespace orbit_client_data::function_utils {
 [[nodiscard]] std::unique_ptr<orbit_client_protos::FunctionInfo> CreateFunctionInfo(
     const orbit_grpc_protos::SymbolInfo& symbol_info, const std::string& module_path,
     const std::string& module_build_id);
+
+[[nodiscard]] bool IsFunctionSelectable(const orbit_client_protos::FunctionInfo& function);
 
 }  // namespace orbit_client_data::function_utils
 

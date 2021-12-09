@@ -24,12 +24,10 @@ class ModulesDataView : public DataView {
 
   const std::vector<Column>& GetColumns() override;
   int GetDefaultSortingColumn() override { return kColumnFileSize; }
-  std::vector<std::string> GetContextMenu(int clicked_index,
-                                          const std::vector<int>& selected_indices) override;
+  std::vector<std::vector<std::string>> GetContextMenuWithGrouping(
+      int clicked_index, const std::vector<int>& selected_indices) override;
   std::string GetValue(int row, int column) override;
 
-  void OnContextMenu(const std::string& action, int menu_index,
-                     const std::vector<int>& item_indices) override;
   void OnDoubleClicked(int index) override;
   bool WantsDisplayColor() override { return true; }
   bool GetDisplayColor(int row, int column, unsigned char& red, unsigned char& green,
@@ -46,7 +44,7 @@ class ModulesDataView : public DataView {
   void DoFilter() override;
 
  private:
-  [[nodiscard]] orbit_client_data::ModuleData* GetModule(uint32_t row) const {
+  [[nodiscard]] orbit_client_data::ModuleData* GetModuleDataFromRow(int row) const override {
     return start_address_to_module_.at(indices_[row]);
   }
 
@@ -55,16 +53,13 @@ class ModulesDataView : public DataView {
   absl::flat_hash_map<uint64_t, orbit_client_data::ModuleData*> start_address_to_module_;
 
   enum ColumnIndex {
+    kColumnLoaded,
     kColumnName,
     kColumnPath,
     kColumnAddressRange,
-    kColumnFileSize,
-    kColumnLoaded,
+    kColumnFileSize,  // Default sorting column
     kNumColumns
   };
-
-  static const std::string kMenuActionLoadSymbols;
-  static const std::string kMenuActionVerifyFramePointers;
 };
 
 }  // namespace orbit_data_views

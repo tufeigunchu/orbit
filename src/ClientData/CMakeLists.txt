@@ -22,12 +22,17 @@ target_sources(ClientData PUBLIC
         include/ClientData/ModuleManager.h
         include/ClientData/PostProcessedSamplingData.h
         include/ClientData/ProcessData.h
+        include/ClientData/ScopeTreeTimerData.h
+        include/ClientData/ThreadTrackDataManager.h
+        include/ClientData/ThreadTrackDataProvider.h
         include/ClientData/TimerChain.h
+        include/ClientData/TimerTrackDataIdManager.h
+        include/ClientData/TimerData.h
+        include/ClientData/TimerDataInterface.h
+        include/ClientData/TimerDataManager.h
         include/ClientData/TimestampIntervalSet.h
         include/ClientData/TracepointCustom.h
         include/ClientData/TracepointData.h
-        include/ClientData/TrackDataManager.h
-        include/ClientData/TrackData.h
         include/ClientData/UserDefinedCaptureData.h)
 
 target_sources(ClientData PRIVATE
@@ -39,13 +44,18 @@ target_sources(ClientData PRIVATE
         ModuleManager.cpp
         PostProcessedSamplingData.cpp
         ProcessData.cpp
+        ScopeTreeTimerData.cpp
+        ThreadTrackDataProvider.cpp
         TimerChain.cpp
+        TimerData.cpp
+        TimerTrackDataIdManager.cpp
         TimestampIntervalSet.cpp
         TracepointData.cpp
         UserDefinedCaptureData.cpp)
 
 target_link_libraries(ClientData PUBLIC
         ApiInterface
+        Containers
         ClientProtos
         GrpcProtos
         # TODO(b/191248550): Remove ObjectUtils once GetAbsoluteAddress is removed
@@ -57,13 +67,18 @@ target_link_libraries(ClientData PUBLIC
 add_executable(ClientDataTests)
 target_sources(ClientDataTests PRIVATE
         CallstackDataTest.cpp
+        DataManagerTest.cpp
         FunctionInfoSetTest.cpp
         ModuleDataTest.cpp
         ModuleManagerTest.cpp
         ProcessDataTest.cpp
+        ScopeTreeTimerDataTest.cpp
+        ThreadTrackDataManagerTest.cpp
+        ThreadTrackDataProviderTest.cpp
+        TimerTrackDataIdManagerTest.cpp
         TimestampIntervalSetTest.cpp
         TracepointDataTest.cpp
-        TrackDataTest.cpp
+        TimerDataTest.cpp
         UserDefinedCaptureDataTest.cpp)
 
 target_link_libraries(ClientDataTests PRIVATE

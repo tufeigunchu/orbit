@@ -25,6 +25,7 @@
 #include <QGridLayout>
 #include <QHBoxLayout>
 #include <QIODevice>
+#include <QInputDialog>
 #include <QLabel>
 #include <QLineEdit>
 #include <QList>
@@ -74,6 +75,7 @@
 #include "ClientData/ProcessData.h"
 #include "ClientFlags/ClientFlags.h"
 #include "ClientModel/CaptureSerializer.h"
+#include "ClientProtos/capture_data.pb.h"
 #include "ClientServices/ProcessManager.h"
 #include "CodeReport/DisassemblyReport.h"
 #include "CodeViewer/Dialog.h"
@@ -86,6 +88,8 @@
 #include "DataViews/LiveFunctionsDataView.h"
 #include "DisplayFormats/DisplayFormats.h"
 #include "GlCanvas.h"
+#include "GrpcProtos/capture.pb.h"
+#include "GrpcProtos/services.pb.h"
 #include "Introspection/Introspection.h"
 #include "LiveFunctionsController.h"
 #include "OrbitBase/ExecutablePath.h"
@@ -113,19 +117,18 @@
 #include "absl/flags/flag.h"
 #include "absl/strings/match.h"
 #include "absl/strings/str_format.h"
-#include "capture_data.pb.h"
 #include "orbitaboutdialog.h"
 #include "orbitdataviewpanel.h"
 #include "orbitglwidget.h"
 #include "orbitlivefunctions.h"
 #include "orbitsamplingreport.h"
-#include "services.pb.h"
 #include "types.h"
 #include "ui_orbitmainwindow.h"
 
 using orbit_capture_client::CaptureClient;
 using orbit_capture_client::CaptureListener;
 
+using orbit_grpc_protos::CaptureOptions;
 using orbit_grpc_protos::CrashOrbitServiceRequest_CrashType;
 using orbit_grpc_protos::CrashOrbitServiceRequest_CrashType_CHECK_FALSE;
 using orbit_grpc_protos::CrashOrbitServiceRequest_CrashType_STACK_OVERFLOW;
@@ -138,12 +141,16 @@ using orbit_session_setup::TargetLabel;
 
 using orbit_data_views::DataViewType;
 
+using DynamicInstrumentationMethod =
+    orbit_grpc_protos::CaptureOptions::DynamicInstrumentationMethod;
+using UnwindingMethod = orbit_grpc_protos::CaptureOptions::UnwindingMethod;
+
 namespace {
 const QString kLightGrayColor = "rgb(117, 117, 117)";
 const QString kMediumGrayColor = "rgb(68, 68, 68)";
 const QString kGreenColor = "rgb(41, 218, 130)";
 constexpr int kHintFramePosX = 21;
-constexpr int kHintFramePosY = 47;
+constexpr int kHintFramePosY = 62;
 constexpr int kHintFrameWidth = 140;
 constexpr int kHintFrameHeight = 45;
 }  // namespace
@@ -179,13 +186,9 @@ OrbitMainWindow::OrbitMainWindow(TargetConfiguration target_configuration,
 
   app_->PostInit(is_connected_);
 
-  app_->SetSamplesPerSecond(absl::GetFlag(FLAGS_sampling_rate));
   uint16_t stack_dump_size = absl::GetFlag(FLAGS_stack_dump_size);
   CHECK(stack_dump_size <= 65000 && stack_dump_size > 0);
   app_->SetStackDumpSize(stack_dump_size);
-  app_->SetUnwindingMethod(absl::GetFlag(FLAGS_frame_pointer_unwinding)
-                               ? orbit_grpc_protos::UnwindingMethod::kFramePointerUnwinding
-                               : orbit_grpc_protos::UnwindingMethod::kDwarfUnwinding);
 
   SaveCurrentTabLayoutAsDefaultInMemory();
 
@@ -193,8 +196,7 @@ OrbitMainWindow::OrbitMainWindow(TargetConfiguration target_configuration,
 
   LoadCaptureOptionsIntoApp();
 
-  metrics_uploader_->SendLogEvent(
-      orbit_metrics_uploader::OrbitLogEvent_LogEventType_ORBIT_MAIN_WINDOW_OPEN);
+  metrics_uploader_->SendLogEvent(orbit_metrics_uploader::OrbitLogEvent::ORBIT_MAIN_WINDOW_OPEN);
 
   // SymbolPaths.txt deprecation code
   // If file does not exist, do nothing. (It means the user never used an older Orbit version or
@@ -247,10 +249,16 @@ OrbitMainWindow::OrbitMainWindow(TargetConfiguration target_configuration,
   }
 }
 
+void OrbitMainWindow::UpdateFilePath(const std::filesystem::path& file_path) {
+  target_label_->SetFile(file_path);
+  setWindowTitle(QString::fromStdString(file_path.string()));
+}
+
 void OrbitMainWindow::SetupMainWindow() {
   DataViewFactory* data_view_factory = app_.get();
 
   ui->setupUi(this);
+  RestoreMainWindowGeometry();
 
   ui->splitter_2->setSizes({5000, 5000});
 
@@ -259,15 +267,16 @@ void OrbitMainWindow::SetupMainWindow() {
   app_->SetStatusListener(status_listener_.get());
 
   app_->SetCaptureStartedCallback([this](const std::optional<std::filesystem::path>& file_path) {
-    UpdateCaptureStateDependentWidgets();
-    ClearCaptureFilters();
-
     // Only set it if this is not empty, we do not want to reset the label when loading from legacy
     // file format.
     if (file_path.has_value()) {
-      target_label_->SetFile(file_path.value());
-      setWindowTitle(QString::fromStdString(file_path.value().string()));
+      UpdateFilePath(file_path.value());
     }
+
+    // we want to call UpdateCaptureStateDependentWidgets after we update
+    // target_label_ since the state of some actions depend on it.
+    UpdateCaptureStateDependentWidgets();
+    ClearCaptureFilters();
   });
 
   constexpr const char* kFinalizingCaptureMessage =
@@ -568,6 +577,18 @@ void OrbitMainWindow::SaveCurrentTabLayoutAsDefaultInMemory() {
   }
 }
 
+void OrbitMainWindow::SaveMainWindowGeometry() {
+  QSettings settings;
+  settings.setValue(kMainWindowGeometrySettingKey, saveGeometry());
+  settings.setValue(kMainWindowStateSettingKey, saveState());
+}
+
+void OrbitMainWindow::RestoreMainWindowGeometry() {
+  QSettings settings;
+  restoreGeometry(settings.value(kMainWindowGeometrySettingKey).toByteArray());
+  restoreState(settings.value(kMainWindowStateSettingKey).toByteArray());
+}
+
 void OrbitMainWindow::CreateTabBarContextMenu(QTabWidget* tab_widget, int tab_index,
                                               const QPoint& pos) {
   QMenu context_menu(this);
@@ -632,6 +653,8 @@ void OrbitMainWindow::UpdateCaptureStateDependentWidgets() {
   ui->actionToggle_Capture->setIcon(is_capturing ? icon_stop_capture_ : icon_start_capture_);
   ui->actionCaptureOptions->setEnabled(!is_capturing);
   ui->actionOpen_Capture->setEnabled(!is_capturing);
+  ui->actionRename_Capture_File->setEnabled(!is_capturing &&
+                                            target_label_->GetFilePath().has_value());
   ui->actionOpen_Preset->setEnabled(!is_capturing && is_connected_);
   ui->actionSave_Preset_As->setEnabled(!is_capturing);
   ui->actionConfigureTracks->setEnabled(has_data);
@@ -1039,29 +1062,79 @@ void OrbitMainWindow::on_actionQuit_triggered() {
 
 void OrbitMainWindow::on_actionToggle_Capture_triggered() { app_->ToggleCapture(); }
 
+const QString OrbitMainWindow::kEnableCallstackSamplingSettingKey{"EnableCallstackSampling"};
+const QString OrbitMainWindow::kCallstackSamplingPeriodMsSettingKey{"CallstackSamplingPeriodMs"};
+const QString OrbitMainWindow::kCallstackUnwindingMethodSettingKey{"CallstackUnwindingMethod"};
+const QString OrbitMainWindow::kCollectSchedulerInfoSettingKey{"CollectSchedulerInfo"};
 const QString OrbitMainWindow::kCollectThreadStatesSettingKey{"CollectThreadStates"};
+const QString OrbitMainWindow::kTraceGpuSubmissionsSettingKey{"TraceGpuSubmissions"};
 const QString OrbitMainWindow::kCollectMemoryInfoSettingKey{"CollectMemoryInfo"};
 const QString OrbitMainWindow::kEnableApiSettingKey{"EnableApi"};
 const QString OrbitMainWindow::kEnableIntrospectionSettingKey{"EnableIntrospection"};
-const QString OrbitMainWindow::kEnableUserSpaceInstrumentationSettingKey{
-    "EnableUserSpaceInstrumentation"};
+const QString OrbitMainWindow::kDynamicInstrumentationMethodSettingKey{
+    "DynamicInstrumentationMethod"};
 const QString OrbitMainWindow::kMemorySamplingPeriodMsSettingKey{"MemorySamplingPeriodMs"};
 const QString OrbitMainWindow::kMemoryWarningThresholdKbSettingKey{"MemoryWarningThresholdKb"};
 const QString OrbitMainWindow::kLimitLocalMarkerDepthPerCommandBufferSettingsKey{
     "LimitLocalMarkerDepthPerCommandBuffer"};
 const QString OrbitMainWindow::kMaxLocalMarkerDepthPerCommandBufferSettingsKey{
     "MaxLocalMarkerDepthPerCommandBuffer"};
+const QString OrbitMainWindow::kMainWindowGeometrySettingKey{"MainWindowGeometry"};
+const QString OrbitMainWindow::kMainWindowStateSettingKey{"MainWindowState"};
 
+constexpr double kCallstackSamplingPeriodMsDefaultValue = 1.0;
+constexpr UnwindingMethod kCallstackUnwindingMethodDefaultValue = CaptureOptions::kDwarf;
 constexpr uint64_t kMemorySamplingPeriodMsDefaultValue = 10;
 constexpr uint64_t kMemoryWarningThresholdKbDefaultValue = 1024 * 1024 * 8;  // 8Gb
+constexpr DynamicInstrumentationMethod kDynamicInstrumentationMethodDefaultValue =
+    CaptureOptions::kKernelUprobes;
 
 void OrbitMainWindow::LoadCaptureOptionsIntoApp() {
   QSettings settings;
+  if (!app_->IsDevMode() || settings.value(kEnableCallstackSamplingSettingKey, true).toBool()) {
+    bool conversion_succeeded = false;
+    double sampling_period_ms =
+        settings.value(kCallstackSamplingPeriodMsSettingKey, kCallstackSamplingPeriodMsDefaultValue)
+            .toDouble(&conversion_succeeded);
+    if (!conversion_succeeded || sampling_period_ms <= 0.0) {
+      ERROR("Invalid value for setting \"%s\", resetting to %.1f",
+            kCallstackSamplingPeriodMsSettingKey.toStdString(),
+            kCallstackSamplingPeriodMsDefaultValue);
+      settings.setValue(kCallstackSamplingPeriodMsSettingKey,
+                        kCallstackSamplingPeriodMsDefaultValue);
+      sampling_period_ms = kCallstackSamplingPeriodMsDefaultValue;
+    }
+    app_->SetSamplesPerSecond(1000.0 / sampling_period_ms);
+
+    UnwindingMethod unwinding_method = static_cast<UnwindingMethod>(
+        settings
+            .value(kCallstackUnwindingMethodSettingKey,
+                   static_cast<int>(kCallstackUnwindingMethodDefaultValue))
+            .toInt());
+    if (unwinding_method != CaptureOptions::kDwarf &&
+        unwinding_method != CaptureOptions::kFramePointers) {
+      unwinding_method = kCallstackUnwindingMethodDefaultValue;
+    }
+    app_->SetUnwindingMethod(unwinding_method);
+  } else {
+    app_->SetSamplesPerSecond(0.0);
+  }
+
+  app_->SetCollectSchedulerInfo(settings.value(kCollectSchedulerInfoSettingKey, true).toBool());
   app_->SetCollectThreadStates(settings.value(kCollectThreadStatesSettingKey, false).toBool());
+  app_->SetTraceGpuSubmissions(settings.value(kTraceGpuSubmissionsSettingKey, true).toBool());
   app_->SetEnableApi(settings.value(kEnableApiSettingKey, true).toBool());
   app_->SetEnableIntrospection(settings.value(kEnableIntrospectionSettingKey, false).toBool());
-  app_->SetEnableUserSpaceInstrumentation(
-      settings.value(kEnableUserSpaceInstrumentationSettingKey, false).toBool());
+  DynamicInstrumentationMethod instrumentation_method = static_cast<DynamicInstrumentationMethod>(
+      settings
+          .value(kDynamicInstrumentationMethodSettingKey,
+                 static_cast<int>(kDynamicInstrumentationMethodDefaultValue))
+          .toInt());
+  if (instrumentation_method != CaptureOptions::kKernelUprobes &&
+      instrumentation_method != CaptureOptions::kUserSpaceInstrumentation) {
+    instrumentation_method = kDynamicInstrumentationMethodDefaultValue;
+  }
+  app_->SetDynamicInstrumentationMethod(instrumentation_method);
 
   app_->SetCollectMemoryInfo(settings.value(kCollectMemoryInfoSettingKey, false).toBool());
   uint64_t memory_sampling_period_ms = kMemorySamplingPeriodMsDefaultValue;
@@ -1092,11 +1165,36 @@ void OrbitMainWindow::on_actionCaptureOptions_triggered() {
   QSettings settings;
 
   orbit_qt::CaptureOptionsDialog dialog{this};
+  dialog.SetEnableSampling(!app_->IsDevMode() ||
+                           settings.value(kEnableCallstackSamplingSettingKey, true).toBool());
+  dialog.SetSamplingPeriodMs(
+      settings.value(kCallstackSamplingPeriodMsSettingKey, kCallstackSamplingPeriodMsDefaultValue)
+          .toDouble());
+  UnwindingMethod unwinding_method = static_cast<UnwindingMethod>(
+      settings
+          .value(kCallstackUnwindingMethodSettingKey,
+                 static_cast<int>(kCallstackUnwindingMethodDefaultValue))
+          .toInt());
+  if (unwinding_method != CaptureOptions::kDwarf &&
+      unwinding_method != CaptureOptions::kFramePointers) {
+    unwinding_method = kCallstackUnwindingMethodDefaultValue;
+  }
+  dialog.SetUnwindingMethod(unwinding_method);
+  dialog.SetCollectSchedulerInfo(settings.value(kCollectSchedulerInfoSettingKey, true).toBool());
   dialog.SetCollectThreadStates(settings.value(kCollectThreadStatesSettingKey, false).toBool());
+  dialog.SetTraceGpuSubmissions(settings.value(kTraceGpuSubmissionsSettingKey, true).toBool());
   dialog.SetEnableApi(settings.value(kEnableApiSettingKey, true).toBool());
   dialog.SetEnableIntrospection(settings.value(kEnableIntrospectionSettingKey, true).toBool());
-  dialog.SetEnableUserSpaceInstrumentation(
-      settings.value(kEnableUserSpaceInstrumentationSettingKey, false).toBool());
+  DynamicInstrumentationMethod instrumentation_method = static_cast<DynamicInstrumentationMethod>(
+      settings
+          .value(kDynamicInstrumentationMethodSettingKey,
+                 static_cast<int>(kDynamicInstrumentationMethodDefaultValue))
+          .toInt());
+  if (instrumentation_method != CaptureOptions::kKernelUprobes &&
+      instrumentation_method != CaptureOptions::kUserSpaceInstrumentation) {
+    instrumentation_method = kDynamicInstrumentationMethodDefaultValue;
+  }
+  dialog.SetDynamicInstrumentationMethod(instrumentation_method);
   dialog.SetCollectMemoryInfo(settings.value(kCollectMemoryInfoSettingKey, false).toBool());
   dialog.SetMemorySamplingPeriodMs(
       settings
@@ -1118,11 +1216,17 @@ void OrbitMainWindow::on_actionCaptureOptions_triggered() {
     return;
   }
 
+  settings.setValue(kEnableCallstackSamplingSettingKey, dialog.GetEnableSampling());
+  settings.setValue(kCallstackSamplingPeriodMsSettingKey, dialog.GetSamplingPeriodMs());
+  settings.setValue(kCallstackUnwindingMethodSettingKey,
+                    static_cast<int>(dialog.GetUnwindingMethod()));
+  settings.setValue(kCollectSchedulerInfoSettingKey, dialog.GetCollectSchedulerInfo());
   settings.setValue(kCollectThreadStatesSettingKey, dialog.GetCollectThreadStates());
+  settings.setValue(kTraceGpuSubmissionsSettingKey, dialog.GetTraceGpuSubmissions());
   settings.setValue(kEnableApiSettingKey, dialog.GetEnableApi());
   settings.setValue(kEnableIntrospectionSettingKey, dialog.GetEnableIntrospection());
-  settings.setValue(kEnableUserSpaceInstrumentationSettingKey,
-                    dialog.GetEnableUserSpaceInstrumentation());
+  settings.setValue(kDynamicInstrumentationMethodSettingKey,
+                    static_cast<int>(dialog.GetDynamicInstrumentationMethod()));
   settings.setValue(kCollectMemoryInfoSettingKey, dialog.GetCollectMemoryInfo());
   settings.setValue(kMemorySamplingPeriodMsSettingKey,
                     QString::number(dialog.GetMemorySamplingPeriodMs()));
@@ -1193,6 +1297,42 @@ void OrbitMainWindow::on_actionOpen_Capture_triggered() {
   QProcess::startDetached(orbit_executable, arguments << file << command_line_flags_);
 }
 
+void OrbitMainWindow::on_actionRename_Capture_File_triggered() {
+  CHECK(target_label_->GetFilePath().has_value());
+  const std::filesystem::path& current_file_path = target_label_->GetFilePath().value();
+  QString file_path =
+      QFileDialog::getSaveFileName(this, "Rename or Move capture...",
+                                   QString::fromStdString(current_file_path.string()), "*.orbit");
+
+  std::filesystem::path new_file_path{file_path.toStdString()};
+
+  if (new_file_path == current_file_path) return;
+
+  auto* progress_dialog = new QProgressDialog(
+      QString("Moving file to \"%1\"...").arg(QString::fromStdString(new_file_path.string())), "",
+      0, 0, this);
+  progress_dialog->setWindowModality(Qt::WindowModal);
+  progress_dialog->show();
+
+  orbit_base::Future<ErrorMessageOr<void>> rename_future =
+      app_->MoveCaptureFile(current_file_path, new_file_path);
+
+  rename_future.Then(main_thread_executor_.get(), [this, progress_dialog, current_file_path,
+                                                   new_file_path](ErrorMessageOr<void> result) {
+    progress_dialog->close();
+    if (result.has_error()) {
+      QMessageBox::critical(
+          this, QString::fromStdString("Unable to Rename File"),
+          QString::fromStdString(absl::StrFormat(R"(Unable to rename/move file "%s" -> "%s": %s)",
+                                                 current_file_path.string(), new_file_path.string(),
+                                                 result.error().message())));
+      return;
+    }
+
+    UpdateFilePath(new_file_path);
+  });
+}
+
 void OrbitMainWindow::OpenCapture(const std::string& filepath) {
   auto* loading_capture_dialog =
       new QProgressDialog("Waiting for the capture to be loaded...", nullptr, 0, 0, this, Qt::Tool);
@@ -1203,7 +1343,7 @@ void OrbitMainWindow::OpenCapture(const std::string& filepath) {
       ~Qt::WindowCloseButtonHint & ~Qt::WindowSystemMenuHint);
   loading_capture_dialog->setFixedSize(loading_capture_dialog->size());
 
-  auto loading_capture_cancel_button = QPointer{new QPushButton{this}};
+  auto loading_capture_cancel_button = QPointer<QPushButton>{new QPushButton{this}};
   loading_capture_cancel_button->setText("Cancel");
   QObject::connect(loading_capture_dialog, &QProgressDialog::canceled, this,
                    [this]() { app_->OnLoadCaptureCancelRequested(); });
@@ -1319,6 +1459,8 @@ bool OrbitMainWindow::ConfirmExit() {
 }
 
 void OrbitMainWindow::Exit(int return_code) {
+  SaveMainWindowGeometry();
+
   if (app_->IsCapturing() || app_->IsLoadingCapture()) {
     // We need for the capture to clean up - exit as soon as this is done
     app_->SetCaptureFailedCallback([this, return_code] { Exit(return_code); });
@@ -1332,8 +1474,7 @@ void OrbitMainWindow::Exit(int return_code) {
     introspection_widget_->close();
   }
 
-  metrics_uploader_->SendLogEvent(
-      orbit_metrics_uploader::OrbitLogEvent_LogEventType_ORBIT_MAIN_WINDOW_CLOSE);
+  metrics_uploader_->SendLogEvent(orbit_metrics_uploader::OrbitLogEvent::ORBIT_MAIN_WINDOW_CLOSE);
 
   QApplication::exit(return_code);
 }
@@ -1552,6 +1693,9 @@ void OrbitMainWindow::ShowSourceCode(
     code_viewer_dialog->SetOwningHeatmap(kHeatmapAreaWidth, std::move(*maybe_code_report));
   }
 
+  // This ensure the dialog will be closed at the latest when the session ends.
+  QObject::connect(this, &QObject::destroyed, code_viewer_dialog.get(), &QDialog::close);
+
   code_viewer_dialog->GoToLineNumber(line_number);
   orbit_code_viewer::OpenAndDeleteOnClose(std::move(code_viewer_dialog));
 }
@@ -1574,6 +1718,9 @@ void OrbitMainWindow::ShowDisassembly(const orbit_client_protos::FunctionInfo& f
     dialog->EnableHeatmap(kHeatmapAreaWidth);
     dialog->SetEnableSampleCounters(true);
   }
+
+  // This ensure the dialog will be closed at the latest when the session ends.
+  QObject::connect(this, &QObject::destroyed, dialog.get(), &QDialog::close);
 
   QPointer<orbit_qt::AnnotatingSourceCodeDialog> dialog_ptr =
       OpenAndDeleteOnClose(std::move(dialog));

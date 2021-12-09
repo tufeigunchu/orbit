@@ -17,29 +17,28 @@
 #include "App.h"
 #include "Batcher.h"
 #include "ClientFlags/ClientFlags.h"
+#include "ClientProtos/capture_data.pb.h"
 #include "DisplayFormats/DisplayFormats.h"
 #include "GlCanvas.h"
-#include "TimeGraph.h"
 #include "TimeGraphLayout.h"
 #include "TriangleToggle.h"
 #include "Viewport.h"
 #include "absl/flags/flag.h"
 #include "absl/strings/str_format.h"
-#include "capture_data.pb.h"
 
 using orbit_client_data::TimerChain;
-using orbit_client_data::TrackData;
+using orbit_client_data::TimerData;
 using orbit_client_protos::TimerInfo;
 
 const Color TimerTrack::kHighlightColor = Color(100, 181, 246, 255);
 
-TimerTrack::TimerTrack(CaptureViewElement* parent, TimeGraph* time_graph,
+TimerTrack::TimerTrack(CaptureViewElement* parent,
+                       const orbit_gl::TimelineInfoInterface* timeline_info,
                        orbit_gl::Viewport* viewport, TimeGraphLayout* layout, OrbitApp* app,
-                       const orbit_client_data::CaptureData* capture_data, TrackData* track_data)
-    : Track(parent, time_graph, viewport, layout, capture_data),
-      text_renderer_{time_graph->GetTextRenderer()},
+                       const orbit_client_data::CaptureData* capture_data, TimerData* timer_data)
+    : Track(parent, timeline_info, viewport, layout, capture_data),
       app_{app},
-      track_data_{track_data} {}
+      timer_data_{timer_data} {}
 
 std::string TimerTrack::GetExtraInfo(const TimerInfo& timer_info) const {
   std::string info;
@@ -83,8 +82,9 @@ std::string TimerTrack::GetDisplayTime(const TimerInfo& timer) const {
   return orbit_display_formats::GetDisplayTime(absl::Nanoseconds(timer.end() - timer.start()));
 }
 
-void TimerTrack::DrawTimesliceText(const orbit_client_protos::TimerInfo& timer, float min_x,
-                                   float z_offset, Vec2 box_pos, Vec2 box_size) {
+void TimerTrack::DrawTimesliceText(TextRenderer& text_renderer,
+                                   const orbit_client_protos::TimerInfo& timer, float min_x,
+                                   Vec2 box_pos, Vec2 box_size) {
   std::string timeslice_text = GetTimesliceText(timer);
 
   const std::string elapsed_time = GetDisplayTime(timer);
@@ -96,14 +96,15 @@ void TimerTrack::DrawTimesliceText(const orbit_client_protos::TimerInfo& timer, 
   TextRenderer::TextFormatting formatting{layout_->CalculateZoomedFontSize(), kTextWhite, max_size};
   formatting.valign = TextRenderer::VAlign::Bottom;
 
-  text_renderer_->AddTextTrailingCharsPrioritized(
+  text_renderer.AddTextTrailingCharsPrioritized(
       timeslice_text.c_str(), pos_x, box_pos[1] + box_size[1] - layout_->GetTextOffset(),
-      GlCanvas::kZValueBox + z_offset, formatting, elapsed_time_length);
+      GlCanvas::kZValueBox, formatting, elapsed_time_length);
 }
 
-bool TimerTrack::DrawTimer(const TimerInfo* prev_timer_info, const TimerInfo* next_timer_info,
-                           const internal::DrawData& draw_data, const TimerInfo* current_timer_info,
-                           uint64_t* min_ignore, uint64_t* max_ignore) {
+bool TimerTrack::DrawTimer(TextRenderer& text_renderer, const TimerInfo* prev_timer_info,
+                           const TimerInfo* next_timer_info, const internal::DrawData& draw_data,
+                           const TimerInfo* current_timer_info, uint64_t* min_ignore,
+                           uint64_t* max_ignore) {
   CHECK(min_ignore != nullptr);
   CHECK(max_ignore != nullptr);
   if (current_timer_info == nullptr) return false;
@@ -115,9 +116,9 @@ bool TimerTrack::DrawTimer(const TimerInfo* prev_timer_info, const TimerInfo* ne
     return false;
   if (!TimerFilter(*current_timer_info)) return false;
 
-  double start_us = time_graph_->GetUsFromTick(current_timer_info->start());
+  double start_us = timeline_info_->GetUsFromTick(current_timer_info->start());
   double start_or_prev_end_us = start_us;
-  double end_us = time_graph_->GetUsFromTick(current_timer_info->end());
+  double end_us = timeline_info_->GetUsFromTick(current_timer_info->end());
   double end_or_next_start_us = end_us;
 
   float world_timer_y = GetYFromTimer(*current_timer_info);
@@ -136,7 +137,7 @@ bool TimerTrack::DrawTimer(const TimerInfo* prev_timer_info, const TimerInfo* ne
       if (prev_timer_info->end() > current_timer_info->start() &&
           prev_timer_info->end() <= current_timer_info->end() &&
           prev_timer_info->type() == current_timer_info->type()) {
-        start_or_prev_end_us = time_graph_->GetUsFromTick(prev_timer_info->end());
+        start_or_prev_end_us = timeline_info_->GetUsFromTick(prev_timer_info->end());
       }
     }
   }
@@ -153,7 +154,7 @@ bool TimerTrack::DrawTimer(const TimerInfo* prev_timer_info, const TimerInfo* ne
       if (current_timer_info->end() > next_timer_info->start() &&
           current_timer_info->end() <= next_timer_info->end() &&
           next_timer_info->type() == current_timer_info->type()) {
-        end_or_next_start_us = time_graph_->GetUsFromTick(next_timer_info->start());
+        end_or_next_start_us = timeline_info_->GetUsFromTick(next_timer_info->start());
       }
     }
   }
@@ -170,12 +171,11 @@ bool TimerTrack::DrawTimer(const TimerInfo* prev_timer_info, const TimerInfo* ne
     WorldXInfo world_x_info = ToWorldX(text_x_start_us, text_x_end_us, draw_data.inv_time_window,
                                        draw_data.track_start_x, draw_data.track_width);
 
-    if (BoxHasRoomForText(world_x_info.world_x_width)) {
+    if (BoxHasRoomForText(text_renderer, world_x_info.world_x_width)) {
       Vec2 pos{world_x_info.world_x_start, world_timer_y};
       Vec2 size{world_x_info.world_x_width, GetDynamicBoxHeight(*current_timer_info)};
 
-      DrawTimesliceText(*current_timer_info, draw_data.track_start_x, draw_data.z_offset, pos,
-                        size);
+      DrawTimesliceText(text_renderer, *current_timer_info, draw_data.track_start_x, pos, size);
     }
   }
 
@@ -189,10 +189,10 @@ bool TimerTrack::DrawTimer(const TimerInfo* prev_timer_info, const TimerInfo* ne
       group_id != kOrbitDefaultGroupId && group_id == draw_data.highlighted_group_id;
   bool is_highlighted = !is_selected && (is_function_id_highlighted || is_group_id_highlighted);
 
-  Color color = GetTimerColor(*current_timer_info, is_selected, is_highlighted);
+  Color color = GetTimerColor(*current_timer_info, is_selected, is_highlighted, draw_data);
 
   bool is_visible_width = elapsed_us * draw_data.inv_time_window *
-                              viewport_->WorldToScreenWidth(draw_data.track_width) >
+                              viewport_->WorldToScreen({draw_data.track_width, 0})[0] >
                           1;
 
   if (is_visible_width) {
@@ -229,41 +229,41 @@ bool TimerTrack::DrawTimer(const TimerInfo* prev_timer_info, const TimerInfo* ne
                                        color, std::move(user_data));
     // For lines, we can ignore the entire pixel into which this event
     // falls. We align this precisely on the pixel x-coordinate of the
-    // current line being drawn (in ticks). If ns_per_pixel is
-    // zero, we need to avoid dividing by zero, but we also wouldn't
-    // gain anything here.
-    if (draw_data.ns_per_pixel != 0) {
-      *min_ignore =
-          draw_data.min_timegraph_tick +
-          ((current_timer_info->start() - draw_data.min_timegraph_tick) / draw_data.ns_per_pixel) *
-              draw_data.ns_per_pixel;
-      *max_ignore = *min_ignore + draw_data.ns_per_pixel;
-    }
+    // current line being drawn (in ticks).
+    int num_pixel = static_cast<int>((current_timer_info->start() - draw_data.min_timegraph_tick) /
+                                     draw_data.ns_per_pixel);
+    *min_ignore =
+        draw_data.min_timegraph_tick + static_cast<uint64_t>(num_pixel * draw_data.ns_per_pixel);
+    *max_ignore = draw_data.min_timegraph_tick +
+                  static_cast<uint64_t>((num_pixel + 1) * draw_data.ns_per_pixel);
   }
 
   return true;
 }
 
-void TimerTrack::UpdatePrimitives(Batcher* batcher, uint64_t min_tick, uint64_t max_tick,
-                                  PickingMode /*picking_mode*/, float z_offset) {
+void TimerTrack::DoUpdatePrimitives(Batcher& batcher, TextRenderer& text_renderer,
+                                    uint64_t min_tick, uint64_t max_tick,
+                                    PickingMode picking_mode) {
+  ORBIT_SCOPE_WITH_COLOR("TimerTrack::DoUpdatePrimitives", kOrbitColorOrange);
+  Track::DoUpdatePrimitives(batcher, text_renderer, min_tick, max_tick, picking_mode);
+
   visible_timer_count_ = 0;
 
   internal::DrawData draw_data{};
   draw_data.min_tick = min_tick;
   draw_data.max_tick = max_tick;
-  draw_data.z_offset = z_offset;
 
-  draw_data.batcher = batcher;
+  draw_data.batcher = &batcher;
   draw_data.viewport = viewport_;
 
-  draw_data.track_start_x = viewport_->GetWorldTopLeft()[0];
+  draw_data.track_start_x = GetPos()[0];
   draw_data.track_width = GetWidth();
-  draw_data.inv_time_window = 1.0 / time_graph_->GetTimeWindowUs();
+  draw_data.inv_time_window = 1.0 / timeline_info_->GetTimeWindowUs();
   draw_data.is_collapsed = IsCollapsed();
 
-  draw_data.z = GlCanvas::kZValueBox + z_offset;
+  draw_data.z = GlCanvas::kZValueBox;
 
-  std::vector<const orbit_client_data::TimerChain*> chains = track_data_->GetChains();
+  std::vector<const orbit_client_data::TimerChain*> chains = timer_data_->GetChains();
   draw_data.selected_timer = app_->selected_timer();
   draw_data.highlighted_function_id = app_->GetFunctionIdToHighlight();
   draw_data.highlighted_group_id = app_->GetGroupIdToHighlight();
@@ -272,9 +272,10 @@ void TimerTrack::UpdatePrimitives(Batcher* batcher, uint64_t min_tick, uint64_t 
   // events that would just draw over an already drawn line. When zoomed in
   // enough that all events are drawn as boxes, this has no effect. When zoomed
   // out, many events will be discarded quickly.
-  uint64_t time_window_ns = static_cast<uint64_t>(1000 * time_graph_->GetTimeWindowUs());
-  draw_data.ns_per_pixel = time_window_ns / viewport_->WorldToScreenWidth(GetWidth());
-  draw_data.min_timegraph_tick = time_graph_->GetTickFromUs(time_graph_->GetMinTimeUs());
+  uint64_t time_window_ns = static_cast<uint64_t>(1000 * timeline_info_->GetTimeWindowUs());
+  draw_data.ns_per_pixel =
+      static_cast<double>(time_window_ns) / viewport_->WorldToScreen({GetWidth(), 0})[0];
+  draw_data.min_timegraph_tick = timeline_info_->GetTickFromUs(timeline_info_->GetMinTimeUs());
 
   for (const TimerChain* chain : chains) {
     CHECK(chain != nullptr);
@@ -300,8 +301,8 @@ void TimerTrack::UpdatePrimitives(Batcher* batcher, uint64_t min_tick, uint64_t 
         // from the previous iteration ("current").
         next_timer_info = &block[k];
 
-        if (DrawTimer(prev_timer_info, next_timer_info, draw_data, current_timer_info, &min_ignore,
-                      &max_ignore)) {
+        if (DrawTimer(text_renderer, prev_timer_info, next_timer_info, draw_data,
+                      current_timer_info, &min_ignore, &max_ignore)) {
           ++visible_timer_count_;
         }
 
@@ -312,24 +313,20 @@ void TimerTrack::UpdatePrimitives(Batcher* batcher, uint64_t min_tick, uint64_t 
 
     // We still need to draw the last timer.
     next_timer_info = nullptr;
-    if (DrawTimer(prev_timer_info, next_timer_info, draw_data, current_timer_info, &min_ignore,
-                  &max_ignore)) {
+    if (DrawTimer(text_renderer, prev_timer_info, next_timer_info, draw_data, current_timer_info,
+                  &min_ignore, &max_ignore)) {
       ++visible_timer_count_;
     }
   }
 }
 
 void TimerTrack::OnTimer(const TimerInfo& timer_info) {
-  if (process_id_ == orbit_base::kInvalidProcessId) {
-    process_id_ = timer_info.process_id();
-  }
-
-  track_data_->AddTimer(timer_info.depth(), timer_info);
+  timer_data_->AddTimer(timer_info, timer_info.depth());
 }
 
 float TimerTrack::GetHeight() const {
-  uint32_t collapsed_depth = std::min<uint32_t>(1, track_data_->GetMaxDepth());
-  uint32_t depth = collapse_toggle_->IsCollapsed() ? collapsed_depth : track_data_->GetMaxDepth();
+  uint32_t collapsed_depth = std::min<uint32_t>(1, GetDepth());
+  uint32_t depth = collapse_toggle_->IsCollapsed() ? collapsed_depth : GetDepth();
   return GetHeaderHeight() + layout_->GetTrackContentTopMargin() +
          layout_->GetTextBoxHeight() * depth +
          (depth > 0 ? layout_->GetSpaceBetweenTracksAndThread() : 0) +
@@ -341,69 +338,23 @@ std::string TimerTrack::GetTooltip() const {
          "functions";
 }
 
-const TimerInfo* TimerTrack::GetFirstAfterTime(uint64_t time, uint32_t depth) const {
-  const orbit_client_data::TimerChain* chain = track_data_->GetChain(depth);
-  if (chain == nullptr) return nullptr;
-
-  // TODO: do better than linear search...
-  for (const auto& it : *chain) {
-    for (size_t k = 0; k < it.size(); ++k) {
-      const TimerInfo& timer_info = it[k];
-      if (timer_info.start() > time) {
-        return &timer_info;
-      }
-    }
-  }
-  return nullptr;
+const TimerInfo* TimerTrack::GetLeft(const TimerInfo& timer_info) const {
+  return timer_data_->GetFirstBeforeStartTime(timer_info.start(), timer_info.depth());
 }
 
-const TimerInfo* TimerTrack::GetFirstBeforeTime(uint64_t time, uint32_t depth) const {
-  const orbit_client_data::TimerChain* chain = track_data_->GetChain(depth);
-  if (chain == nullptr) return nullptr;
-
-  const TimerInfo* first_timer_before_time = nullptr;
-
-  // TODO: do better than linear search...
-  for (const auto& it : *chain) {
-    for (size_t k = 0; k < it.size(); ++k) {
-      const TimerInfo* timer_info = &it[k];
-      if (timer_info->start() > time) {
-        return first_timer_before_time;
-      }
-      first_timer_before_time = timer_info;
-    }
-  }
-
-  return nullptr;
+const TimerInfo* TimerTrack::GetRight(const TimerInfo& timer_info) const {
+  return timer_data_->GetFirstAfterStartTime(timer_info.start(), timer_info.depth());
 }
 
 const TimerInfo* TimerTrack::GetUp(const TimerInfo& timer_info) const {
-  return GetFirstBeforeTime(timer_info.start(), timer_info.depth() - 1);
+  return timer_data_->GetFirstBeforeStartTime(timer_info.start(), timer_info.depth() - 1);
 }
 
 const TimerInfo* TimerTrack::GetDown(const TimerInfo& timer_info) const {
-  return GetFirstAfterTime(timer_info.start(), timer_info.depth() + 1);
+  return timer_data_->GetFirstAfterStartTime(timer_info.start(), timer_info.depth() + 1);
 }
 
-std::vector<const orbit_client_protos::TimerInfo*> TimerTrack::GetScopesInRange(
-    uint64_t start_ns, uint64_t end_ns) const {
-  std::vector<const orbit_client_protos::TimerInfo*> result;
-  for (const TimerChain* chain : track_data_->GetChains()) {
-    CHECK(chain != nullptr);
-    for (const auto& block : *chain) {
-      if (!block.Intersects(start_ns, end_ns)) continue;
-      for (uint64_t i = 0; i < block.size(); ++i) {
-        const orbit_client_protos::TimerInfo& timer_info = block[i];
-        if (timer_info.start() <= end_ns && timer_info.end() > start_ns) {
-          result.push_back(&timer_info);
-        }
-      }
-    }
-  }
-  return result;
-}
-
-bool TimerTrack::IsEmpty() const { return track_data_->IsEmpty(); }
+bool TimerTrack::IsEmpty() const { return timer_data_->IsEmpty(); }
 
 std::string TimerTrack::GetBoxTooltip(const Batcher& /*batcher*/, PickingId /*id*/) const {
   return "";
@@ -413,8 +364,9 @@ float TimerTrack::GetHeaderHeight() const {
   return layout_->GetTrackTabHeight() + layout_->GetTrackContentTopMargin();
 }
 
-internal::DrawData TimerTrack::GetDrawData(uint64_t min_tick, uint64_t max_tick, float track_width,
-                                           float z_offset, Batcher* batcher, TimeGraph* time_graph,
+internal::DrawData TimerTrack::GetDrawData(uint64_t min_tick, uint64_t max_tick, float track_pos_x,
+                                           float track_width, Batcher* batcher,
+                                           const orbit_gl::TimelineInfoInterface* timeline_info,
                                            orbit_gl::Viewport* viewport, bool is_collapsed,
                                            const orbit_client_protos::TimerInfo* selected_timer,
                                            uint64_t highlighted_function_id,
@@ -422,24 +374,24 @@ internal::DrawData TimerTrack::GetDrawData(uint64_t min_tick, uint64_t max_tick,
   internal::DrawData draw_data{};
   draw_data.min_tick = min_tick;
   draw_data.max_tick = max_tick;
-  draw_data.z_offset = z_offset;
   draw_data.batcher = batcher;
   draw_data.viewport = viewport;
-  draw_data.track_start_x = viewport->GetWorldTopLeft()[0];
+  draw_data.track_start_x = track_pos_x;
   draw_data.track_width = track_width;
-  draw_data.inv_time_window = 1.0 / time_graph->GetTimeWindowUs();
+  draw_data.inv_time_window = 1.0 / timeline_info->GetTimeWindowUs();
   draw_data.is_collapsed = is_collapsed;
-  draw_data.z = GlCanvas::kZValueBox + z_offset;
+  draw_data.z = GlCanvas::kZValueBox;
   draw_data.selected_timer = selected_timer;
   draw_data.highlighted_function_id = highlighted_function_id;
   draw_data.highlighted_group_id = highlighted_group_id;
 
-  uint64_t time_window_ns = static_cast<uint64_t>(1000 * time_graph->GetTimeWindowUs());
-  draw_data.ns_per_pixel = time_window_ns / viewport->WorldToScreenWidth(track_width);
-  draw_data.min_timegraph_tick = time_graph->GetTickFromUs(time_graph->GetMinTimeUs());
+  uint64_t time_window_ns = static_cast<uint64_t>(1000 * timeline_info->GetTimeWindowUs());
+  draw_data.ns_per_pixel =
+      static_cast<double>(time_window_ns) / viewport->WorldToScreen({track_width, 0})[0];
+  draw_data.min_timegraph_tick = timeline_info->GetTickFromUs(timeline_info->GetMinTimeUs());
   return draw_data;
 }
 
-size_t TimerTrack::GetNumberOfTimers() const { return track_data_->GetNumberOfTimers(); }
-uint64_t TimerTrack::GetMinTime() const { return track_data_->GetMinTime(); }
-uint64_t TimerTrack::GetMaxTime() const { return track_data_->GetMaxTime(); }
+size_t TimerTrack::GetNumberOfTimers() const { return timer_data_->GetNumberOfTimers(); }
+uint64_t TimerTrack::GetMinTime() const { return timer_data_->GetMinTime(); }
+uint64_t TimerTrack::GetMaxTime() const { return timer_data_->GetMaxTime(); }

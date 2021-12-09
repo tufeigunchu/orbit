@@ -10,16 +10,22 @@
 
 #include "ClientData/ModuleData.h"
 #include "ClientData/ProcessData.h"
+#include "ClientProtos/capture_data.pb.h"
+#include "GrpcProtos/module.pb.h"
 #include "absl/container/node_hash_map.h"
 #include "absl/synchronization/mutex.h"
-#include "capture_data.pb.h"
-#include "module.pb.h"
 
 namespace orbit_client_data {
 
 class ModuleManager final {
  public:
   explicit ModuleManager() = default;
+
+  [[nodiscard]] const ModuleData* GetModuleByModuleInMemoryAndAbsoluteAddress(
+      const ModuleInMemory& module_in_memory, uint64_t absolute_address) const;
+
+  [[nodiscard]] ModuleData* GetMutableModuleByModuleInMemoryAndAbsoluteAddress(
+      const ModuleInMemory& module_in_memory, uint64_t absolute_address);
 
   [[nodiscard]] const ModuleData* GetModuleByPathAndBuildId(const std::string& path,
                                                             const std::string& build_id) const;

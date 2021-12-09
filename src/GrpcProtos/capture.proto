@@ -38,8 +38,10 @@ message ApiFunction {
   uint64 api_version = 5;
 }
 
-// NextId: 18
+// NextId: 19
 message CaptureOptions {
+  reserved 17;
+
   bool trace_context_switches = 1;
   uint32 pid = 2;
   double samples_per_second = 3;
@@ -53,7 +55,12 @@ message CaptureOptions {
   }
   UnwindingMethod unwinding_method = 4;
 
-  bool enable_user_space_instrumentation = 17;
+  enum DynamicInstrumentationMethod {
+    kDynamicInstrumentationMethodUnspecified = 0;
+    kKernelUprobes = 1;
+    kUserSpaceInstrumentation = 2;
+  }
+  DynamicInstrumentationMethod dynamic_instrumentation_method = 18;
 
   repeated InstrumentedFunction instrumented_functions = 5;
 
@@ -105,6 +112,22 @@ message FunctionCall {
   int32 depth = 6;
   uint64 return_value = 7;
   repeated uint64 registers = 8;
+}
+
+// FunctionEntry and FunctionExit are emitted by user space instrumentation.
+message FunctionEntry {
+  uint32 pid = 1;
+  uint32 tid = 2;
+  uint64 function_id = 3;
+  uint64 stack_pointer = 4;
+  uint64 return_address = 5;
+  uint64 timestamp_ns = 6;
+}
+
+message FunctionExit {
+  uint32 pid = 1;
+  uint32 tid = 2;
+  uint64 timestamp_ns = 3;
 }
 
 message ApiEvent {
@@ -355,7 +378,8 @@ message Callstack {
     kDwarfUnwindingError = 1;
     kFramePointerUnwindingError = 2;
     kInUprobes = 3;
-    kUprobesPatchingFailed = 4;
+    kInUserSpaceInstrumentation = 7;
+    kCallstackPatchingFailed = 4;
     kStackTopForDwarfUnwindingTooSmall = 5;
     kStackTopDwarfUnwindingError = 6;
   }
@@ -653,6 +677,18 @@ message ErrorEnablingUserSpaceInstrumentationEvent {
   bytes message = 2;
 }
 
+message FunctionThatFailedToBeInstrumented {
+  uint64 function_id = 1;
+  // This is a string, we use bytes to avoid UTF-8 validation.
+  bytes error_message = 2;
+}
+
+message WarningInstrumentingWithUserSpaceInstrumentationEvent {
+  uint64 timestamp_ns = 1;
+  repeated FunctionThatFailedToBeInstrumented
+      functions_that_failed_to_instrument = 2;
+}
+
 message ClockResolutionEvent {
   uint64 timestamp_ns = 1;
   uint64 clock_resolution_ns = 2;
@@ -684,7 +720,7 @@ message ClientCaptureEvent {
     // numbers starting with 16.
     //
     // Next high-frequency ID: 12
-    // Next lower-frequency ID: 48
+    // Next lower-frequency ID: 49
     // Please keep these alphabetically ordered.
 
     // Even though AddressInfo is a high-frequency event
@@ -728,6 +764,8 @@ message ClientCaptureEvent {
     ThreadStateSlice thread_state_slice = 7;
     TracepointEvent tracepoint_event = 8;
     WarningEvent warning_event = 32;
+    WarningInstrumentingWithUserSpaceInstrumentationEvent
+        warning_instrumenting_with_user_space_instrumentation_event = 48;
   }
 }
 
@@ -739,8 +777,8 @@ message ProducerCaptureEvent {
     // use them for high frequency events. For the rest please assign
     // numbers starting with 16.
     //
-    // Next high-frequency ID: 13
-    // Next lower-frequency ID: 46
+    // Next high-frequency ID: 15
+    // Next lower-frequency ID: 48
     //
     // Please keep these alphabetically ordered.
     ApiEvent api_event = 10;
@@ -756,6 +794,7 @@ message ProducerCaptureEvent {
     ApiTrackUint api_track_uint = 43;
     ApiTrackUint64 api_track_uint64 = 44;
     CallstackSample callstack_sample = 1;
+    CaptureFinished capture_finished = 46;
     CaptureStarted capture_started = 23;
     ClockResolutionEvent clock_resolution_event = 32;
     ErrorEnablingOrbitApiEvent error_enabling_orbit_api_event = 31;
@@ -771,6 +810,8 @@ message ProducerCaptureEvent {
     FullGpuJob full_gpu_job = 3;
     FullTracepointEvent full_tracepoint_event = 4;
     FunctionCall function_call = 5;
+    FunctionEntry function_entry = 13;
+    FunctionExit function_exit = 14;
     GpuQueueSubmission gpu_queue_submission = 6;
     InternedCallstack interned_callstack = 7;
     InternedString interned_string = 18;
@@ -784,5 +825,7 @@ message ProducerCaptureEvent {
     ThreadNamesSnapshot thread_names_snapshot = 24;
     ThreadStateSlice thread_state_slice = 9;
     WarningEvent warning_event = 30;
+    WarningInstrumentingWithUserSpaceInstrumentationEvent
+        warning_instrumenting_with_user_space_instrumentation_event = 47;
   }
 }

@@ -25,7 +25,6 @@
 #include <vector>
 
 #include "CallTreeView.h"
-#include "CallstackDataView.h"
 #include "CaptureClient/CaptureClient.h"
 #include "CaptureClient/CaptureListener.h"
 #include "CaptureFile/CaptureFile.h"
@@ -40,21 +39,29 @@
 #include "ClientData/ProcessData.h"
 #include "ClientData/TracepointCustom.h"
 #include "ClientData/UserDefinedCaptureData.h"
+#include "ClientProtos/capture_data.pb.h"
+#include "ClientProtos/preset.pb.h"
 #include "ClientServices/CrashManager.h"
 #include "ClientServices/ProcessManager.h"
 #include "ClientServices/TracepointServiceClient.h"
 #include "CodeReport/DisassemblyReport.h"
 #include "DataViewFactory.h"
 #include "DataViews/AppInterface.h"
+#include "DataViews/CallstackDataView.h"
 #include "DataViews/DataViewType.h"
 #include "DataViews/FunctionsDataView.h"
 #include "DataViews/LiveFunctionsDataView.h"
 #include "DataViews/ModulesDataView.h"
 #include "DataViews/PresetLoadState.h"
 #include "DataViews/PresetsDataView.h"
+#include "DataViews/TracepointsDataView.h"
 #include "FramePointerValidatorClient.h"
 #include "FrameTrackOnlineProcessor.h"
 #include "GlCanvas.h"
+#include "GrpcProtos/capture.pb.h"
+#include "GrpcProtos/services.pb.h"
+#include "GrpcProtos/symbol.pb.h"
+#include "GrpcProtos/tracepoint.pb.h"
 #include "IntrospectionWindow.h"
 #include "MainThreadExecutor.h"
 #include "MainWindowInterface.h"
@@ -71,13 +78,6 @@
 #include "StatusListener.h"
 #include "StringManager/StringManager.h"
 #include "Symbols/SymbolHelper.h"
-#include "TracepointsDataView.h"
-#include "capture.pb.h"
-#include "capture_data.pb.h"
-#include "preset.pb.h"
-#include "services.pb.h"
-#include "symbol.pb.h"
-#include "tracepoint.pb.h"
 
 class OrbitApp final : public DataViewFactory,
                        public orbit_capture_client::CaptureListener,
@@ -107,6 +107,9 @@ class OrbitApp final : public DataViewFactory,
   ErrorMessageOr<void> OnLoadPreset(const std::string& file_name);
   orbit_base::Future<ErrorMessageOr<CaptureOutcome>> LoadCaptureFromFile(
       const std::filesystem::path& file_path);
+
+  orbit_base::Future<ErrorMessageOr<void>> MoveCaptureFile(const std::filesystem::path& src,
+                                                           const std::filesystem::path& dest);
   void OnLoadCaptureCancelRequested();
 
   [[nodiscard]] orbit_capture_client::CaptureClient::State GetCaptureState() const;
@@ -118,7 +121,7 @@ class OrbitApp final : public DataViewFactory,
   void AbortCapture();
   void ClearCapture();
   [[nodiscard]] bool HasCaptureData() const override { return capture_data_ != nullptr; }
-  [[nodiscard]] orbit_client_data::CaptureData& GetMutableCaptureData() {
+  [[nodiscard]] orbit_client_data::CaptureData& GetMutableCaptureData() override {
     CHECK(capture_data_ != nullptr);
     return *capture_data_;
   }
@@ -166,6 +169,9 @@ class OrbitApp final : public DataViewFactory,
       orbit_grpc_protos::ErrorEnablingOrbitApiEvent error_enabling_orbit_api_event) override;
   void OnErrorEnablingUserSpaceInstrumentationEvent(
       orbit_grpc_protos::ErrorEnablingUserSpaceInstrumentationEvent error_event) override;
+  void OnWarningInstrumentingWithUserSpaceInstrumentationEvent(
+      orbit_grpc_protos::WarningInstrumentingWithUserSpaceInstrumentationEvent warning_event)
+      override;
   void OnLostPerfRecordsEvent(
       orbit_grpc_protos::LostPerfRecordsEvent lost_perf_records_event) override;
   void OnOutOfOrderEventsDiscardedEvent(orbit_grpc_protos::OutOfOrderEventsDiscardedEvent
@@ -297,7 +303,7 @@ class OrbitApp final : public DataViewFactory,
     clipboard_callback_ = std::move(callback);
   }
   using SecureCopyCallback =
-      std::function<ErrorMessageOr<void>(std::string_view, std::string_view)>;
+      std::function<orbit_base::Future<ErrorMessageOr<void>>(std::string_view, std::string_view)>;
   void SetSecureCopyCallback(SecureCopyCallback callback) {
     secure_copy_callback_ = std::move(callback);
   }
@@ -346,6 +352,7 @@ class OrbitApp final : public DataViewFactory,
   void LoadPreset(const orbit_preset_file::PresetFile& preset) override;
   [[nodiscard]] orbit_data_views::PresetLoadState GetPresetLoadState(
       const orbit_preset_file::PresetFile& preset) const override;
+  void ShowPresetInExplorer(const orbit_preset_file::PresetFile& preset) override;
   void FilterTracks(const std::string& filter);
 
   void CrashOrbitService(orbit_grpc_protos::CrashOrbitServiceRequest_CrashType crash_type);
@@ -378,7 +385,7 @@ class OrbitApp final : public DataViewFactory,
     return manual_instrumentation_manager_.get();
   }
   [[nodiscard]] orbit_client_data::ModuleData* GetMutableModuleByPathAndBuildId(
-      const std::string& path, const std::string& build_id) const override {
+      const std::string& path, const std::string& build_id) override {
     return module_manager_->GetMutableModuleByPathAndBuildId(path, build_id);
   }
   [[nodiscard]] const orbit_client_data::ModuleData* GetModuleByPathAndBuildId(
@@ -386,13 +393,16 @@ class OrbitApp final : public DataViewFactory,
     return module_manager_->GetModuleByPathAndBuildId(path, build_id);
   }
 
+  void SetCollectSchedulerInfo(bool collect_scheduler_info);
   void SetCollectThreadStates(bool collect_thread_states);
+  void SetTraceGpuSubmissions(bool trace_gpu_submissions);
   void SetEnableApi(bool enable_api);
   void SetEnableIntrospection(bool enable_introspection);
-  void SetEnableUserSpaceInstrumentation(bool enable);
+  void SetDynamicInstrumentationMethod(
+      orbit_grpc_protos::CaptureOptions::DynamicInstrumentationMethod method);
   void SetSamplesPerSecond(double samples_per_second);
   void SetStackDumpSize(uint16_t stack_dump_size);
-  void SetUnwindingMethod(orbit_grpc_protos::UnwindingMethod unwinding_method);
+  void SetUnwindingMethod(orbit_grpc_protos::CaptureOptions::UnwindingMethod unwinding_method);
   void SetMaxLocalMarkerDepthPerCommandBuffer(uint64_t max_local_marker_depth_per_command_buffer);
 
   void SetCollectMemoryInfo(bool collect_memory_info) {
@@ -417,7 +427,8 @@ class OrbitApp final : public DataViewFactory,
   void DeselectFunction(const orbit_client_protos::FunctionInfo& func) override;
   [[nodiscard]] bool IsFunctionSelected(
       const orbit_client_protos::FunctionInfo& func) const override;
-  [[nodiscard]] bool IsFunctionSelected(const orbit_client_data::SampledFunction& func) const;
+  [[nodiscard]] bool IsFunctionSelected(
+      const orbit_client_data::SampledFunction& func) const override;
   [[nodiscard]] bool IsFunctionSelected(uint64_t absolute_address) const;
   [[nodiscard]] const orbit_grpc_protos::InstrumentedFunction* GetInstrumentedFunction(
       uint64_t function_id) const;
@@ -438,14 +449,19 @@ class OrbitApp final : public DataViewFactory,
   [[nodiscard]] uint64_t GetFunctionIdToHighlight() const;
   [[nodiscard]] uint64_t GetGroupIdToHighlight() const;
 
+  // origin_is_multiple_threads defines if the selection is specific to a single thread,
+  // or spans across multiple threads.
   void SelectCallstackEvents(
       const std::vector<orbit_client_protos::CallstackEvent>& selected_callstack_events,
+      bool origin_is_multiple_threads);
+  [[nodiscard]] const std::vector<orbit_client_protos::CallstackEvent>& GetSelectedCallstackEvents(
       uint32_t thread_id);
 
-  void SelectTracepoint(const orbit_grpc_protos::TracepointInfo& info);
-  void DeselectTracepoint(const orbit_grpc_protos::TracepointInfo& tracepoint);
+  void SelectTracepoint(const orbit_grpc_protos::TracepointInfo& info) override;
+  void DeselectTracepoint(const orbit_grpc_protos::TracepointInfo& tracepoint) override;
 
-  [[nodiscard]] bool IsTracepointSelected(const orbit_grpc_protos::TracepointInfo& info) const;
+  [[nodiscard]] bool IsTracepointSelected(
+      const orbit_grpc_protos::TracepointInfo& info) const override;
 
   // Only enables the frame track in the capture settings (in DataManager) and does not
   // add a frame track to the current capture data.
@@ -472,6 +488,8 @@ class OrbitApp final : public DataViewFactory,
   [[nodiscard]] bool HasFrameTrackInCaptureData(uint64_t instrumented_function_id) const override;
 
   void JumpToTimerAndZoom(uint64_t function_id, JumpToTimerMode selection_mode) override;
+  [[nodiscard]] std::vector<const orbit_client_protos::TimerInfo*> GetAllTimersForHookedFunction(
+      uint64_t function_id) const override;
 
  private:
   void UpdateModulesAbortCaptureIfModuleWithoutBuildIdNeedsReload(
@@ -491,8 +509,8 @@ class OrbitApp final : public DataViewFactory,
   void SelectFunctionsByName(const orbit_client_data::ModuleData* module,
                              absl::Span<const std::string> function_names);
 
-  ErrorMessageOr<std::filesystem::path> FindModuleLocally(const std::filesystem::path& module_path,
-                                                          const std::string& build_id);
+  ErrorMessageOr<std::filesystem::path> FindModuleLocally(
+      const orbit_client_data::ModuleData& module_data);
   [[nodiscard]] orbit_base::Future<ErrorMessageOr<void>> LoadSymbols(
       const std::filesystem::path& symbols_path, const std::string& module_file_path,
       const std::string& module_build_id);
@@ -521,7 +539,8 @@ class OrbitApp final : public DataViewFactory,
   void CaptureMetricProcessTimer(const orbit_client_protos::TimerInfo& timer);
 
   std::atomic<bool> capture_loading_cancellation_requested_ = false;
-  std::atomic<bool> is_loading_capture_{false};
+  std::atomic<orbit_client_data::CaptureData::DataSource> data_source_{
+      orbit_client_data::CaptureData::DataSource::kLiveCapture};
 
   CaptureStartedCallback capture_started_callback_;
   CaptureStopRequestedCallback capture_stop_requested_callback_;
@@ -548,10 +567,10 @@ class OrbitApp final : public DataViewFactory,
 
   std::unique_ptr<orbit_data_views::ModulesDataView> modules_data_view_;
   std::unique_ptr<orbit_data_views::FunctionsDataView> functions_data_view_;
-  std::unique_ptr<CallstackDataView> callstack_data_view_;
-  std::unique_ptr<CallstackDataView> selection_callstack_data_view_;
+  std::unique_ptr<orbit_data_views::CallstackDataView> callstack_data_view_;
+  std::unique_ptr<orbit_data_views::CallstackDataView> selection_callstack_data_view_;
   std::unique_ptr<orbit_data_views::PresetsDataView> presets_data_view_;
-  std::unique_ptr<TracepointsDataView> tracepoints_data_view_;
+  std::unique_ptr<orbit_data_views::TracepointsDataView> tracepoints_data_view_;
 
   CaptureWindow* capture_window_ = nullptr;
   IntrospectionWindow* introspection_window_ = nullptr;

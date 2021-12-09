@@ -13,13 +13,12 @@
 #include "App.h"
 #include "Batcher.h"
 #include "ClientData/CaptureData.h"
+#include "ClientProtos/capture_data.pb.h"
 #include "OrbitBase/Logging.h"
 #include "OrbitBase/ThreadConstants.h"
-#include "TimeGraph.h"
 #include "TimeGraphLayout.h"
 #include "TriangleToggle.h"
 #include "Viewport.h"
-#include "capture_data.pb.h"
 
 using orbit_client_protos::TimerInfo;
 
@@ -49,18 +48,19 @@ std::string MapGpuTimelineToTrackLabel(std::string_view timeline) {
 
 }  // namespace orbit_gl
 
-GpuTrack::GpuTrack(CaptureViewElement* parent, TimeGraph* time_graph, orbit_gl::Viewport* viewport,
-                   TimeGraphLayout* layout, uint64_t timeline_hash, OrbitApp* app,
-                   const orbit_client_data::CaptureData* capture_data,
-                   orbit_client_data::TrackData* submission_track_data,
-                   orbit_client_data::TrackData* marker_track_data)
-    : Track(parent, time_graph, viewport, layout, capture_data),
+GpuTrack::GpuTrack(CaptureViewElement* parent, const orbit_gl::TimelineInfoInterface* timeline_info,
+                   orbit_gl::Viewport* viewport, TimeGraphLayout* layout, uint64_t timeline_hash,
+                   OrbitApp* app, const orbit_client_data::CaptureData* capture_data,
+                   orbit_client_data::TimerData* submission_timer_data,
+                   orbit_client_data::TimerData* marker_timer_data)
+    : Track(parent, timeline_info, viewport, layout, capture_data),
       string_manager_{app->GetStringManager()},
-      submission_track_{std::make_shared<GpuSubmissionTrack>(this, time_graph, viewport, layout,
+      submission_track_{std::make_shared<GpuSubmissionTrack>(this, timeline_info, viewport, layout,
                                                              timeline_hash, app, capture_data,
-                                                             submission_track_data)},
-      marker_track_{std::make_shared<GpuDebugMarkerTrack>(
-          this, time_graph, viewport, layout, timeline_hash, app, capture_data, marker_track_data)},
+                                                             submission_timer_data)},
+      marker_track_{std::make_shared<GpuDebugMarkerTrack>(this, timeline_info, viewport, layout,
+                                                          timeline_hash, app, capture_data,
+                                                          marker_timer_data)},
       timeline_hash_{timeline_hash} {
   // Gpu are collapsed by default. Their subtracks are expanded by default, but are however not
   // shown while the Gpu track is collapsed.
@@ -86,14 +86,21 @@ void GpuTrack::UpdatePositionOfSubtracks() {
   const Vec2 pos = GetPos();
   if (collapse_toggle_->IsCollapsed()) {
     submission_track_->SetPos(pos[0], pos[1]);
+    marker_track_->SetVisible(false);
+    submission_track_->SetHeadless(true);
     return;
   }
+  marker_track_->SetVisible(true);
+  marker_track_->SetIndentationLevel(indentation_level_ + 1);
+  submission_track_->SetHeadless(false);
+  submission_track_->SetIndentationLevel(indentation_level_ + 1);
+
   float current_y = pos[1] + layout_->GetTrackTabHeight();
-  if (!submission_track_->IsEmpty()) {
+  if (submission_track_->ShouldBeRendered()) {
     current_y += layout_->GetSpaceBetweenSubtracks();
   }
   submission_track_->SetPos(pos[0], current_y);
-  if (!marker_track_->IsEmpty()) {
+  if (marker_track_->ShouldBeRendered()) {
     current_y += (layout_->GetSpaceBetweenSubtracks() + submission_track_->GetHeight());
   }
 
@@ -105,73 +112,20 @@ float GpuTrack::GetHeight() const {
     return submission_track_->GetHeight();
   }
   float height = layout_->GetTrackTabHeight();
-  if (!submission_track_->IsEmpty()) {
+  if (submission_track_->ShouldBeRendered()) {
     height += submission_track_->GetHeight();
     height += layout_->GetSpaceBetweenSubtracks();
   }
-  if (!marker_track_->IsEmpty()) {
+  if (marker_track_->ShouldBeRendered()) {
     height += marker_track_->GetHeight();
     height += layout_->GetSpaceBetweenSubtracks();
   }
   return height;
 }
 
-// TODO(b/176216022): Make a general interface for capture view elements for setting the width to
-// every child.
-void GpuTrack::SetWidth(float width) {
-  Track::SetWidth(width);
-  submission_track_->SetWidth(width);
-  marker_track_->SetWidth(width);
-}
-
-void GpuTrack::Draw(Batcher& batcher, TextRenderer& text_renderer,
-                    const DrawContext& draw_context) {
-  Track::Draw(batcher, text_renderer, draw_context);
-
-  if (collapse_toggle_->IsCollapsed()) {
-    return;
-  }
-  const DrawContext sub_track_draw_context = draw_context.IncreasedIndentationLevel();
-  if (!submission_track_->IsEmpty()) {
-    submission_track_->Draw(batcher, text_renderer, sub_track_draw_context);
-  }
-
-  if (!marker_track_->IsEmpty()) {
-    marker_track_->Draw(batcher, text_renderer, sub_track_draw_context);
-  }
-}
-
-void GpuTrack::UpdatePrimitives(Batcher* batcher, uint64_t min_tick, uint64_t max_tick,
-                                PickingMode picking_mode, float z_offset) {
-  const bool is_collapsed = collapse_toggle_->IsCollapsed();
-
-  if (!submission_track_->IsEmpty()) {
-    submission_track_->UpdatePrimitives(batcher, min_tick, max_tick, picking_mode, z_offset);
-  }
-
-  if (is_collapsed) {
-    return;
-  }
-
-  if (!marker_track_->IsEmpty()) {
-    marker_track_->UpdatePrimitives(batcher, min_tick, max_tick, picking_mode, z_offset);
-  }
-}
-
-std::vector<orbit_gl::CaptureViewElement*> GpuTrack::GetVisibleChildren() {
-  std::vector<CaptureViewElement*> result;
-
-  if (collapse_toggle_->IsCollapsed()) {
-    return result;
-  }
-
-  if (!submission_track_->IsEmpty()) {
-    result.push_back(submission_track_.get());
-  }
-
-  if (!marker_track_->IsEmpty()) {
-    result.push_back(marker_track_.get());
-  }
+std::vector<orbit_gl::CaptureViewElement*> GpuTrack::GetAllChildren() const {
+  auto result = Track::GetAllChildren();
+  result.insert(result.end(), {submission_track_.get(), marker_track_.get()});
   return result;
 }
 

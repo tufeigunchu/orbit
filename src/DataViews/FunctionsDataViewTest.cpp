@@ -14,16 +14,28 @@
 #include "ClientData/ModuleData.h"
 #include "ClientData/ModuleManager.h"
 #include "ClientData/ProcessData.h"
+#include "ClientProtos/capture_data.pb.h"
+#include "DataViewTestUtils.h"
 #include "DataViews/DataView.h"
 #include "DataViews/FunctionsDataView.h"
+#include "GrpcProtos/capture.pb.h"
+#include "GrpcProtos/process.pb.h"
 #include "MockAppInterface.h"
-#include "OrbitBase/ReadFileToString.h"
-#include "OrbitBase/TemporaryFile.h"
-#include "OrbitBase/ThreadPool.h"
-#include "TestUtils/TestUtils.h"
-#include "capture.pb.h"
-#include "capture_data.pb.h"
-#include "process.pb.h"
+
+using orbit_client_data::CaptureData;
+using orbit_data_views::CheckCopySelectionIsInvoked;
+using orbit_data_views::CheckExportToCsvIsInvoked;
+using orbit_data_views::CheckSingleAction;
+using orbit_data_views::ContextMenuEntry;
+using orbit_data_views::FlattenContextMenuWithGrouping;
+using orbit_data_views::kMenuActionCopySelection;
+using orbit_data_views::kMenuActionDisableFrameTrack;
+using orbit_data_views::kMenuActionDisassembly;
+using orbit_data_views::kMenuActionEnableFrameTrack;
+using orbit_data_views::kMenuActionExportToCsv;
+using orbit_data_views::kMenuActionSelect;
+using orbit_data_views::kMenuActionSourceCode;
+using orbit_data_views::kMenuActionUnselect;
 
 namespace {
 struct FunctionsDataViewTest : public testing::Test {
@@ -146,7 +158,7 @@ TEST_F(FunctionsDataViewTest, IsEmptyOnConstruction) {
 }
 
 TEST_F(FunctionsDataViewTest, FunctionNameIsDisplayName) {
-  EXPECT_CALL(app_, IsFunctionSelected)
+  EXPECT_CALL(app_, IsFunctionSelected(testing::A<const orbit_client_protos::FunctionInfo&>()))
       .Times(testing::AnyNumber())
       .WillRepeatedly(testing::Return(false));
 
@@ -164,7 +176,7 @@ TEST_F(FunctionsDataViewTest, InvalidColumnAndRowNumbersReturnEmptyString) {
 }
 
 TEST_F(FunctionsDataViewTest, ViewHandlesMultipleElements) {
-  EXPECT_CALL(app_, IsFunctionSelected)
+  EXPECT_CALL(app_, IsFunctionSelected(testing::A<const orbit_client_protos::FunctionInfo&>()))
       .Times(testing::AnyNumber())
       .WillRepeatedly(testing::Return(false));
 
@@ -180,7 +192,7 @@ TEST_F(FunctionsDataViewTest, ViewHandlesMultipleElements) {
 }
 
 TEST_F(FunctionsDataViewTest, ClearFunctionsRemovesAllElements) {
-  EXPECT_CALL(app_, IsFunctionSelected)
+  EXPECT_CALL(app_, IsFunctionSelected(testing::A<const orbit_client_protos::FunctionInfo&>()))
       .Times(testing::AnyNumber())
       .WillRepeatedly(testing::Return(false));
 
@@ -195,7 +207,7 @@ TEST_F(FunctionsDataViewTest, FunctionSelectionAppearsInFirstColumn) {
   bool function_selected = false;
   bool frame_track_enabled = false;
 
-  EXPECT_CALL(app_, IsFunctionSelected)
+  EXPECT_CALL(app_, IsFunctionSelected(testing::A<const orbit_client_protos::FunctionInfo&>()))
       .Times(testing::AnyNumber())
       .WillRepeatedly(testing::ReturnPointee(&function_selected));
 
@@ -231,7 +243,7 @@ TEST_F(FunctionsDataViewTest, FrameTrackSelectionAppearsInFirstColumn) {
   bool function_selected = false;
   bool frame_track_enabled = false;
 
-  EXPECT_CALL(app_, IsFunctionSelected)
+  EXPECT_CALL(app_, IsFunctionSelected(testing::A<const orbit_client_protos::FunctionInfo&>()))
       .Times(testing::AnyNumber())
       .WillRepeatedly(testing::ReturnPointee(&function_selected));
 
@@ -267,9 +279,18 @@ TEST_F(FunctionsDataViewTest, FrameTrackSelectionAppearsInFirstColumnWhenACaptur
   (void)module_manager.AddOrUpdateModules({module_infos_[0]});
   ASSERT_EQ(module_manager.GetAllModuleData().size(), 1);
 
+  orbit_grpc_protos::SymbolInfo symbol_info;
+  symbol_info.set_name(functions_[0].name());
+  symbol_info.set_demangled_name(functions_[0].pretty_name());
+  symbol_info.set_address(functions_[0].address());
+  symbol_info.set_size(functions_[0].size());
+  orbit_grpc_protos::ModuleSymbols module_symbols;
+  module_symbols.set_load_bias(module_infos_[0].load_bias());
+  module_symbols.set_symbols_file_path(module_infos_[0].file_path());
+  module_symbols.mutable_symbol_infos()->Add(std::move(symbol_info));
   orbit_client_data::ModuleData* module_data = module_manager.GetMutableModuleByPathAndBuildId(
       functions_[0].module_path(), functions_[0].module_build_id());
-  module_data->AddFunctionInfoWithBuildId(functions_[0], functions_[0].module_build_id());
+  module_data->AddSymbols(module_symbols);
 
   orbit_grpc_protos::CaptureStarted capture_started{};
 
@@ -280,7 +301,7 @@ TEST_F(FunctionsDataViewTest, FrameTrackSelectionAppearsInFirstColumnWhenACaptur
   instrumented_function->set_file_offset(
       orbit_client_data::function_utils::Offset(functions_[0], *module_data));
 
-  EXPECT_CALL(app_, IsFunctionSelected)
+  EXPECT_CALL(app_, IsFunctionSelected(testing::A<const orbit_client_protos::FunctionInfo&>()))
       .Times(testing::AnyNumber())
       .WillRepeatedly(testing::Return(true));
 
@@ -291,7 +312,8 @@ TEST_F(FunctionsDataViewTest, FrameTrackSelectionAppearsInFirstColumnWhenACaptur
 
   EXPECT_CALL(app_, HasCaptureData).Times(2).WillRepeatedly(testing::Return(true));
 
-  orbit_client_data::CaptureData capture_data{&module_manager, capture_started, std::nullopt, {}};
+  orbit_client_data::CaptureData capture_data{
+      &module_manager, capture_started, std::nullopt, {}, CaptureData::DataSource::kLiveCapture};
   EXPECT_CALL(app_, GetCaptureData).Times(2).WillRepeatedly(testing::ReturnPointee(&capture_data));
 
   // Note that `CaptureData` also keeps a list of enabled frame track function ids, but this list is
@@ -314,7 +336,7 @@ TEST_F(FunctionsDataViewTest, FrameTrackSelectionAppearsInFirstColumnWhenACaptur
 }
 
 TEST_F(FunctionsDataViewTest, FunctionSizeAppearsInThirdColumn) {
-  EXPECT_CALL(app_, IsFunctionSelected)
+  EXPECT_CALL(app_, IsFunctionSelected(testing::A<const orbit_client_protos::FunctionInfo&>()))
       .Times(testing::AnyNumber())
       .WillRepeatedly(testing::Return(false));
 
@@ -324,7 +346,7 @@ TEST_F(FunctionsDataViewTest, FunctionSizeAppearsInThirdColumn) {
 }
 
 TEST_F(FunctionsDataViewTest, ModuleColumnShowsFilenameOfModule) {
-  EXPECT_CALL(app_, IsFunctionSelected)
+  EXPECT_CALL(app_, IsFunctionSelected(testing::A<const orbit_client_protos::FunctionInfo&>()))
       .Times(testing::AnyNumber())
       .WillRepeatedly(testing::Return(false));
 
@@ -344,27 +366,9 @@ TEST_F(FunctionsDataViewTest, AddressColumnShowsAddress) {
   EXPECT_EQ(view_.GetValue(0, 4).substr(2), absl::StrFormat("%x", functions_[0].address()));
 }
 
-TEST_F(FunctionsDataViewTest, CommonContextMenuEntriesArePresent) {
-  // This functionality is not tested in this test case.
-  EXPECT_CALL(app_, IsFunctionSelected)
-      .Times(testing::AnyNumber())
-      .WillRepeatedly(testing::Return(false));
-
-  // This functionality is not tested in this test case.
-  EXPECT_CALL(app_, IsFrameTrackEnabled)
-      .Times(testing::AnyNumber())
-      .WillRepeatedly(testing::Return(false));
-
-  view_.AddFunctions({&functions_[0], &functions_[1], &functions_[2]});
-
-  EXPECT_THAT(view_.GetContextMenu(0, {0}),
-              testing::IsSupersetOf({"Copy Selection", "Export to CSV"}));
-}
-
 TEST_F(FunctionsDataViewTest, ContextMenuEntriesChangeOnFunctionState) {
-  std::array<bool, 3> is_function_selected = {false, false, false};
-
-  EXPECT_CALL(app_, IsFunctionSelected)
+  std::array<bool, 3> is_function_selected = {true, true, false};
+  EXPECT_CALL(app_, IsFunctionSelected(testing::A<const orbit_client_protos::FunctionInfo&>()))
       .Times(testing::AnyNumber())
       .WillRepeatedly([&](const orbit_client_protos::FunctionInfo& function) -> bool {
         std::optional<size_t> index = IndexOfFunction(function);
@@ -372,7 +376,7 @@ TEST_F(FunctionsDataViewTest, ContextMenuEntriesChangeOnFunctionState) {
         return is_function_selected.at(index.value());
       });
 
-  std::array<bool, 3> is_frame_track_enabled = {false, false, false};
+  std::array<bool, 3> is_frame_track_enabled = {true, false, false};
   EXPECT_CALL(app_, IsFrameTrackEnabled)
       .Times(testing::AnyNumber())
       .WillRepeatedly([&](const orbit_client_protos::FunctionInfo& function) -> bool {
@@ -383,89 +387,55 @@ TEST_F(FunctionsDataViewTest, ContextMenuEntriesChangeOnFunctionState) {
 
   view_.AddFunctions({&functions_[0], &functions_[1], &functions_[2]});
 
-  const auto can_unhook = [&]() {
-    return testing::AllOf(testing::Not(testing::Contains("Hook")), testing::Contains("Unhook"));
+  auto verify_context_menu_action_availability = [&](std::vector<int> selected_indices) {
+    std::vector<std::string> context_menu =
+        FlattenContextMenuWithGrouping(view_.GetContextMenuWithGrouping(0, selected_indices));
+
+    // Common actions should always be available.
+    CheckSingleAction(context_menu, kMenuActionCopySelection, ContextMenuEntry::kEnabled);
+    CheckSingleAction(context_menu, kMenuActionExportToCsv, ContextMenuEntry::kEnabled);
+
+    // Source code and disassembly actions are also always available.
+    CheckSingleAction(context_menu, kMenuActionSourceCode, ContextMenuEntry::kEnabled);
+    CheckSingleAction(context_menu, kMenuActionDisassembly, ContextMenuEntry::kEnabled);
+
+    // Hook action is available if and only if there is an unselected function. Unhook action is
+    // available if and only if there is a selected instrumented function.
+    // Enable frametrack action is available if and only if there is a function with frametrack not
+    // yet enabled, disable frametrack action is available if and only if there is a function with
+    // frametrack enabled.
+    ContextMenuEntry select = ContextMenuEntry::kDisabled;
+    ContextMenuEntry unselect = ContextMenuEntry::kDisabled;
+    ContextMenuEntry enable_frametrack = ContextMenuEntry::kDisabled;
+    ContextMenuEntry disable_frametrack = ContextMenuEntry::kDisabled;
+    for (size_t index : selected_indices) {
+      if (is_function_selected.at(index)) {
+        unselect = ContextMenuEntry::kEnabled;
+      } else {
+        select = ContextMenuEntry::kEnabled;
+      }
+
+      if (is_frame_track_enabled.at(index)) {
+        disable_frametrack = ContextMenuEntry::kEnabled;
+      } else {
+        enable_frametrack = ContextMenuEntry::kEnabled;
+      }
+    }
+    CheckSingleAction(context_menu, kMenuActionSelect, select);
+    CheckSingleAction(context_menu, kMenuActionUnselect, unselect);
+    CheckSingleAction(context_menu, kMenuActionEnableFrameTrack, enable_frametrack);
+    CheckSingleAction(context_menu, kMenuActionDisableFrameTrack, disable_frametrack);
   };
-  const auto can_hook = [&]() {
-    return testing::AllOf(testing::Contains("Hook"), testing::Not(testing::Contains("Unhook")));
-  };
-  const auto can_hook_and_unhook = [&]() {
-    return testing::AllOf(testing::Contains("Hook"), testing::Contains("Unhook"));
-  };
-  const auto can_disable_frame_tracks = [&]() {
-    return testing::AllOf(testing::Not(testing::Contains("Enable frame track(s)")),
-                          testing::Contains("Disable frame track(s)"));
-  };
-  const auto can_enable_frame_tracks = [&]() {
-    return testing::AllOf(testing::Contains("Enable frame track(s)"),
-                          testing::Not(testing::Contains("Disable frame track(s)")));
-  };
-  const auto can_enable_and_disable_frame_tracks = [&]() {
-    return testing::AllOf(testing::Contains("Enable frame track(s)"),
-                          testing::Contains("Disable frame track(s)"));
-  };
 
-  // Context menus when single entries are selected
-
-  is_function_selected[0] = false;
-  is_frame_track_enabled[0] = false;
-  EXPECT_THAT(view_.GetContextMenu(0, {0}), can_hook());
-  EXPECT_THAT(view_.GetContextMenu(0, {0}), can_enable_frame_tracks());
-
-  is_function_selected[0] = true;
-  is_frame_track_enabled[0] = false;
-  EXPECT_THAT(view_.GetContextMenu(0, {0}), can_unhook());
-  EXPECT_THAT(view_.GetContextMenu(0, {0}), can_enable_frame_tracks());
-
-  is_function_selected[0] = true;
-  is_frame_track_enabled[0] = true;
-  EXPECT_THAT(view_.GetContextMenu(0, {0}), can_unhook());
-  EXPECT_THAT(view_.GetContextMenu(0, {0}), can_disable_frame_tracks());
-
-  // Note that the missing combination - `is_function_selected = false` and `is_frame_track_enabled
-  // = true` - makes no sense since a function needs to be hooked to have a frame track enabled.
-
-  // Context menus when multiple entries are selected: A particular action will be offered when any
-  // selected entry can execute that action.
-  is_function_selected = {false, false, false};
-  is_frame_track_enabled = {false, false, false};
-  EXPECT_THAT(view_.GetContextMenu(0, {0, 1, 2}), can_hook());
-  EXPECT_THAT(view_.GetContextMenu(0, {0, 1, 2}), can_enable_frame_tracks());
-
-  is_function_selected = {false, true, false};
-  is_frame_track_enabled = {false, false, false};
-  EXPECT_THAT(view_.GetContextMenu(0, {0, 1, 2}), can_hook_and_unhook());
-  EXPECT_THAT(view_.GetContextMenu(0, {0, 1, 2}), can_enable_frame_tracks());
-
-  is_function_selected = {false, true, false};
-  is_frame_track_enabled = {false, true, false};
-  EXPECT_THAT(view_.GetContextMenu(0, {0, 1, 2}), can_hook_and_unhook());
-  EXPECT_THAT(view_.GetContextMenu(0, {0, 1, 2}), can_enable_and_disable_frame_tracks());
-
-  is_function_selected = {false, true, true};
-  is_frame_track_enabled = {false, true, false};
-  EXPECT_THAT(view_.GetContextMenu(0, {0, 1, 2}), can_hook_and_unhook());
-  EXPECT_THAT(view_.GetContextMenu(0, {0, 1, 2}), can_enable_and_disable_frame_tracks());
-
-  is_function_selected = {false, true, true};
-  is_frame_track_enabled = {false, true, false};
-  EXPECT_THAT(view_.GetContextMenu(0, {0, 1, 2}), can_hook_and_unhook());
-  EXPECT_THAT(view_.GetContextMenu(0, {0, 1, 2}), can_enable_and_disable_frame_tracks());
-
-  is_function_selected = {true, true, true};
-  is_frame_track_enabled = {true, true, false};
-  EXPECT_THAT(view_.GetContextMenu(0, {0, 1, 2}), can_unhook());
-  EXPECT_THAT(view_.GetContextMenu(0, {0, 1, 2}), can_enable_and_disable_frame_tracks());
-
-  is_function_selected = {true, true, true};
-  is_frame_track_enabled = {true, true, true};
-  EXPECT_THAT(view_.GetContextMenu(0, {0, 1, 2}), can_unhook());
-  EXPECT_THAT(view_.GetContextMenu(0, {0, 1, 2}), can_disable_frame_tracks());
+  verify_context_menu_action_availability({0});
+  verify_context_menu_action_availability({1});
+  verify_context_menu_action_availability({2});
+  verify_context_menu_action_availability({0, 1, 2});
 }
 
 TEST_F(FunctionsDataViewTest, GenericDataExportFunctionShowCorrectData) {
   // This functionality is not tested in this test case.
-  EXPECT_CALL(app_, IsFunctionSelected)
+  EXPECT_CALL(app_, IsFunctionSelected(testing::A<const orbit_client_protos::FunctionInfo&>()))
       .Times(testing::AnyNumber())
       .WillRepeatedly(testing::Return(false));
 
@@ -481,64 +451,37 @@ TEST_F(FunctionsDataViewTest, GenericDataExportFunctionShowCorrectData) {
 
   view_.AddFunctions({&functions_[0]});
 
-  std::vector<std::string> context_menu = view_.GetContextMenu(0, {0});
+  std::vector<std::string> context_menu =
+      FlattenContextMenuWithGrouping(view_.GetContextMenuWithGrouping(0, {0}));
 
   // Copy Selection
   {
-    const auto copy_selection_idx =
-        std::find(context_menu.begin(), context_menu.end(), "Copy Selection") -
-        context_menu.begin();
-    ASSERT_LT(copy_selection_idx, context_menu.size());
-
-    std::string clipboard;
-    EXPECT_CALL(app_, SetClipboard).Times(1).WillOnce(testing::SaveArg<0>(&clipboard));
-    view_.OnContextMenu("Copy Selection", static_cast<int>(copy_selection_idx), {0});
-    EXPECT_EQ(clipboard, absl::StrFormat(
-                             "Hooked\tFunction\tSize\tModule\tAddress in module\n"
-                             "\t%s\t%d\t%s\t%#x\n",
-                             functions_[0].pretty_name(), functions_[0].size(),
-                             std::filesystem::path{functions_[0].module_path()}.filename().string(),
-                             functions_[0].address()));
+    std::string expected_clipboard = absl::StrFormat(
+        "Hooked\tFunction\tSize\tModule\tAddress in module\n"
+        "\t%s\t%d\t%s\t%#x\n",
+        functions_[0].pretty_name(), functions_[0].size(),
+        std::filesystem::path{functions_[0].module_path()}.filename().string(),
+        functions_[0].address());
+    CheckCopySelectionIsInvoked(context_menu, app_, view_, expected_clipboard);
   }
 
   // Export to CSV
   {
-    const auto export_to_csv_idx =
-        std::find(context_menu.begin(), context_menu.end(), "Export to CSV") - context_menu.begin();
-    ASSERT_LT(export_to_csv_idx, context_menu.size());
-
-    ErrorMessageOr<orbit_base::TemporaryFile> temporary_file_or_error =
-        orbit_base::TemporaryFile::Create();
-    ASSERT_THAT(temporary_file_or_error, orbit_test_utils::HasNoError());
-    const std::filesystem::path temporary_file_path = temporary_file_or_error.value().file_path();
-
-    // We actually only need a temporary file path, so let's call `CloseAndRemove` and reuse the
-    // filepath. The TemporaryFile instance will still take care of deleting our new file when it
-    // gets out of scope.
-    temporary_file_or_error.value().CloseAndRemove();
-
-    EXPECT_CALL(app_, GetSaveFile).Times(1).WillOnce(testing::Return(temporary_file_path.string()));
-    view_.OnContextMenu("Export to CSV", static_cast<int>(export_to_csv_idx), {0});
-
-    ErrorMessageOr<std::string> contents_or_error =
-        orbit_base::ReadFileToString(temporary_file_path);
-    ASSERT_THAT(contents_or_error, orbit_test_utils::HasNoError());
-
-    EXPECT_EQ(
-        contents_or_error.value(),
+    std::string expected_contents =
         absl::StrFormat(R"("Hooked","Function","Size","Module","Address in module")"
                         "\r\n"
                         R"("","%s","%d","%s","%#x")"
                         "\r\n",
                         functions_[0].pretty_name(), functions_[0].size(),
                         std::filesystem::path{functions_[0].module_path()}.filename().string(),
-                        functions_[0].address()));
+                        functions_[0].address());
+    CheckExportToCsvIsInvoked(context_menu, app_, view_, expected_contents);
   }
 }
 
 TEST_F(FunctionsDataViewTest, ColumnSorting) {
   // This functionality is not tested in this test case.
-  EXPECT_CALL(app_, IsFunctionSelected)
+  EXPECT_CALL(app_, IsFunctionSelected(testing::A<const orbit_client_protos::FunctionInfo&>()))
       .Times(testing::AnyNumber())
       .WillRepeatedly(testing::Return(false));
 
@@ -628,15 +571,17 @@ TEST_F(FunctionsDataViewTest, ColumnSorting) {
 }
 
 TEST_F(FunctionsDataViewTest, ContextMenuActionsCallCorrespondingFunctionsInAppInterface) {
-  EXPECT_CALL(app_, IsFunctionSelected)
+  EXPECT_CALL(app_, IsFunctionSelected(testing::A<const orbit_client_protos::FunctionInfo&>()))
       .Times(testing::AnyNumber())
       .WillRepeatedly(testing::Return(false));
   EXPECT_CALL(app_, IsFrameTrackEnabled)
       .Times(testing::AnyNumber())
       .WillRepeatedly(testing::Return(false));
-  EXPECT_CALL(app_, HasCaptureData)
-      .Times(testing::AnyNumber())
-      .WillRepeatedly(testing::Return(false));
+
+  orbit_client_data::CaptureData capture_data{
+      nullptr, {}, std::nullopt, {}, CaptureData::DataSource::kLiveCapture};
+  EXPECT_CALL(app_, GetCaptureData).WillRepeatedly(testing::ReturnPointee(&capture_data));
+  EXPECT_CALL(app_, IsCaptureConnected).WillRepeatedly(testing::Return(true));
 
   view_.AddFunctions({&functions_[0]});
 
@@ -646,27 +591,27 @@ TEST_F(FunctionsDataViewTest, ContextMenuActionsCallCorrespondingFunctionsInAppI
   };
 
   EXPECT_CALL(app_, SelectFunction).Times(1).WillRepeatedly(match_function);
-  view_.OnContextMenu("Hook", 0, {0});
+  view_.OnContextMenu(std::string{kMenuActionSelect}, 0, {0});
 
   EXPECT_CALL(app_, DeselectFunction).Times(1).WillRepeatedly(match_function);
   EXPECT_CALL(app_, DisableFrameTrack).Times(1).WillRepeatedly(match_function);
   EXPECT_CALL(app_, RemoveFrameTrack(testing::A<const orbit_client_protos::FunctionInfo&>()))
       .Times(1)
       .WillRepeatedly(match_function);
-  view_.OnContextMenu("Unhook", 0, {0});
+  view_.OnContextMenu(std::string{kMenuActionUnselect}, 0, {0});
 
   EXPECT_CALL(app_, SelectFunction).Times(1).WillRepeatedly(match_function);
   EXPECT_CALL(app_, EnableFrameTrack).Times(1).WillRepeatedly(match_function);
   EXPECT_CALL(app_, AddFrameTrack(testing::A<const orbit_client_protos::FunctionInfo&>()))
       .Times(1)
       .WillRepeatedly(match_function);
-  view_.OnContextMenu("Enable frame track(s)", 0, {0});
+  view_.OnContextMenu(std::string{kMenuActionEnableFrameTrack}, 0, {0});
 
   EXPECT_CALL(app_, DisableFrameTrack).Times(1).WillRepeatedly(match_function);
   EXPECT_CALL(app_, RemoveFrameTrack(testing::A<const orbit_client_protos::FunctionInfo&>()))
       .Times(1)
       .WillRepeatedly(match_function);
-  view_.OnContextMenu("Disable frame track(s)", 0, {0});
+  view_.OnContextMenu(std::string{kMenuActionDisableFrameTrack}, 0, {0});
 
   constexpr int kRandomPid = 4242;
   orbit_grpc_protos::ProcessInfo process_info{};
@@ -680,15 +625,15 @@ TEST_F(FunctionsDataViewTest, ContextMenuActionsCallCorrespondingFunctionsInAppI
         EXPECT_EQ(pid, kRandomPid);
         match_function(function);
       });
-  view_.OnContextMenu("Go to Disassembly", 0, {0});
+  view_.OnContextMenu(std::string{kMenuActionDisassembly}, 0, {0});
 
   EXPECT_CALL(app_, ShowSourceCode).Times(1).WillRepeatedly(match_function);
-  view_.OnContextMenu("Go to Source code", 0, {0});
+  view_.OnContextMenu(std::string{kMenuActionSourceCode}, 0, {0});
 }
 
 TEST_F(FunctionsDataViewTest, FilteringByFunctionName) {
   // This functionality is not tested in this test case.
-  EXPECT_CALL(app_, IsFunctionSelected)
+  EXPECT_CALL(app_, IsFunctionSelected(testing::A<const orbit_client_protos::FunctionInfo&>()))
       .Times(testing::AnyNumber())
       .WillRepeatedly(testing::Return(false));
 
@@ -743,7 +688,7 @@ TEST_F(FunctionsDataViewTest, FilteringByFunctionName) {
 
 TEST_F(FunctionsDataViewTest, FilteringByModuleName) {
   // This functionality is not tested in this test case.
-  EXPECT_CALL(app_, IsFunctionSelected)
+  EXPECT_CALL(app_, IsFunctionSelected(testing::A<const orbit_client_protos::FunctionInfo&>()))
       .Times(testing::AnyNumber())
       .WillRepeatedly(testing::Return(false));
 
@@ -772,7 +717,7 @@ TEST_F(FunctionsDataViewTest, FilteringByModuleName) {
 
 TEST_F(FunctionsDataViewTest, FilteringByFunctionAndModuleName) {
   // This functionality is not tested in this test case.
-  EXPECT_CALL(app_, IsFunctionSelected)
+  EXPECT_CALL(app_, IsFunctionSelected(testing::A<const orbit_client_protos::FunctionInfo&>()))
       .Times(testing::AnyNumber())
       .WillRepeatedly(testing::Return(false));
 

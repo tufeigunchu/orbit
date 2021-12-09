@@ -62,11 +62,12 @@ TimeGraph::TimeGraph(AccessibleInterfaceProvider* parent, OrbitApp* app,
     // Note that `GlCanvas` and `TimeGraph` span the bridge to OpenGl content, and `TimeGraph`'s
     // parent needs special handling for accessibility. Thus, we use `nullptr` here and we save the
     // parent in accessible_parent_ which doesn't need to be a CaptureViewElement.
-    : orbit_gl::CaptureViewElement(nullptr, this, viewport, &layout_),
+    : orbit_gl::CaptureViewElement(nullptr, viewport, &layout_),
       accessible_parent_{parent},
       batcher_(BatcherId::kTimeGraph),
       manual_instrumentation_manager_{app->GetManualInstrumentationManager()},
       capture_data_{capture_data},
+      thread_track_data_provider_(capture_data->GetThreadTrackDataProvider()),
       app_{app} {
   text_renderer_static_.Init();
   text_renderer_static_.SetViewport(viewport);
@@ -80,10 +81,25 @@ TimeGraph::TimeGraph(AccessibleInterfaceProvider* parent, OrbitApp* app,
             ProcessAsyncTimer(name, timer_info);
           });
   manual_instrumentation_manager_->AddAsyncTimerListener(async_timer_info_listener_.get());
+
+  if (absl::GetFlag(FLAGS_enforce_full_redraw)) {
+    RequestUpdate();
+  }
 }
 
 TimeGraph::~TimeGraph() {
   manual_instrumentation_manager_->RemoveAsyncTimerListener(async_timer_info_listener_.get());
+}
+
+float TimeGraph::GetHeight() const {
+  // Top and Bottom Margin. TODO: Margins should be treated in a different way (http://b/192070555).
+  float total_height = layout_.GetSchedulerTrackOffset() + layout_.GetBottomMargin();
+
+  // Track height including space between them
+  for (auto& track : GetNonHiddenChildren()) {
+    total_height += (track->GetHeight() + layout_.GetSpaceBetweenTracks());
+  }
+  return total_height;
 }
 
 void TimeGraph::UpdateCaptureMinMaxTimestamps() {
@@ -143,14 +159,10 @@ void TimeGraph::ZoomTime(float zoom_value, double mouse_ratio) {
   double min_time_us = ref_time_us_ - scale * time_left;
   double max_time_us = ref_time_us_ + scale * time_right;
 
-  if (max_time_us - min_time_us < 0.001 /*1 ns*/) {
-    return;
-  }
-
   SetMinMax(min_time_us, max_time_us);
 }
 
-void TimeGraph::VerticalZoom(float zoom_value, float mouse_relative_position) {
+void TimeGraph::VerticalZoom(float zoom_value, float mouse_normalized_y_position) {
   constexpr float kIncrementRatio = 0.1f;
 
   const float ratio = (zoom_value > 0) ? (1 + kIncrementRatio) : (1 / (1 + kIncrementRatio));
@@ -159,24 +171,26 @@ void TimeGraph::VerticalZoom(float zoom_value, float mouse_relative_position) {
   const float old_scale = layout_.GetScale();
   layout_.SetScale(old_scale / ratio);
 
-  // We are limiting the maximum and minimum zoom-level, so the real ratio could be different.
-  const float capped_ratio = old_scale / layout_.GetScale();
-
-  const float world_height = viewport_->GetVisibleWorldHeight();
-  const float y_mouse_position =
-      viewport_->GetWorldTopLeft()[1] - mouse_relative_position * world_height;
-  const float top_distance = viewport_->GetWorldTopLeft()[1] - y_mouse_position;
-
-  const float new_y_mouse_position = y_mouse_position / capped_ratio;
-
-  float new_world_top_left_y = new_y_mouse_position + top_distance;
-
-  viewport_->SetWorldTopLeftY(new_world_top_left_y);
+  // Adjust the scrolling offset such that the point under the mouse stays the same if possible.
+  // For this, calculate the "global" position (including scaling and scrolling offset) of the point
+  // underneath the mouse with the old and new scaling, and adjust the scrolling to have them match.
+  const float offset_from_top_in_world = viewport_->GetWorldHeight() * mouse_normalized_y_position;
+  const float mouse_y_including_scrolling =
+      (offset_from_top_in_world + vertical_scrolling_offset_) / old_scale;
+  const float new_scrolling_offset =
+      mouse_y_including_scrolling * layout_.GetScale() - offset_from_top_in_world;
+  SetVerticalScrollingOffset(new_scrolling_offset);
 }
 
 void TimeGraph::SetMinMax(double min_time_us, double max_time_us) {
-  double desired_time_window = max_time_us - min_time_us;
-  min_time_us_ = std::max(min_time_us, 0.0);
+  constexpr double kTimeGraphMinTimeWindowsUs = 0.1; /* 100 ns */
+  const double desired_time_window =
+      std::max(max_time_us - min_time_us, kTimeGraphMinTimeWindowsUs);
+
+  // Centering the interval in screen.
+  const double center_time_us = (max_time_us + min_time_us) / 2.;
+
+  min_time_us_ = std::max(center_time_us - desired_time_window / 2, 0.0);
   max_time_us_ = std::min(min_time_us_ + desired_time_window, GetCaptureTimeSpanUs());
 
   RequestUpdate();
@@ -231,15 +245,14 @@ void TimeGraph::VerticallyMoveIntoView(const TimerInfo& timer_info) {
 
 // Move vertically the view to make a Track fully visible.
 void TimeGraph::VerticallyMoveIntoView(Track& track) {
-  float pos = track.GetPos()[1];
+  float pos = track.GetPos()[1] + vertical_scrolling_offset_;
   float height = track.GetHeight();
-  float world_top_left_y = viewport_->GetWorldTopLeft()[1];
 
-  float max_world_top_left_y = pos;
-  float min_world_top_left_y =
-      pos + height - viewport_->GetVisibleWorldHeight() + layout_.GetBottomMargin();
-  viewport_->SetWorldTopLeftY(
-      std::clamp(world_top_left_y, min_world_top_left_y, max_world_top_left_y));
+  float max_vertical_scrolling_offset = pos;
+  float min_vertical_scrolling_offset =
+      pos + height - viewport_->GetWorldHeight() + layout_.GetBottomMargin();
+  SetVerticalScrollingOffset(std::clamp(vertical_scrolling_offset_, min_vertical_scrolling_offset,
+                                        max_vertical_scrolling_offset));
 }
 
 void TimeGraph::UpdateHorizontalScroll(float ratio) {
@@ -299,13 +312,15 @@ void TimeGraph::ProcessTimer(const TimerInfo& timer_info, const InstrumentedFunc
       break;
     }
     case TimerInfo::kNone: {
-      ThreadTrack* track = track_manager_->GetOrCreateThreadTrack(timer_info.thread_id());
-      track->OnTimer(timer_info);
+      // TODO (http://b/198135618): Create tracks only before drawing.
+      track_manager_->GetOrCreateThreadTrack(timer_info.thread_id());
+      thread_track_data_provider_->AddTimer(timer_info);
       break;
     }
     case TimerInfo::kApiScope: {
-      ThreadTrack* track = track_manager_->GetOrCreateThreadTrack(timer_info.thread_id());
-      track->OnTimer(timer_info);
+      // TODO (http://b/198135618): Create tracks only before drawing.
+      track_manager_->GetOrCreateThreadTrack(timer_info.thread_id());
+      thread_track_data_provider_->AddTimer(timer_info);
       break;
     }
     case TimerInfo::kApiScopeAsync: {
@@ -380,7 +395,7 @@ void TimeGraph::ProcessCGroupAndProcessMemoryTrackingTimer(const TimerInfo& time
   track->OnTimer(timer_info);
 }
 
-void TimeGraph::ProcessPageFaultsTrackingTimer(const orbit_client_protos::TimerInfo& timer_info) {
+void TimeGraph::ProcessPageFaultsTrackingTimer(const TimerInfo& timer_info) {
   uint64_t cgroup_name_hash = timer_info.registers(
       static_cast<size_t>(CaptureEventProcessor::PageFaultsEncodingIndex::kCGroupNameHash));
   std::string cgroup_name = app_->GetStringManager()->Get(cgroup_name_hash).value_or("");
@@ -401,18 +416,22 @@ void TimeGraph::ProcessAsyncTimer(const std::string& track_name, const TimerInfo
 }
 
 std::vector<const TimerChain*> TimeGraph::GetAllThreadTrackTimerChains() const {
-  std::vector<const TimerChain*> chains;
-  for (const auto& track : track_manager_->GetThreadTracks()) {
-    orbit_base::Append(chains, track->GetChains());
+  return thread_track_data_provider_->GetAllThreadTimerChains();
+}
+
+int TimeGraph::GetNumVisiblePrimitives() const {
+  int num_visible_primitives = 0;
+  for (auto track : track_manager_->GetAllTracks()) {
+    num_visible_primitives += track->GetVisiblePrimitiveCount();
   }
-  return chains;
+  return num_visible_primitives;
 }
 
 float TimeGraph::GetWorldFromTick(uint64_t time) const {
   if (time_window_us_ > 0) {
     double start = TicksToMicroseconds(capture_min_timestamp_, time) - min_time_us_;
     double normalized_start = start / time_window_us_;
-    auto pos = float(world_start_x_ + normalized_start * world_width_);
+    float pos = static_cast<float>(normalized_start * GetWidth());
     return pos;
   }
 
@@ -428,9 +447,7 @@ double TimeGraph::GetUsFromTick(uint64_t time) const {
 }
 
 uint64_t TimeGraph::GetTickFromWorld(float world_x) const {
-  float visible_width = world_width_;
-  double ratio =
-      visible_width > 0 ? static_cast<double>((world_x - world_start_x_) / visible_width) : 0;
+  double ratio = GetWidth() > 0 ? static_cast<double>(world_x / GetWidth()) : 0;
   auto time_span_ns = static_cast<uint64_t>(1000 * GetTime(ratio));
   return capture_min_timestamp_ + time_span_ns;
 }
@@ -452,14 +469,14 @@ void TimeGraph::SelectAndMakeVisible(const TimerInfo* timer_info) {
 const TimerInfo* TimeGraph::FindPreviousFunctionCall(uint64_t function_address,
                                                      uint64_t current_time,
                                                      std::optional<uint32_t> thread_id) const {
-  const orbit_client_protos::TimerInfo* previous_timer = nullptr;
+  const TimerInfo* previous_timer = nullptr;
   uint64_t goal_time = std::numeric_limits<uint64_t>::lowest();
   std::vector<const TimerChain*> chains = GetAllThreadTrackTimerChains();
   for (const TimerChain* chain : chains) {
     for (const auto& block : *chain) {
       if (!block.Intersects(goal_time, current_time)) continue;
       for (uint64_t i = 0; i < block.size(); i++) {
-        const orbit_client_protos::TimerInfo& timer_info = block[i];
+        const TimerInfo& timer_info = block[i];
         auto timer_end_time = timer_info.end();
         if ((timer_info.function_id() == function_address) &&
             (!thread_id || thread_id.value() == timer_info.thread_id()) &&
@@ -475,7 +492,7 @@ const TimerInfo* TimeGraph::FindPreviousFunctionCall(uint64_t function_address,
 
 const TimerInfo* TimeGraph::FindNextFunctionCall(uint64_t function_address, uint64_t current_time,
                                                  std::optional<uint32_t> thread_id) const {
-  const orbit_client_protos::TimerInfo* next_timer = nullptr;
+  const TimerInfo* next_timer = nullptr;
   uint64_t goal_time = std::numeric_limits<uint64_t>::max();
   std::vector<const TimerChain*> chains = GetAllThreadTrackTimerChains();
   for (const TimerChain* chain : chains) {
@@ -483,7 +500,7 @@ const TimerInfo* TimeGraph::FindNextFunctionCall(uint64_t function_address, uint
     for (const auto& block : *chain) {
       if (!block.Intersects(current_time, goal_time)) continue;
       for (uint64_t i = 0; i < block.size(); i++) {
-        const orbit_client_protos::TimerInfo& timer_info = block[i];
+        const TimerInfo& timer_info = block[i];
         auto timer_end_time = timer_info.end();
         if ((timer_info.function_id() == function_address) &&
             (!thread_id || thread_id.value() == timer_info.thread_id()) &&
@@ -497,19 +514,48 @@ const TimerInfo* TimeGraph::FindNextFunctionCall(uint64_t function_address, uint
   return next_timer;
 }
 
-void TimeGraph::RequestUpdate() {
-  update_primitives_requested_ = true;
-  RequestRedraw();
+std::vector<const TimerInfo*> TimeGraph::GetAllTimersForHookedFunction(
+    uint64_t function_address) const {
+  std::vector<const TimerInfo*> timers;
+  std::vector<const TimerChain*> chains = GetAllThreadTrackTimerChains();
+  for (const TimerChain* chain : chains) {
+    CHECK(chain != nullptr);
+    for (const auto& block : *chain) {
+      for (uint64_t i = 0; i < block.size(); i++) {
+        const TimerInfo& timer = block[i];
+        if (timer.function_id() == function_address) timers.push_back(&timer);
+      }
+    }
+  }
+  return timers;
 }
 
-// UpdatePrimitives updates all the drawable track timers in the timegraph's batcher
-void TimeGraph::UpdatePrimitives(Batcher* /*batcher*/, uint64_t /*min_tick*/, uint64_t /*max_tick*/,
-                                 PickingMode picking_mode, float /*z_offset*/) {
+void TimeGraph::RequestUpdate() {
+  CaptureViewElement::RequestUpdate();
+  update_primitives_requested_ = true;
+}
+
+void TimeGraph::PrepareBatcherAndUpdatePrimitives(PickingMode picking_mode) {
   ORBIT_SCOPE_FUNCTION;
   CHECK(app_->GetStringManager() != nullptr);
 
   batcher_.StartNewFrame();
+
   text_renderer_static_.Clear();
+
+  uint64_t min_tick = GetTickFromUs(min_time_us_);
+  uint64_t max_tick = GetTickFromUs(max_time_us_);
+
+  CaptureViewElement::UpdatePrimitives(batcher_, text_renderer_static_, min_tick, max_tick,
+                                       picking_mode);
+
+  if (!absl::GetFlag(FLAGS_enforce_full_redraw)) {
+    update_primitives_requested_ = false;
+  }
+}
+
+void TimeGraph::DoUpdateLayout() {
+  CaptureViewElement::DoUpdateLayout();
 
   capture_min_timestamp_ =
       std::min(capture_min_timestamp_, capture_data_->GetCallstackData().min_time());
@@ -517,21 +563,19 @@ void TimeGraph::UpdatePrimitives(Batcher* /*batcher*/, uint64_t /*min_tick*/, ui
       std::max(capture_max_timestamp_, capture_data_->GetCallstackData().max_time());
 
   time_window_us_ = max_time_us_ - min_time_us_;
-  world_start_x_ = viewport_->GetWorldTopLeft()[0];
-  world_width_ = viewport_->GetVisibleWorldWidth();
-  uint64_t min_tick = GetTickFromUs(min_time_us_);
-  uint64_t max_tick = GetTickFromUs(max_time_us_);
 
-  track_manager_->UpdateTrackPrimitives(&batcher_, min_tick, max_tick, picking_mode);
+  track_manager_->UpdateTrackListForRendering();
+  UpdateTracksPosition();
 
-  update_primitives_requested_ = false;
+  // This is called to make sure the current scrolling value is correctly clamped
+  // in case any changes in track visibility occured before
+  SetVerticalScrollingOffset(vertical_scrolling_offset_);
 }
 
 void TimeGraph::UpdateTracksPosition() {
-  // Update position of a track which is currently being moved.
   const float track_pos_x = GetPos()[0];
 
-  float current_y = layout_.GetSchedulerTrackOffset();
+  float current_y = layout_.GetSchedulerTrackOffset() - vertical_scrolling_offset_;
 
   // Track height including space between them
   for (auto& track : track_manager_->GetVisibleTracks()) {
@@ -541,54 +585,6 @@ void TimeGraph::UpdateTracksPosition() {
     track->SetWidth(GetWidth());
     current_y += (track->GetHeight() + layout_.GetSpaceBetweenTracks());
   }
-}
-
-void TimeGraph::SelectCallstacks(float world_start, float world_end, uint32_t thread_id) {
-  if (world_start > world_end) {
-    std::swap(world_end, world_start);
-  }
-
-  uint64_t t0 = GetTickFromWorld(world_start);
-  uint64_t t1 = GetTickFromWorld(world_end);
-
-  CHECK(capture_data_);
-  std::vector<CallstackEvent> selected_callstack_events =
-      (thread_id == orbit_base::kAllProcessThreadsTid)
-          ? capture_data_->GetCallstackData().GetCallstackEventsInTimeRange(t0, t1)
-          : capture_data_->GetCallstackData().GetCallstackEventsOfTidInTimeRange(thread_id, t0, t1);
-
-  selected_callstack_events_per_thread_.clear();
-  for (CallstackEvent& event : selected_callstack_events) {
-    selected_callstack_events_per_thread_[event.thread_id()].emplace_back(event);
-    selected_callstack_events_per_thread_[orbit_base::kAllProcessThreadsTid].emplace_back(event);
-  }
-
-  app_->SelectCallstackEvents(selected_callstack_events, thread_id);
-
-  RequestUpdate();
-}
-
-const std::vector<CallstackEvent>& TimeGraph::GetSelectedCallstackEvents(uint32_t tid) {
-  return selected_callstack_events_per_thread_[tid];
-}
-
-void TimeGraph::Draw(Batcher& batcher, TextRenderer& text_renderer,
-                     const DrawContext& draw_context) {
-  ORBIT_SCOPE("TimeGraph::Draw");
-
-  track_manager_->UpdateTracksForRendering();
-  UpdateTracksPosition();
-
-  const bool picking = draw_context.picking_mode != PickingMode::kNone;
-  if ((!picking && update_primitives_requested_) || picking) {
-    UpdatePrimitives(nullptr, 0, 0, draw_context.picking_mode, draw_context.z_offset);
-  }
-
-  DrawTracks(batcher, text_renderer, draw_context);
-  DrawIncompleteDataIntervals(batcher, draw_context.picking_mode);
-  DrawOverlay(batcher, text_renderer, draw_context.picking_mode);
-
-  redraw_requested_ = false;
 }
 
 namespace {
@@ -650,14 +646,13 @@ void TimeGraph::DrawOverlay(Batcher& batcher, TextRenderer& text_renderer,
     return;
   }
 
-  std::vector<std::pair<uint64_t, const orbit_client_protos::TimerInfo*>> timers(
-      iterator_timer_info_.size());
+  std::vector<std::pair<uint64_t, const TimerInfo*>> timers(iterator_timer_info_.size());
   std::copy(iterator_timer_info_.begin(), iterator_timer_info_.end(), timers.begin());
 
   // Sort timers by start time.
   std::sort(timers.begin(), timers.end(),
-            [](const std::pair<uint64_t, const orbit_client_protos::TimerInfo*>& timer_a,
-               const std::pair<uint64_t, const orbit_client_protos::TimerInfo*>& timer_b) -> bool {
+            [](const std::pair<uint64_t, const TimerInfo*>& timer_a,
+               const std::pair<uint64_t, const TimerInfo*>& timer_b) -> bool {
               return timer_a.second->start() < timer_b.second->start();
             });
 
@@ -666,11 +661,11 @@ void TimeGraph::DrawOverlay(Batcher& batcher, TextRenderer& text_renderer,
   std::vector<float> x_coords;
   x_coords.reserve(timers.size());
 
-  float world_start_x = viewport_->GetWorldTopLeft()[0];
-  float world_width = viewport_->GetVisibleWorldWidth();
+  float world_start_x = 0;
+  float world_width = GetWidth();
 
-  float world_start_y = viewport_->GetWorldTopLeft()[1];
-  float world_height = viewport_->GetVisibleWorldHeight();
+  float world_start_y = 0;
+  float world_height = viewport_->GetWorldHeight();
 
   double inv_time_window = 1.0 / GetTimeWindowUs();
 
@@ -786,8 +781,8 @@ void TimeGraph::DrawIncompleteDataIntervals(Batcher& batcher, PickingMode pickin
     }
   }
 
-  const float world_start_y = viewport_->GetWorldTopLeft()[1];
-  const float world_height = viewport_->GetVisibleWorldHeight();
+  const float world_start_y = 0;
+  const float world_height = viewport_->GetWorldHeight();
 
   // Actually draw the ranges.
   for (const auto& [start_x, end_x] : x_ranges) {
@@ -812,20 +807,6 @@ void TimeGraph::DrawIncompleteDataIntervals(Batcher& batcher, PickingMode pickin
   }
 }
 
-void TimeGraph::DrawTracks(Batcher& batcher, TextRenderer& text_renderer,
-                           const DrawContext& draw_context) {
-  for (auto& track : track_manager_->GetVisibleTracks()) {
-    float z_offset = 0;
-    if (track->IsPinned()) {
-      z_offset = GlCanvas::kZOffsetPinnedTrack;
-    } else if (track->IsMoving()) {
-      z_offset = GlCanvas::kZOffsetMovingTrack;
-    }
-    const DrawContext updated_draw_context = draw_context.UpdatedZOffset(z_offset);
-    track->Draw(batcher, text_renderer, updated_draw_context);
-  }
-}
-
 void TimeGraph::SetThreadFilter(const std::string& filter) {
   track_manager_->SetFilter(filter);
   RequestUpdate();
@@ -847,7 +828,7 @@ void TimeGraph::JumpToNeighborTimer(const TimerInfo* from, JumpDirection jump_di
       !TrackManager::FunctionIteratableType(from->type())) {
     jump_scope = JumpScope::kSameDepth;
   }
-  const orbit_client_protos::TimerInfo* goal = nullptr;
+  const TimerInfo* goal = nullptr;
   auto function_id = from->function_id();
   auto current_time = from->end();
   auto thread_id = from->thread_id();
@@ -919,13 +900,13 @@ const TimerInfo* TimeGraph::FindDown(const TimerInfo& from) {
 
 std::pair<const TimerInfo*, const TimerInfo*> TimeGraph::GetMinMaxTimerInfoForFunction(
     uint64_t function_id) const {
-  const orbit_client_protos::TimerInfo* min_timer = nullptr;
-  const orbit_client_protos::TimerInfo* max_timer = nullptr;
+  const TimerInfo* min_timer = nullptr;
+  const TimerInfo* max_timer = nullptr;
   std::vector<const TimerChain*> chains = GetAllThreadTrackTimerChains();
   for (const TimerChain* chain : chains) {
     for (const auto& block : *chain) {
       for (size_t i = 0; i < block.size(); i++) {
-        const orbit_client_protos::TimerInfo& timer_info = block[i];
+        const TimerInfo& timer_info = block[i];
         if (timer_info.function_id() != function_id) continue;
 
         uint64_t elapsed_nanos = timer_info.end() - timer_info.start();
@@ -941,11 +922,27 @@ std::pair<const TimerInfo*, const TimerInfo*> TimeGraph::GetMinMaxTimerInfoForFu
   return std::make_pair(min_timer, max_timer);
 }
 
-void TimeGraph::DrawText(float layer) {
-  if (draw_text_) {
-    text_renderer_static_.RenderLayer(layer);
+void TimeGraph::DoDraw(Batcher& batcher, TextRenderer& text_renderer,
+                       const DrawContext& draw_context) {
+  CaptureViewElement::DoDraw(batcher, text_renderer, draw_context);
+
+  DrawIncompleteDataIntervals(batcher, draw_context.picking_mode);
+  DrawOverlay(batcher, text_renderer, draw_context.picking_mode);
+}
+
+void TimeGraph::DrawAllElements(Batcher& batcher, TextRenderer& text_renderer,
+                                PickingMode& picking_mode, uint64_t current_mouse_time_ns) {
+  const bool picking = picking_mode != PickingMode::kNone;
+
+  DrawContext context{current_mouse_time_ns, picking_mode};
+  Draw(batcher, text_renderer, context);
+
+  if ((!picking && update_primitives_requested_) || picking) {
+    PrepareBatcherAndUpdatePrimitives(picking_mode);
   }
 }
+
+void TimeGraph::DrawText(float layer) { text_renderer_static_.RenderLayer(layer); }
 
 bool TimeGraph::IsFullyVisible(uint64_t min, uint64_t max) const {
   double start = TicksToMicroseconds(capture_min_timestamp_, min);
@@ -972,6 +969,14 @@ bool TimeGraph::IsVisible(VisibilityType vis_type, uint64_t min, uint64_t max) c
   }
 }
 
+void TimeGraph::SetVerticalScrollingOffset(float value) {
+  float clamped_value = std::max(std::min(value, GetHeight() - viewport_->GetWorldHeight()), 0.f);
+  if (clamped_value == vertical_scrolling_offset_) return;
+
+  vertical_scrolling_offset_ = clamped_value;
+  RequestUpdate();
+}
+
 bool TimeGraph::HasFrameTrack(uint64_t function_id) const {
   auto frame_tracks = track_manager_->GetFrameTracks();
   return (std::find_if(frame_tracks.begin(), frame_tracks.end(), [&](auto frame_track) {
@@ -982,6 +987,16 @@ bool TimeGraph::HasFrameTrack(uint64_t function_id) const {
 void TimeGraph::RemoveFrameTrack(uint64_t function_id) {
   track_manager_->RemoveFrameTrack(function_id);
   RequestUpdate();
+}
+
+std::vector<orbit_gl::CaptureViewElement*> TimeGraph::GetAllChildren() const {
+  std::vector<Track*> all_tracks = track_manager_->GetAllTracks();
+  return {all_tracks.begin(), all_tracks.end()};
+}
+
+std::vector<orbit_gl::CaptureViewElement*> TimeGraph::GetNonHiddenChildren() const {
+  std::vector<Track*> all_tracks = track_manager_->GetVisibleTracks();
+  return {all_tracks.begin(), all_tracks.end()};
 }
 
 std::unique_ptr<orbit_accessibility::AccessibleInterface> TimeGraph::CreateAccessibleInterface() {

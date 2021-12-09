@@ -17,24 +17,26 @@ namespace orbit_gl {
 
 class TracepointThreadBar : public ThreadBar {
  public:
-  explicit TracepointThreadBar(CaptureViewElement* parent, OrbitApp* app, TimeGraph* time_graph,
+  explicit TracepointThreadBar(CaptureViewElement* parent, OrbitApp* app,
+                               const orbit_gl::TimelineInfoInterface* timeline_info,
                                orbit_gl::Viewport* viewport, TimeGraphLayout* layout,
                                const orbit_client_data::CaptureData* capture_data,
                                uint32_t thread_id, const Color& color);
 
-  void Draw(Batcher& batcher, TextRenderer& text_renderer,
-            const DrawContext& draw_context) override;
-
-  void UpdatePrimitives(Batcher* batcher, uint64_t min_tick, uint64_t max_tick,
-                        PickingMode picking_mode, float z_offset = 0) override;
   [[nodiscard]] float GetHeight() const override {
     return layout_->GetEventTrackHeightFromTid(GetThreadId());
   }
 
   [[nodiscard]] bool IsEmpty() const override;
 
+ protected:
+  void DoDraw(Batcher& batcher, TextRenderer& text_renderer,
+              const DrawContext& draw_context) override;
+  void DoUpdatePrimitives(Batcher& batcher, TextRenderer& text_renderer, uint64_t min_tick,
+                          uint64_t max_tick, PickingMode picking_mode) override;
+
  private:
-  std::string GetTracepointTooltip(Batcher* batcher, PickingId id) const;
+  std::string GetTracepointTooltip(Batcher& batcher, PickingId id) const;
 };
 
 }  // namespace orbit_gl

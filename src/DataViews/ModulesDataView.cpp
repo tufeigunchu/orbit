@@ -35,11 +35,11 @@ const std::vector<DataView::Column>& ModulesDataView::GetColumns() {
   static const std::vector<Column> columns = [] {
     std::vector<Column> columns;
     columns.resize(kNumColumns);
+    columns[kColumnLoaded] = {"Loaded", .0f, SortingOrder::kDescending};
     columns[kColumnName] = {"Name", .2f, SortingOrder::kAscending};
     columns[kColumnPath] = {"Path", .5f, SortingOrder::kAscending};
     columns[kColumnAddressRange] = {"Address Range", .15f, SortingOrder::kAscending};
     columns[kColumnFileSize] = {"File Size", .0f, SortingOrder::kDescending};
-    columns[kColumnLoaded] = {"Loaded", .0f, SortingOrder::kDescending};
     return columns;
   }();
   return columns;
@@ -51,6 +51,8 @@ std::string ModulesDataView::GetValue(int row, int col) {
   const ModuleInMemory& memory_space = start_address_to_module_in_memory_.at(start_address);
 
   switch (col) {
+    case kColumnLoaded:
+      return module->is_loaded() ? "*" : "";
     case kColumnName:
       return module->name();
     case kColumnPath:
@@ -59,8 +61,6 @@ std::string ModulesDataView::GetValue(int row, int col) {
       return memory_space.FormattedAddressRange();
     case kColumnFileSize:
       return orbit_display_formats::GetDisplaySize(module->file_size());
-    case kColumnLoaded:
-      return module->is_loaded() ? "*" : "";
     default:
       return "";
   }
@@ -84,6 +84,9 @@ void ModulesDataView::DoSort() {
   std::function<bool(uint64_t, uint64_t)> sorter = nullptr;
 
   switch (sorting_column_) {
+    case kColumnLoaded:
+      sorter = ORBIT_PROC_SORT(is_loaded());
+      break;
     case kColumnName:
       sorter = ORBIT_PROC_SORT(name());
       break;
@@ -96,9 +99,6 @@ void ModulesDataView::DoSort() {
     case kColumnFileSize:
       sorter = ORBIT_PROC_SORT(file_size());
       break;
-    case kColumnLoaded:
-      sorter = ORBIT_PROC_SORT(is_loaded());
-      break;
     default:
       break;
   }
@@ -108,15 +108,12 @@ void ModulesDataView::DoSort() {
   }
 }
 
-const std::string ModulesDataView::kMenuActionLoadSymbols = "Load Symbols";
-const std::string ModulesDataView::kMenuActionVerifyFramePointers = "Verify Frame Pointers";
-
-std::vector<std::string> ModulesDataView::GetContextMenu(int clicked_index,
-                                                         const std::vector<int>& selected_indices) {
+std::vector<std::vector<std::string>> ModulesDataView::GetContextMenuWithGrouping(
+    int clicked_index, const std::vector<int>& selected_indices) {
   bool enable_load = false;
   bool enable_verify = false;
   for (int index : selected_indices) {
-    const ModuleData* module = GetModule(index);
+    const ModuleData* module = GetModuleDataFromRow(index);
     if (!module->is_loaded()) {
       enable_load = true;
     }
@@ -126,47 +123,21 @@ std::vector<std::string> ModulesDataView::GetContextMenu(int clicked_index,
     }
   }
 
-  std::vector<std::string> menu;
-  if (enable_load) {
-    menu.emplace_back(kMenuActionLoadSymbols);
-  }
+  std::vector<std::string> action_group;
+  if (enable_load) action_group.emplace_back(std::string{kMenuActionLoadSymbols});
   if (enable_verify && absl::GetFlag(FLAGS_enable_frame_pointer_validator)) {
-    menu.emplace_back(kMenuActionVerifyFramePointers);
+    action_group.emplace_back(std::string{kMenuActionVerifyFramePointers});
   }
-  orbit_base::Append(menu, DataView::GetContextMenu(clicked_index, selected_indices));
+
+  std::vector<std::vector<std::string>> menu =
+      DataView::GetContextMenuWithGrouping(clicked_index, selected_indices);
+  menu.insert(menu.begin(), action_group);
+
   return menu;
 }
 
-void ModulesDataView::OnContextMenu(const std::string& action, int menu_index,
-                                    const std::vector<int>& item_indices) {
-  if (action == kMenuActionLoadSymbols) {
-    std::vector<ModuleData*> modules_to_load;
-    for (int index : item_indices) {
-      ModuleData* module_data = GetModule(index);
-      if (!module_data->is_loaded()) {
-        modules_to_load.push_back(module_data);
-      }
-    }
-    app_->RetrieveModulesAndLoadSymbols(modules_to_load);
-
-  } else if (action == kMenuActionVerifyFramePointers) {
-    std::vector<const ModuleData*> modules_to_validate;
-    modules_to_validate.reserve(item_indices.size());
-    for (int index : item_indices) {
-      const ModuleData* module = GetModule(index);
-      modules_to_validate.push_back(module);
-    }
-
-    if (!modules_to_validate.empty()) {
-      app_->OnValidateFramePointers(modules_to_validate);
-    }
-  } else {
-    DataView::OnContextMenu(action, menu_index, item_indices);
-  }
-}
-
 void ModulesDataView::OnDoubleClicked(int index) {
-  ModuleData* module_data = GetModule(index);
+  ModuleData* module_data = GetModuleDataFromRow(index);
   if (!module_data->is_loaded()) {
     std::vector<ModuleData*> modules_to_load = {module_data};
     app_->RetrieveModulesAndLoadSymbols(modules_to_load);
@@ -213,7 +184,14 @@ void ModulesDataView::UpdateModules(const ProcessData* process) {
   for (const auto& [start_address, module_in_memory] : memory_map) {
     ModuleData* module = app_->GetMutableModuleByPathAndBuildId(module_in_memory.file_path(),
                                                                 module_in_memory.build_id());
-    AddModule(start_address, std::move(module), module_in_memory);
+
+    // The module here cannot be a nullptr, because the call
+    // `app_->GetMutableModuleByPathAndBuildId` is relaying the call to
+    // `ModuleManager::GetMutableModuleByPathAndBuildId` and ModuleManager never deletes modules,
+    // only changes modules or adds new modules. And the memory_map cannot contain modules that are
+    // not yet in ModuleManager, since these two locations get updated simultaneously.
+    CHECK(module != nullptr);
+    AddModule(start_address, module, module_in_memory);
   }
 
   OnDataChanged();
@@ -230,7 +208,7 @@ void ModulesDataView::OnRefreshButtonClicked() {
 
 bool ModulesDataView::GetDisplayColor(int row, int /*column*/, unsigned char& red,
                                       unsigned char& green, unsigned char& blue) {
-  const ModuleData* module = GetModule(row);
+  const ModuleData* module = GetModuleDataFromRow(row);
   if (module->is_loaded()) {
     red = 42;
     green = 218;

@@ -10,8 +10,9 @@
 #include <filesystem>
 #include <memory>
 
+#include "CaptureFile/BufferOutputStream.h"
+#include "GrpcProtos/capture.pb.h"
 #include "OrbitBase/Result.h"
-#include "capture.pb.h"
 
 namespace orbit_capture_file {
 
@@ -54,6 +55,8 @@ class CaptureFileOutputStream {
   // overwritten.
   [[nodiscard]] static ErrorMessageOr<std::unique_ptr<CaptureFileOutputStream>> Create(
       std::filesystem::path path);
+  [[nodiscard]] static std::unique_ptr<CaptureFileOutputStream> Create(
+      BufferOutputStream* output_buffer);
 };
 
 }  // namespace orbit_capture_file

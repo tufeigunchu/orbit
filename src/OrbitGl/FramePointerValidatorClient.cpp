@@ -16,11 +16,11 @@
 #include "App.h"
 #include "ClientData/FunctionUtils.h"
 #include "ClientData/ModuleData.h"
+#include "ClientProtos/capture_data.pb.h"
+#include "GrpcProtos/code_block.pb.h"
+#include "GrpcProtos/services.grpc.pb.h"
+#include "GrpcProtos/services.pb.h"
 #include "OrbitBase/Logging.h"
-#include "capture_data.pb.h"
-#include "code_block.pb.h"
-#include "services.grpc.pb.h"
-#include "services.pb.h"
 
 using orbit_client_data::ModuleData;
 using orbit_client_protos::FunctionInfo;
@@ -55,7 +55,8 @@ void FramePointerValidatorClient::AnalyzeModules(const std::vector<const ModuleD
       function_info->set_size(function->size());
     }
     grpc::ClientContext context;
-    std::chrono::time_point deadline = std::chrono::system_clock::now() + std::chrono::minutes(1);
+    std::chrono::system_clock::time_point deadline =
+        std::chrono::system_clock::now() + std::chrono::minutes(1);
     context.set_deadline(deadline);
 
     // careful this is the synchronous call (maybe async is better)

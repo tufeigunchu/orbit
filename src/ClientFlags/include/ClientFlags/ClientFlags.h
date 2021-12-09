@@ -26,9 +26,6 @@ ABSL_DECLARE_FLAG(std::string, process_name);
 
 ABSL_DECLARE_FLAG(bool, enable_tutorials_feature);
 
-// TODO(b/160549506): Remove this flag once it can be specified in the ui.
-ABSL_DECLARE_FLAG(uint16_t, sampling_rate);
-
 // Max to pass to perf_event_open without getting an error is (1u << 16u) - 8,
 // because the kernel stores this in a short and because of alignment reasons.
 // But the size the kernel actually returns is smaller and we leave some extra room (see
@@ -52,5 +49,13 @@ ABSL_DECLARE_FLAG(bool, enable_warning_threshold);
 
 // additional folder in which OrbitService will look for symbols
 ABSL_DECLARE_FLAG(std::string, instance_symbols_folder);
+
+ABSL_DECLARE_FLAG(bool, enforce_full_redraw);
+
+// VSI
+ABSL_DECLARE_FLAG(std::string, connection_target);
+
+// Clears QSettings. This is intended for e2e tests.
+ABSL_DECLARE_FLAG(bool, clear_settings);
 
 #endif  // CLIENT_FLAGS_CLIENT_FLAGS_H_

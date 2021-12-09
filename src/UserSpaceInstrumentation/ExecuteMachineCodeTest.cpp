@@ -4,6 +4,7 @@
 
 #include <absl/strings/str_format.h>
 #include <gtest/gtest.h>
+#include <sys/prctl.h>
 #include <sys/wait.h>
 
 #include <csignal>
@@ -25,7 +26,12 @@ TEST(ExecuteMachineCodeTest, ExecuteMachineCode) {
   pid_t pid = fork();
   CHECK(pid != -1);
   if (pid == 0) {
+    prctl(PR_SET_PDEATHSIG, SIGTERM);
+
+    volatile uint64_t counter = 0;
     while (true) {
+      // Endless loops without side effects are UB and recent versions of clang optimize it away.
+      ++counter;
     }
   }
 
@@ -53,7 +59,7 @@ TEST(ExecuteMachineCodeTest, ExecuteMachineCode) {
   // Cleanup, end child process.
   CHECK(!DetachAndContinueProcess(pid).has_error());
   kill(pid, SIGKILL);
-  waitpid(pid, NULL, 0);
+  waitpid(pid, nullptr, 0);
 }
 
 }  // namespace orbit_user_space_instrumentation

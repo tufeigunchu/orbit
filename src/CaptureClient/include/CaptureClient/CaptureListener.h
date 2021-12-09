@@ -8,10 +8,10 @@
 #include "ClientData/ProcessData.h"
 #include "ClientData/TracepointCustom.h"
 #include "ClientData/UserDefinedCaptureData.h"
+#include "ClientProtos/capture_data.pb.h"
+#include "GrpcProtos/capture.pb.h"
 #include "OrbitBase/Result.h"
 #include "absl/container/flat_hash_set.h"
-#include "capture.pb.h"
-#include "capture_data.pb.h"
 
 namespace orbit_capture_client {
 
@@ -52,6 +52,8 @@ class CaptureListener {
       orbit_grpc_protos::ErrorEnablingOrbitApiEvent error_enabling_orbit_api_event) = 0;
   virtual void OnErrorEnablingUserSpaceInstrumentationEvent(
       orbit_grpc_protos::ErrorEnablingUserSpaceInstrumentationEvent error_event) = 0;
+  virtual void OnWarningInstrumentingWithUserSpaceInstrumentationEvent(
+      orbit_grpc_protos::WarningInstrumentingWithUserSpaceInstrumentationEvent warning_event) = 0;
   virtual void OnLostPerfRecordsEvent(
       orbit_grpc_protos::LostPerfRecordsEvent lost_perf_records_event) = 0;
   virtual void OnOutOfOrderEventsDiscardedEvent(

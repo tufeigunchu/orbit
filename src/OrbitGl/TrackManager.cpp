@@ -58,6 +58,9 @@ std::vector<Track*> TrackManager::GetAllTracks() const {
   for (const auto& track : all_tracks_) {
     tracks.push_back(track.get());
   }
+  for (const auto& track : frame_tracks_) {
+    tracks.push_back(track.second.get());
+  }
   return tracks;
 }
 
@@ -179,29 +182,14 @@ void TrackManager::SetFilter(const std::string& filter) {
   visible_track_list_needs_update_ = true;
 }
 
-// This function assumes visible track list is updated.
-float TrackManager::GetVisibleTracksTotalHeight() const {
-  // Top and Bottom Margin. TODO: Margins should be treated in a different way (http://b/192070555).
-  float total_height = layout_->GetSchedulerTrackOffset() + layout_->GetBottomMargin();
-
-  // Track height including space between them
-  for (auto& track : visible_tracks_) {
-    total_height += (track->GetHeight() + layout_->GetSpaceBetweenTracks());
-  }
-  return total_height;
-}
-
 void TrackManager::UpdateVisibleTrackList() {
-  // This function assumes we asked before for a update for the visible track list and that tracks
-  // are already sorted (in sorted_tracks_).
   CHECK(visible_track_list_needs_update_);
-  CHECK(!sorting_invalidated_);
 
   visible_track_list_needs_update_ = false;
   visible_tracks_.clear();
 
   auto track_should_be_shown = [this](const Track* track) {
-    return track->GetVisible() && track_type_visibility_[track->GetType()];
+    return track->ShouldBeRendered() && track_type_visibility_[track->GetType()];
   };
 
   if (filter_.empty()) {
@@ -266,6 +254,8 @@ void TrackManager::UpdateMovingTrackPositionInVisibleTracks() {
 
   if (moving_track_previous_position != -1) {
     Track* moving_track = visible_tracks_[moving_track_previous_position];
+    time_graph_->VerticallyMoveIntoView(*moving_track);
+
     visible_tracks_.erase(visible_tracks_.begin() + moving_track_previous_position);
 
     int moving_track_current_position = -1;
@@ -315,15 +305,7 @@ int TrackManager::FindMovingTrackIndex() {
   return -1;
 }
 
-void TrackManager::UpdateTrackPrimitives(Batcher* batcher, uint64_t min_tick, uint64_t max_tick,
-                                         PickingMode picking_mode) {
-  for (auto& track : visible_tracks_) {
-    const float z_offset = track->IsMoving() ? GlCanvas::kZOffsetMovingTrack : 0.f;
-    track->UpdatePrimitives(batcher, min_tick, max_tick, picking_mode, z_offset);
-  }
-}
-
-void TrackManager::UpdateTracksForRendering() {
+void TrackManager::UpdateTrackListForRendering() {
   // Reorder threads if sorting isn't valid or once per second when capturing.
   if (sorting_invalidated_ ||
       (app_ != nullptr && app_->IsCapturing() && last_thread_reorder_.ElapsedMillis() > 1000.0)) {
@@ -383,6 +365,19 @@ bool TrackManager::GetTrackTypeVisibility(Track::Type type) const {
   return track_type_visibility_.at(type);
 }
 
+const absl::flat_hash_map<Track::Type, bool> TrackManager::GetAllTrackTypesVisibility() const {
+  return track_type_visibility_;
+}
+
+void TrackManager::RestoreAllTrackTypesVisibility(
+    const absl::flat_hash_map<Track::Type, bool>& values) {
+  track_type_visibility_ = values;
+  if (time_graph_ != nullptr) {
+    time_graph_->RequestUpdate();
+  }
+  visible_track_list_needs_update_ = true;
+}
+
 bool TrackManager::IteratableType(orbit_client_protos::TimerInfo_Type type) {
   switch (type) {
     case TimerInfo::kNone:
@@ -439,9 +434,9 @@ Track* TrackManager::GetOrCreateTrackFromTimerInfo(const TimerInfo& timer_info) 
 SchedulerTrack* TrackManager::GetOrCreateSchedulerTrack() {
   std::lock_guard<std::recursive_mutex> lock(mutex_);
   if (scheduler_track_ == nullptr) {
-    auto [unused, track_data] = capture_data_->CreateTrackData();
+    auto [unused, timer_data] = capture_data_->CreateTimerData();
     scheduler_track_ = std::make_shared<SchedulerTrack>(time_graph_, time_graph_, viewport_,
-                                                        layout_, app_, capture_data_, track_data);
+                                                        layout_, app_, capture_data_, timer_data);
     AddTrack(scheduler_track_);
   }
   return scheduler_track_.get();
@@ -451,12 +446,10 @@ ThreadTrack* TrackManager::GetOrCreateThreadTrack(uint32_t tid) {
   std::lock_guard<std::recursive_mutex> lock(mutex_);
   std::shared_ptr<ThreadTrack> track = thread_tracks_[tid];
   if (track == nullptr) {
-    ThreadTrack::ScopeTreeUpdateType scope_tree_update_type =
-        GetIsDataFromSavedCapture() ? ThreadTrack::ScopeTreeUpdateType::kOnCaptureComplete
-                                    : ThreadTrack::ScopeTreeUpdateType::kAlways;
-    auto [unused, track_data] = capture_data_->CreateTrackData();
+    auto thread_track_data_provider = capture_data_->GetThreadTrackDataProvider();
+    thread_track_data_provider->CreateScopeTreeTimerData(tid);
     track = std::make_shared<ThreadTrack>(time_graph_, time_graph_, viewport_, layout_, tid, app_,
-                                          capture_data_, track_data, scope_tree_update_type);
+                                          capture_data_, thread_track_data_provider);
     thread_tracks_[tid] = track;
     AddTrack(track);
   }
@@ -469,11 +462,11 @@ GpuTrack* TrackManager::GetOrCreateGpuTrack(uint64_t timeline_hash) {
       app_->GetStringManager()->Get(timeline_hash).value_or(std::to_string(timeline_hash));
   std::shared_ptr<GpuTrack> track = gpu_tracks_[timeline];
   if (track == nullptr) {
-    auto [unused1, submission_track_data] = capture_data_->CreateTrackData();
-    auto [unused2, marker_track_data] = capture_data_->CreateTrackData();
+    auto [unused1, submission_timer_data] = capture_data_->CreateTimerData();
+    auto [unused2, marker_timer_data] = capture_data_->CreateTimerData();
     track =
         std::make_shared<GpuTrack>(time_graph_, time_graph_, viewport_, layout_, timeline_hash,
-                                   app_, capture_data_, submission_track_data, marker_track_data);
+                                   app_, capture_data_, submission_timer_data, marker_timer_data);
     gpu_tracks_[timeline] = track;
     AddTrack(track);
   }
@@ -496,9 +489,9 @@ AsyncTrack* TrackManager::GetOrCreateAsyncTrack(const std::string& name) {
   std::lock_guard<std::recursive_mutex> lock(mutex_);
   std::shared_ptr<AsyncTrack> track = async_tracks_[name];
   if (track == nullptr) {
-    auto [unused, track_data] = capture_data_->CreateTrackData();
+    auto [unused, timer_data] = capture_data_->CreateTimerData();
     track = std::make_shared<AsyncTrack>(time_graph_, time_graph_, viewport_, layout_, name, app_,
-                                         capture_data_, track_data);
+                                         capture_data_, timer_data);
     async_tracks_[name] = track;
     AddTrack(track);
   }
@@ -514,9 +507,9 @@ FrameTrack* TrackManager::GetOrCreateFrameTrack(
     return track_it->second.get();
   }
 
-  auto [unused, track_data] = capture_data_->CreateTrackData();
+  auto [unused, timer_data] = capture_data_->CreateTimerData();
   auto track = std::make_shared<FrameTrack>(time_graph_, time_graph_, viewport_, layout_, function,
-                                            app_, capture_data_, track_data);
+                                            app_, capture_data_, timer_data);
 
   // Normally we would call AddTrack(track) here, but frame tracks are removable by users
   // and therefore cannot be simply thrown into the flat vector of tracks. Also, we don't want to

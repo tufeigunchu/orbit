@@ -9,10 +9,10 @@
 
 #include "MetricsUploader/MetricsUploader.h"
 #include "MetricsUploader/MetricsUploaderStub.h"
+#include "MetricsUploader/orbit_log_event.pb.h"
 #include "OrbitBase/Logging.h"
 #include "OrbitBase/Result.h"
 #include "OrbitVersion/OrbitVersion.h"
-#include "orbit_log_event.pb.h"
 
 namespace orbit_metrics_uploader {
 
@@ -40,9 +40,9 @@ class MetricsUploaderImpl : public MetricsUploader {
                     std::chrono::milliseconds event_duration) override;
   bool SendLogEvent(OrbitLogEvent_LogEventType log_event_type,
                     std::chrono::milliseconds event_duration,
-                    OrbitLogEvent_StatusCode status_code) override;
+                    OrbitLogEvent::StatusCode status_code) override;
   bool SendCaptureEvent(OrbitCaptureData capture_data,
-                        OrbitLogEvent_StatusCode status_code) override;
+                        OrbitLogEvent::StatusCode status_code) override;
 
  private:
   [[nodiscard]] bool FillAndSendLogEvent(OrbitLogEvent partial_filled_event) const;
@@ -224,7 +224,7 @@ bool MetricsUploaderImpl::FillAndSendLogEvent(OrbitLogEvent partial_filled_event
 bool MetricsUploaderImpl::SendLogEvent(OrbitLogEvent_LogEventType log_event_type) {
   OrbitLogEvent log_event;
   log_event.set_log_event_type(log_event_type);
-  log_event.set_status_code(OrbitLogEvent_StatusCode_SUCCESS);
+  log_event.set_status_code(OrbitLogEvent::SUCCESS);
   return FillAndSendLogEvent(std::move(log_event));
 }
 
@@ -233,13 +233,13 @@ bool MetricsUploaderImpl::SendLogEvent(OrbitLogEvent_LogEventType log_event_type
   OrbitLogEvent log_event;
   log_event.set_log_event_type(log_event_type);
   log_event.set_event_duration_milliseconds(event_duration.count());
-  log_event.set_status_code(OrbitLogEvent_StatusCode_SUCCESS);
+  log_event.set_status_code(OrbitLogEvent::SUCCESS);
   return FillAndSendLogEvent(std::move(log_event));
 }
 
 bool MetricsUploaderImpl::SendLogEvent(OrbitLogEvent_LogEventType log_event_type,
                                        std::chrono::milliseconds event_duration,
-                                       OrbitLogEvent_StatusCode status_code) {
+                                       OrbitLogEvent::StatusCode status_code) {
   OrbitLogEvent log_event;
   log_event.set_log_event_type(log_event_type);
   log_event.set_event_duration_milliseconds(event_duration.count());
@@ -248,9 +248,9 @@ bool MetricsUploaderImpl::SendLogEvent(OrbitLogEvent_LogEventType log_event_type
 }
 
 bool MetricsUploaderImpl::SendCaptureEvent(OrbitCaptureData capture_data,
-                                           OrbitLogEvent_StatusCode status_code) {
+                                           OrbitLogEvent::StatusCode status_code) {
   OrbitLogEvent log_event;
-  log_event.set_log_event_type(OrbitLogEvent_LogEventType_ORBIT_CAPTURE_END);
+  log_event.set_log_event_type(OrbitLogEvent::ORBIT_CAPTURE_END);
   *log_event.mutable_orbit_capture_data() = std::move(capture_data);
   log_event.set_status_code(status_code);
   return FillAndSendLogEvent(log_event);

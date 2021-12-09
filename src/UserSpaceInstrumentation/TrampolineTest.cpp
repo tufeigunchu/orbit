@@ -8,6 +8,7 @@
 #include <gtest/gtest.h>
 #include <immintrin.h>
 #include <signal.h>
+#include <sys/prctl.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -26,6 +27,7 @@
 
 #include "AccessTraceesMemory.h"
 #include "AllocateInTracee.h"
+#include "GetTestLibLibraryPath.h"
 #include "MachineCode.h"
 #include "ObjectUtils/Address.h"
 #include "ObjectUtils/ElfFile.h"
@@ -35,6 +37,7 @@
 #include "TestUtils.h"
 #include "TestUtils/TestUtils.h"
 #include "Trampoline.h"
+#include "UserSpaceInstrumentation/AddressRange.h"
 #include "UserSpaceInstrumentation/Attach.h"
 #include "UserSpaceInstrumentation/InjectLibraryInTracee.h"
 
@@ -268,8 +271,12 @@ TEST(TrampolineTest, AllocateMemoryForTrampolines) {
   pid_t pid = fork();
   CHECK(pid != -1);
   if (pid == 0) {
-    uint64_t sum = 0;
-    int i = 0;
+    prctl(PR_SET_PDEATHSIG, SIGTERM);
+
+    [[maybe_unused]] volatile uint64_t sum = 0;
+    // Endless loops without side effects are UB and recent versions of clang optimize
+    // it away. Making `i` volatile avoids that problem.
+    volatile int i = 0;
     while (true) {
       i = (i + 1) & 3;
       sum += DoubleAndIncrement(i);
@@ -281,15 +288,16 @@ TEST(TrampolineTest, AllocateMemoryForTrampolines) {
 
   // Find the address range of the code for `DoubleAndIncrement`. For the purpose of this test we
   // just take the entire address space taken up by `UserSpaceInstrumentationTests`.
-  AddressRange code_range;
-  auto modules = orbit_object_utils::ReadModules(pid);
-  CHECK(!modules.has_error());
-  for (const auto& m : modules.value()) {
-    if (m.name() == "UserSpaceInstrumentationTests") {
-      code_range.start = m.address_start();
-      code_range.end = m.address_end();
-    }
-  }
+  auto modules_or_error = orbit_object_utils::ReadModules(pid);
+  CHECK(!modules_or_error.has_error());
+
+  auto& modules = modules_or_error.value();
+  const auto module = std::find_if(modules.begin(), modules.end(), [&](const auto& module) {
+    return module.file_path() == orbit_base::GetExecutablePath();
+  });
+
+  ASSERT_NE(module, modules.end());
+  const AddressRange code_range{module->address_start(), module->address_end()};
 
   // Allocate one megabyte in the tracee. The memory will be close to `code_range`.
   constexpr uint64_t kTrampolineSize = 1024 * 1024;
@@ -446,7 +454,7 @@ TEST_F(RelocateInstructionTest, UnconditionalJumpTo32BitImmediate) {
   EXPECT_EQ(6, result.value().position_of_absolute_address.value());
 }
 
-TEST_F(RelocateInstructionTest, CallToImmediateAddress) {
+TEST_F(RelocateInstructionTest, CallInstructionIsNotSupported) {
   MachineCode code;
   constexpr int32_t kOffset = 0x01020304;
   // call [rip + kOffset]
@@ -456,15 +464,7 @@ TEST_F(RelocateInstructionTest, CallToImmediateAddress) {
 
   ErrorMessageOr<RelocatedInstruction> result =
       RelocateInstruction(instruction_, 0x0100000000, 0x0200000000);
-  ASSERT_THAT(result, HasValue());
-  // call [rip + 2]               ff 15 02 00 00 00
-  // jmp  [rip + 8]               eb 08
-  // absolute_address             09 03 02 01 01 00 00 00
-  EXPECT_THAT(result.value().code,
-              ElementsAreArray({0xff, 0x15, 0x02, 0x00, 0x00, 0x00, 0xeb, 0x08, 0x09, 0x03, 0x02,
-                                0x01, 0x01, 0x00, 0x00, 0x00}));
-  ASSERT_TRUE(result.value().position_of_absolute_address.has_value());
-  EXPECT_EQ(8, result.value().position_of_absolute_address.value());
+  EXPECT_THAT(result, HasError("Relocating a call instruction is not supported."));
 }
 
 TEST_F(RelocateInstructionTest, ConditionalJumpTo8BitImmediate) {
@@ -560,7 +560,11 @@ class InstrumentFunctionTest : public testing::Test {
     pid_ = fork();
     CHECK(pid_ != -1);
     if (pid_ == 0) {
-      uint64_t sum = 0;
+      prctl(PR_SET_PDEATHSIG, SIGTERM);
+
+      // Endless loops without side effects are UB and recent versions of clang optimize
+      // it away. Making `sum` volatile avoids that problem.
+      [[maybe_unused]] volatile uint64_t sum = 0;
       while (true) {
         sum += (*function_pointer)();
       }
@@ -576,9 +580,11 @@ class InstrumentFunctionTest : public testing::Test {
     // Stop the child process using our tooling.
     CHECK(AttachAndStopProcess(pid_).has_value());
 
+    auto library_path_or_error = GetTestLibLibraryPath();
+    ASSERT_THAT(library_path_or_error, HasNoError());
+    std::filesystem::path library_path = std::move(library_path_or_error.value());
+
     // Inject the payload for the instrumentation.
-    constexpr std::string_view kLibName = "libUserSpaceInstrumentationTestLib.so";
-    const std::string library_path = orbit_base::GetExecutableDir() / ".." / "lib" / kLibName;
     auto library_handle_or_error = DlopenInTracee(pid_, library_path, RTLD_NOW);
     CHECK(library_handle_or_error.has_value());
     void* library_handle = library_handle_or_error.value();
@@ -688,6 +694,20 @@ extern "C" int DoSomething() {
 TEST_F(InstrumentFunctionTest, DoSomething) {
   RunChild(&DoSomething, "DoSomething");
   PrepareInstrumentation(kEntryPayloadFunctionName, kExitPayloadFunctionName);
+  ErrorMessageOr<uint64_t> address_after_prologue_or_error = CreateTrampoline(
+      pid_, function_address_, function_code_, trampoline_address_, entry_payload_function_address_,
+      return_trampoline_address_, capstone_handle_, relocation_map_);
+  EXPECT_THAT(address_after_prologue_or_error, HasNoError());
+  ErrorMessageOr<void> result =
+      InstrumentFunction(pid_, function_address_, /*function_id=*/42,
+                         address_after_prologue_or_error.value(), trampoline_address_);
+  EXPECT_THAT(result, HasNoError());
+  RestartAndRemoveInstrumentation();
+}
+
+TEST_F(InstrumentFunctionTest, CheckStackAlignedTo16Bytes) {
+  RunChild(&DoSomething, "DoSomething");
+  PrepareInstrumentation("EntryPayloadAlignedCopy", kExitPayloadFunctionName);
   ErrorMessageOr<uint64_t> address_after_prologue_or_error = CreateTrampoline(
       pid_, function_address_, function_code_, trampoline_address_, entry_payload_function_address_,
       return_trampoline_address_, capstone_handle_, relocation_map_);
@@ -834,33 +854,6 @@ TEST_F(InstrumentFunctionTest, UnconditionalJump32BitOffset) {
   RestartAndRemoveInstrumentation();
 }
 
-// Call function at relative offset.
-extern "C" __attribute__((naked)) int CallFunction() {
-  __asm__ __volatile__(
-      "call function_label\n\t"
-      "ret \n\t"
-      "function_label:\n\t"
-      "nop \n\t"
-      "ret \n\t"
-      :
-      :
-      :);
-}
-
-TEST_F(InstrumentFunctionTest, CallFunction) {
-  RunChild(&CallFunction, "CallFunction");
-  PrepareInstrumentation(kEntryPayloadFunctionName, kExitPayloadFunctionName);
-  ErrorMessageOr<uint64_t> address_after_prologue_or_error = CreateTrampoline(
-      pid_, function_address_, function_code_, trampoline_address_, entry_payload_function_address_,
-      return_trampoline_address_, capstone_handle_, relocation_map_);
-  EXPECT_THAT(address_after_prologue_or_error, HasNoError());
-  ErrorMessageOr<void> result =
-      InstrumentFunction(pid_, function_address_, /*function_id=*/42,
-                         address_after_prologue_or_error.value(), trampoline_address_);
-  EXPECT_THAT(result, HasNoError());
-  RestartAndRemoveInstrumentation();
-}
-
 // The rip relative address is translated to the new code position.
 extern "C" __attribute__((naked)) int ConditionalJump8BitOffset() {
   __asm__ __volatile__(
@@ -959,9 +952,13 @@ TEST_F(InstrumentFunctionTest, CheckIntParameters) {
   pid_ = fork();
   CHECK(pid_ != -1);
   if (pid_ == 0) {
-    uint64_t sum = 0;
+    prctl(PR_SET_PDEATHSIG, SIGTERM);
+
+    [[maybe_unused]] volatile uint64_t sum = 0;
     while (true) {
       sum += CheckIntParameters(0, 0, 0, 0, 0, 0, 0, 0);
+      // Endless loops without side effects are UB and recent versions of clang optimize
+      // it away.
     }
   }
   PrepareInstrumentation("EntryPayloadClobberParameterRegisters", kExitPayloadFunctionName);
@@ -989,7 +986,11 @@ TEST_F(InstrumentFunctionTest, CheckFloatParameters) {
   pid_ = fork();
   CHECK(pid_ != -1);
   if (pid_ == 0) {
-    uint64_t sum = 0;
+    prctl(PR_SET_PDEATHSIG, SIGTERM);
+
+    // Endless loops without side effects are UB and recent versions of clang optimize
+    // it away. Making `sum` volatile avoids that problem.
+    [[maybe_unused]] volatile uint64_t sum = 0;
     while (true) {
       sum += CheckFloatParameters(0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f);
     }
@@ -1021,7 +1022,11 @@ TEST_F(InstrumentFunctionTest, CheckM256iParameters) {
   pid_ = fork();
   CHECK(pid_ != -1);
   if (pid_ == 0) {
-    uint64_t sum = 0;
+    prctl(PR_SET_PDEATHSIG, SIGTERM);
+
+    // Endless loops without side effects are UB and recent versions of clang optimize
+    // it away. Making `sum` volatile avoids that problem.
+    [[maybe_unused]] volatile uint64_t sum = 0;
     while (true) {
       sum +=
           CheckM256iParameters(_mm256_set1_epi64x(0), _mm256_set1_epi64x(0), _mm256_set1_epi64x(0),

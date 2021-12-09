@@ -8,6 +8,7 @@
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
 #include <stdint.h>
+#include <sys/prctl.h>
 #include <sys/ptrace.h>
 #include <sys/types.h>
 #include <sys/wait.h>
@@ -75,8 +76,13 @@ TEST(AccessTraceesMemoryTest, ReadFailures) {
   pid_t pid = fork();
   CHECK(pid != -1);
   if (pid == 0) {
+    prctl(PR_SET_PDEATHSIG, SIGTERM);
+
     // Child just runs an endless loop.
+    volatile uint64_t counter = 0;
     while (true) {
+      // Endless loops without side effects are UB and recent versions of clang optimize it away.
+      ++counter;
     }
   }
 
@@ -87,7 +93,9 @@ TEST(AccessTraceesMemoryTest, ReadFailures) {
   CHECK(continuous_range_or_error.has_value());
   const auto continuous_range = continuous_range_or_error.value();
   const uint64_t address = continuous_range.start;
-  const uint64_t length = continuous_range.end - continuous_range.start;
+
+  constexpr uint64_t kMaxLength = 20ul * 1024 * 1024;  // 20 MiB
+  const uint64_t length = std::min(kMaxLength, continuous_range.end - continuous_range.start);
 
   // Good read.
   ErrorMessageOr<std::vector<uint8_t>> result = ReadTraceesMemory(pid, address, length);
@@ -101,8 +109,8 @@ TEST(AccessTraceesMemoryTest, ReadFailures) {
   EXPECT_DEATH(auto unused_result = ReadTraceesMemory(pid, address, 0), "Check failed");
 
   // Read past the end of the mappings.
-  result = ReadTraceesMemory(pid, address, length + 1);
-  EXPECT_THAT(result, HasError("Only got"));
+  result = ReadTraceesMemory(pid, continuous_range.end - length, length + 1);
+  EXPECT_THAT(result, HasError("Input/output error"));
 
   // Read from bad address.
   result = ReadTraceesMemory(pid, 0, length);
@@ -111,15 +119,20 @@ TEST(AccessTraceesMemoryTest, ReadFailures) {
   // Detach and end child.
   CHECK(!DetachAndContinueProcess(pid).has_error());
   kill(pid, SIGKILL);
-  waitpid(pid, NULL, 0);
+  waitpid(pid, nullptr, 0);
 }
 
 TEST(AccessTraceesMemoryTest, WriteFailures) {
   pid_t pid = fork();
   CHECK(pid != -1);
   if (pid == 0) {
+    prctl(PR_SET_PDEATHSIG, SIGTERM);
+
     // Child just runs an endless loop.
+    volatile uint64_t counter = 0;
     while (true) {
+      // Endless loops without side effects are UB and recent versions of clang optimize it away.
+      ++counter;
     }
   }
 
@@ -130,7 +143,9 @@ TEST(AccessTraceesMemoryTest, WriteFailures) {
   CHECK(continuous_range_or_error.has_value());
   const auto continuous_range = continuous_range_or_error.value();
   const uint64_t address = continuous_range.start;
-  const uint64_t length = continuous_range.end - continuous_range.start;
+
+  constexpr uint64_t kMaxLength = 20ul * 1024 * 1024;  // 20 MiB
+  const uint64_t length = std::min(kMaxLength, continuous_range.end - continuous_range.start);
 
   // Backup.
   auto backup = ReadTraceesMemory(pid, address, length);
@@ -151,7 +166,7 @@ TEST(AccessTraceesMemoryTest, WriteFailures) {
 
   // Write past the end of the mappings.
   bytes.push_back(0);
-  result = WriteTraceesMemory(pid, address, bytes);
+  result = WriteTraceesMemory(pid, continuous_range.end - length, bytes);
   EXPECT_THAT(result, HasError("Input/output error"));
 
   // Write to bad address.
@@ -162,15 +177,20 @@ TEST(AccessTraceesMemoryTest, WriteFailures) {
   CHECK(!WriteTraceesMemory(pid, address, backup.value()).has_error());
   CHECK(!DetachAndContinueProcess(pid).has_error());
   kill(pid, SIGKILL);
-  waitpid(pid, NULL, 0);
+  waitpid(pid, nullptr, 0);
 }
 
 TEST(AccessTraceesMemoryTest, ReadWriteRestore) {
   pid_t pid = fork();
   CHECK(pid != -1);
   if (pid == 0) {
+    prctl(PR_SET_PDEATHSIG, SIGTERM);
+
     // Child just runs an endless loop.
+    volatile uint64_t counter = 0;
     while (true) {
+      // Endless loops without side effects are UB and recent versions of clang optimize it away.
+      ++counter;
     }
   }
 
@@ -201,7 +221,7 @@ TEST(AccessTraceesMemoryTest, ReadWriteRestore) {
   CHECK(WriteTraceesMemory(pid, address, backup.value()).has_value());
   CHECK(!DetachAndContinueProcess(pid).has_error());
   kill(pid, SIGKILL);
-  waitpid(pid, NULL, 0);
+  waitpid(pid, nullptr, 0);
 }
 
 }  // namespace orbit_user_space_instrumentation

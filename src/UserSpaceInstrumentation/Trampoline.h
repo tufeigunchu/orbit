@@ -14,9 +14,9 @@
 #include <optional>
 #include <vector>
 
-#include "AddressRange.h"
 #include "AllocateInTracee.h"
 #include "OrbitBase/Result.h"
+#include "UserSpaceInstrumentation/AddressRange.h"
 
 namespace orbit_user_space_instrumentation {
 
@@ -104,30 +104,31 @@ struct RelocatedInstruction {
 // Returns the translated code and, optionally, a position in the code that might require an address
 // translation (details in the comment above).
 // Note that not all instructions can be handled (for various reasons, see the comments in the
-// implemention). At least in the current implementation it might not be possible to instrument some
-// functions.
+// implementation). At least in the current implementation it might not be possible to instrument
+// some functions.
 [[nodiscard]] ErrorMessageOr<RelocatedInstruction> RelocateInstruction(cs_insn* instruction,
                                                                        uint64_t old_address,
                                                                        uint64_t new_address);
 
-// Strictly speaking the max tempoline size is a compile time constant, but we prefer to compute it
+// Strictly speaking the max trampoline size is a compile time constant, but we prefer to compute it
 // here since this captures every change to the code constructing the trampoline.
 [[nodiscard]] uint64_t GetMaxTrampolineSize();
 
 // Creates a trampoline for the function at `function_address`. The trampoline is built at
-// `trampoline_address`. The trampoline will call `entry_payload_function_address` with
-// `return_address` and a function id as a parameter. The function id is written into the
-// trampoline by `InstrumentFunction`. This is necessary since the function id is not stable across
-// multiple profiling runs.
-// `function` contains the beginning of the function (kMaxFunctionPrologueBackupSize bytes or less
-// if the function shorter). `capstone_handle` is a handle to the capstone disassembler library
-// returned by cs_open. The function returns an error if it was not possible to instrument the
-// function. For details on that see the comments at AppendRelocatedPrologueCode. If the function is
-// successful it will insert an address pair into `relocation_map` for each instruction it relocated
-// from the beginning of the function into the trampoline (needed for moving instruction pointers
-// away from the overwritten bytes at the beginning of the function, compare
-// MoveInstructionPointersOutOfOverwrittenCode below). The return value is the address of the first
-// instruction not relocated into the trampoline (i.e. the address the trampoline jump back to).
+// `trampoline_address`. The trampoline will call `entry_payload_function_address` with the
+// function's return address, a function id, the address on the stack where the return address is
+// stored, and the address of the return trampoline as parameters. The function id is written
+// into the trampoline by `InstrumentFunction`. This is necessary since the function id is not
+// stable across multiple profiling runs. `function` contains the beginning of the function
+// (kMaxFunctionPrologueBackupSize bytes or less if the function shorter). `capstone_handle` is a
+// handle to the capstone disassembler library returned by cs_open. The function returns an error if
+// it was not possible to instrument the function. For details on that see the comments at
+// AppendRelocatedPrologueCode. If the function is successful it will insert an address pair into
+// `relocation_map` for each instruction it relocated from the beginning of the function into the
+// trampoline (needed for moving instruction pointers away from the overwritten bytes at the
+// beginning of the function, compare MoveInstructionPointersOutOfOverwrittenCode below). The return
+// value is the address of the first instruction not relocated into the trampoline (i.e. the address
+// the trampoline jump back to).
 [[nodiscard]] ErrorMessageOr<uint64_t> CreateTrampoline(
     pid_t pid, uint64_t function_address, const std::vector<uint8_t>& function,
     uint64_t trampoline_address, uint64_t entry_payload_function_address,
@@ -151,7 +152,7 @@ struct RelocatedInstruction {
                                                           uint64_t return_trampoline_address);
 
 // Instrument function at `function_address` in process `pid`. This simply overwrites the beginning
-// of the fuction with a jump to `trampoline_address`. The trampoline needs to be constructed with
+// of the function with a jump to `trampoline_address`. The trampoline needs to be constructed with
 // `CreateTrampoline` above. The trampoline gets patched such that it hands over the current
 // `function_id` to the entry payload.
 [[nodiscard]] ErrorMessageOr<void> InstrumentFunction(pid_t pid, uint64_t function_address,

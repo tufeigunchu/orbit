@@ -13,40 +13,39 @@
 #include "Batcher.h"
 #include "CaptureViewElement.h"
 #include "ClientData/CaptureData.h"
+#include "ClientProtos/capture_data.pb.h"
 #include "Geometry.h"
 #include "GlCanvas.h"
 #include "OrbitBase/Logging.h"
-#include "TimeGraph.h"
 #include "Viewport.h"
-#include "capture_data.pb.h"
 
 using orbit_client_data::ThreadID;
 using orbit_client_protos::ThreadStateSliceInfo;
 
 namespace orbit_gl {
 
-ThreadStateBar::ThreadStateBar(CaptureViewElement* parent, OrbitApp* app, TimeGraph* time_graph,
+ThreadStateBar::ThreadStateBar(CaptureViewElement* parent, OrbitApp* app,
+                               const orbit_gl::TimelineInfoInterface* timeline_info,
                                orbit_gl::Viewport* viewport, TimeGraphLayout* layout,
                                const orbit_client_data::CaptureData* capture_data,
                                ThreadID thread_id, const Color& color)
-    : ThreadBar(parent, app, time_graph, viewport, layout, capture_data, thread_id, "ThreadState",
-                color) {}
+    : ThreadBar(parent, app, timeline_info, viewport, layout, capture_data, thread_id,
+                "ThreadState", color) {}
 
 bool ThreadStateBar::IsEmpty() const {
   return capture_data_ == nullptr || !capture_data_->HasThreadStatesForThread(GetThreadId());
 }
 
-void ThreadStateBar::Draw(Batcher& batcher, TextRenderer& text_renderer,
-                          const DrawContext& draw_context) {
-  ThreadBar::Draw(batcher, text_renderer, draw_context);
+void ThreadStateBar::DoDraw(Batcher& batcher, TextRenderer& text_renderer,
+                            const DrawContext& draw_context) {
+  ThreadBar::DoDraw(batcher, text_renderer, draw_context);
 
-  // Similarly to CallstackThreadBar::Draw, the thread state slices don't respond to clicks, but
+  // Similarly to CallstackThreadBar::DoDraw, the thread state slices don't respond to clicks, but
   // have a tooltip. For picking, we want to draw the event bar over them if handling a click, and
   // underneath otherwise. This simulates "click-through" behavior.
   float thread_state_bar_z = draw_context.picking_mode == PickingMode::kClick
                                  ? GlCanvas::kZValueEventBarPicking
                                  : GlCanvas::kZValueEventBar;
-  thread_state_bar_z += draw_context.z_offset;
 
   // Draw a transparent track just for clicking.
   Box box(GetPos(), Vec2(GetWidth(), GetHeight()), thread_state_bar_z);
@@ -145,8 +144,8 @@ static std::string GetThreadStateDescription(ThreadStateSliceInfo::ThreadState s
   }
 }
 
-std::string ThreadStateBar::GetThreadStateSliceTooltip(Batcher* batcher, PickingId id) const {
-  PickingUserData* user_data = batcher->GetUserData(id);
+std::string ThreadStateBar::GetThreadStateSliceTooltip(Batcher& batcher, PickingId id) const {
+  PickingUserData* user_data = batcher.GetUserData(id);
   if (user_data == nullptr || user_data->custom_data_ == nullptr) {
     return "";
   }
@@ -162,15 +161,16 @@ std::string ThreadStateBar::GetThreadStateSliceTooltip(Batcher* batcher, Picking
       GetThreadStateDescription(thread_state_slice->thread_state()));
 }
 
-void ThreadStateBar::UpdatePrimitives(Batcher* batcher, uint64_t min_tick, uint64_t max_tick,
-                                      PickingMode picking_mode, float z_offset) {
-  ThreadBar::UpdatePrimitives(batcher, min_tick, max_tick, picking_mode, z_offset);
+void ThreadStateBar::DoUpdatePrimitives(Batcher& batcher, TextRenderer& text_renderer,
+                                        uint64_t min_tick, uint64_t max_tick,
+                                        PickingMode picking_mode) {
+  ORBIT_SCOPE_WITH_COLOR("ThreadStateBar::DoUpdatePrimitives", kOrbitColorTeal);
+  ThreadBar::DoUpdatePrimitives(batcher, text_renderer, min_tick, max_tick, picking_mode);
 
-  const auto time_window_ns = static_cast<uint64_t>(1000 * time_graph_->GetTimeWindowUs());
-  const uint64_t pixel_delta_ns = time_window_ns / viewport_->WorldToScreenWidth(GetWidth());
-  const uint64_t min_time_graph_ns = time_graph_->GetTickFromUs(time_graph_->GetMinTimeUs());
-  const float pixel_width_in_world_coords =
-      viewport_->GetVisibleWorldWidth() / viewport_->WorldToScreenWidth(GetWidth());
+  const auto time_window_ns = static_cast<uint64_t>(1000 * timeline_info_->GetTimeWindowUs());
+  const uint64_t pixel_delta_ns = time_window_ns / viewport_->WorldToScreen(GetSize())[0];
+  const uint64_t min_time_graph_ns = timeline_info_->GetTickFromUs(timeline_info_->GetMinTimeUs());
+  const float pixel_width_in_world_coords = viewport_->ScreenToWorld({1, 0})[0];
 
   uint64_t ignore_until_ns = 0;
 
@@ -183,8 +183,8 @@ void ThreadStateBar::UpdatePrimitives(Batcher* batcher, uint64_t min_tick, uint6
           return;
         }
 
-        const float x0 = time_graph_->GetWorldFromTick(slice.begin_timestamp_ns());
-        const float x1 = time_graph_->GetWorldFromTick(slice.end_timestamp_ns());
+        const float x0 = timeline_info_->GetWorldFromTick(slice.begin_timestamp_ns());
+        const float x1 = timeline_info_->GetWorldFromTick(slice.end_timestamp_ns());
         const float width = x1 - x0;
 
         const Vec2 pos{x0, GetPos()[1]};
@@ -192,21 +192,20 @@ void ThreadStateBar::UpdatePrimitives(Batcher* batcher, uint64_t min_tick, uint6
 
         const Color color = GetThreadStateColor(slice.thread_state());
 
-        auto user_data = std::make_unique<PickingUserData>(nullptr, [&, batcher](PickingId id) {
-          return GetThreadStateSliceTooltip(batcher, id);
-        });
+        auto user_data = std::make_unique<PickingUserData>(
+            nullptr, [&](PickingId id) { return GetThreadStateSliceTooltip(batcher, id); });
         user_data->custom_data_ = &slice;
 
         if (slice.end_timestamp_ns() - slice.begin_timestamp_ns() > pixel_delta_ns) {
-          Box box(pos, size, GlCanvas::kZValueEvent + z_offset);
-          batcher->AddBox(box, color, std::move(user_data));
+          Box box(pos, size, GlCanvas::kZValueEvent);
+          batcher.AddBox(box, color, std::move(user_data));
         } else {
           // Make this slice cover an entire pixel and don't draw subsequent slices that would
           // coincide with the same pixel.
           // Use AddBox instead of AddVerticalLine as otherwise the tops of Boxes and lines wouldn't
           // be properly aligned.
-          Box box(pos, {pixel_width_in_world_coords, size[1]}, GlCanvas::kZValueEvent + z_offset);
-          batcher->AddBox(box, color, std::move(user_data));
+          Box box(pos, {pixel_width_in_world_coords, size[1]}, GlCanvas::kZValueEvent);
+          batcher.AddBox(box, color, std::move(user_data));
 
           if (pixel_delta_ns != 0) {
             ignore_until_ns =

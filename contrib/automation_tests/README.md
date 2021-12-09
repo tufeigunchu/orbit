@@ -26,6 +26,7 @@ Once you've activated the virtual environment, install the dependencies:
 
 ```
 pip install absl-py
+pip install psutil
 pip install pywinauto
 ```
 
@@ -33,6 +34,12 @@ The script should run with python 2 and 3 so just use what you have installed. M
 you are running a 64 bit version of python.
 The Orbit UI is 64 bit only and pywinauto requires the bitness of python to match the bitness 
 of the program under test.
+
+*For Google internal users only:*
+
+You can download the 
+[python distribution used in the automatic test runs](https://pantheon.corp.google.com/storage/browser/_details/orbit-integration-test-data/WPy64-3830.zip;tab=live_object?project=orbitprofiler), unpack it and start 'WinPython Command Prompt.exe'. All pathes 
+will be set correctly and the dependencies are installed.
 
 ## Running the tests locally
 
@@ -102,4 +109,11 @@ Running an E2E test with the `-dev_mode` command line parameter will:
 - Not close Orbit when a test is done
 
 Use this for quick iterations on new tests. In addition, omit the usual test cases to connect to the 
-stadia instance and select a process while you're developing, so you can simply keep Orbit open.  
+stadia instance and select a process while you're developing, so you can simply keep Orbit open.
+
+### Style
+
+[yapf](https://github.com/google/yapf) is used with the Google style to keep consistent code style
+in python files. yapf can be installed with `pip install` and will pick up the provided
+`.style.yapf` file automatically. For most convenience, use yapf with an IDE extension, or run by
+hand with `yapf -i <file>.py` (formats file in place).

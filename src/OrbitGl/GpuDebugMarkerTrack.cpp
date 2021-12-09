@@ -12,24 +12,24 @@
 #include "App.h"
 #include "Batcher.h"
 #include "ClientData/TimerChain.h"
+#include "ClientProtos/capture_data.pb.h"
 #include "DisplayFormats/DisplayFormats.h"
 #include "GlUtils.h"
 #include "OrbitBase/Logging.h"
 #include "OrbitBase/ThreadConstants.h"
-#include "TimeGraph.h"
 #include "TimeGraphLayout.h"
 #include "TriangleToggle.h"
 #include "absl/strings/str_format.h"
-#include "capture_data.pb.h"
 
 using orbit_client_protos::TimerInfo;
 
-GpuDebugMarkerTrack::GpuDebugMarkerTrack(CaptureViewElement* parent, TimeGraph* time_graph,
+GpuDebugMarkerTrack::GpuDebugMarkerTrack(CaptureViewElement* parent,
+                                         const orbit_gl::TimelineInfoInterface* timeline_info,
                                          orbit_gl::Viewport* viewport, TimeGraphLayout* layout,
                                          uint64_t timeline_hash, OrbitApp* app,
                                          const orbit_client_data::CaptureData* capture_data,
-                                         orbit_client_data::TrackData* track_data)
-    : TimerTrack(parent, time_graph, viewport, layout, app, capture_data, track_data),
+                                         orbit_client_data::TimerData* timer_data)
+    : TimerTrack(parent, timeline_info, viewport, layout, app, capture_data, timer_data),
       string_manager_{app->GetStringManager()},
       timeline_hash_{timeline_hash} {
   draw_background_ = false;
@@ -45,7 +45,8 @@ std::string GpuDebugMarkerTrack::GetTooltip() const {
 }
 
 Color GpuDebugMarkerTrack::GetTimerColor(const TimerInfo& timer_info, bool is_selected,
-                                         bool is_highlighted) const {
+                                         bool is_highlighted,
+                                         const internal::DrawData& /*draw_data*/) const {
   CHECK(timer_info.type() == TimerInfo::kGpuDebugMarker);
   const Color kInactiveColor(100, 100, 100, 255);
   const Color kSelectionColor(0, 128, 255, 255);
@@ -116,8 +117,7 @@ float GpuDebugMarkerTrack::GetYFromTimer(const TimerInfo& timer_info) const {
 
 float GpuDebugMarkerTrack::GetHeight() const {
   bool collapsed = collapse_toggle_->IsCollapsed();
-  uint32_t depth =
-      collapsed ? std::min<uint32_t>(1, track_data_->GetMaxDepth()) : track_data_->GetMaxDepth();
+  uint32_t depth = collapsed ? std::min<uint32_t>(1, GetDepth()) : GetDepth();
   return layout_->GetTrackTabHeight() + layout_->GetTrackContentTopMargin() +
          layout_->GetTextBoxHeight() * depth + layout_->GetTrackContentBottomMargin();
 }

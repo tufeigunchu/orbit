@@ -9,10 +9,9 @@
 #include <algorithm>
 
 #include "App.h"
-#include "CallstackDataView.h"
+#include "ClientProtos/capture_data.pb.h"
 #include "OrbitBase/Logging.h"
 #include "absl/strings/str_format.h"
-#include "capture_data.pb.h"
 
 using orbit_client_data::CallstackCount;
 using orbit_client_data::PostProcessedSamplingData;
@@ -28,10 +27,8 @@ SamplingReport::SamplingReport(
       unique_callstacks_{std::move(unique_callstacks)},
       has_summary_{has_summary},
       app_{app} {
-  selected_thread_id_ = 0;
-  callstack_data_view_ = nullptr;
-  selected_sorted_callstack_report_ = nullptr;
-  selected_callstack_index_ = 0;
+  ORBIT_SCOPE_FUNCTION;
+  SCOPED_TIMED_LOG("SamplingReport::SamplingReport");
   FillReport();
 }
 
@@ -47,7 +44,7 @@ void SamplingReport::FillReport() {
   const auto& sample_data = post_processed_sampling_data_.GetThreadSampleData();
 
   for (const ThreadSampleData& thread_sample_data : sample_data) {
-    SamplingReportDataView thread_report{app_};
+    orbit_data_views::SamplingReportDataView thread_report{app_};
     thread_report.SetSampledFunctions(thread_sample_data.sampled_functions);
     thread_report.SetThreadID(thread_sample_data.thread_id);
     thread_report.SetSamplingReport(this);
@@ -78,7 +75,7 @@ void SamplingReport::UpdateReport(
   unique_callstacks_ = std::move(unique_callstacks);
   post_processed_sampling_data_ = std::move(post_processed_sampling_data);
 
-  for (SamplingReportDataView& thread_report : thread_reports_) {
+  for (orbit_data_views::SamplingReportDataView& thread_report : thread_reports_) {
     ThreadID thread_id = thread_report.GetThreadID();
     const ThreadSampleData* thread_sample_data =
         post_processed_sampling_data_.GetThreadSampleDataByThreadId(thread_id);

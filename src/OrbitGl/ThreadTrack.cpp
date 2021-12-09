@@ -18,49 +18,42 @@
 #include "ClientData/CaptureData.h"
 #include "ClientData/FunctionUtils.h"
 #include "ClientData/TimerChain.h"
+#include "ClientProtos/capture_data.pb.h"
 #include "DisplayFormats/DisplayFormats.h"
 #include "GlUtils.h"
 #include "Introspection/Introspection.h"
-#include "ManualInstrumentationManager.h"
 #include "OrbitBase/Logging.h"
 #include "OrbitBase/ThreadConstants.h"
 #include "OrbitBase/ThreadUtils.h"
 #include "TextRenderer.h"
-#include "TimeGraph.h"
 #include "TimeGraphLayout.h"
 #include "TriangleToggle.h"
 #include "Viewport.h"
-#include "capture_data.pb.h"
 
 using orbit_client_data::CaptureData;
 using orbit_client_data::TimerChain;
 
-using orbit_client_protos::FunctionInfo;
 using orbit_client_protos::TimerInfo;
 
 using orbit_grpc_protos::InstrumentedFunction;
 
-ThreadTrack::ThreadTrack(CaptureViewElement* parent, TimeGraph* time_graph,
+ThreadTrack::ThreadTrack(CaptureViewElement* parent,
+                         const orbit_gl::TimelineInfoInterface* timeline_info,
                          orbit_gl::Viewport* viewport, TimeGraphLayout* layout, uint32_t thread_id,
-                         OrbitApp* app, const CaptureData* capture_data,
-                         orbit_client_data::TrackData* track_data,
-                         ScopeTreeUpdateType scope_tree_update_type)
-    : TimerTrack(parent, time_graph, viewport, layout, app, capture_data, track_data),
+                         OrbitApp* app, const orbit_client_data::CaptureData* capture_data,
+                         orbit_client_data::ThreadTrackDataProvider* thread_track_data_provider)
+    : TimerTrack(parent, timeline_info, viewport, layout, app, capture_data, nullptr),
       thread_id_{thread_id},
-      scope_tree_update_type_{scope_tree_update_type} {
+      thread_track_data_provider_{thread_track_data_provider} {
   Color color = TimeGraph::GetThreadColor(thread_id);
   thread_state_bar_ = std::make_shared<orbit_gl::ThreadStateBar>(
-      this, app_, time_graph, viewport, layout, capture_data, thread_id, color);
+      this, app_, timeline_info_, viewport, layout, capture_data, thread_id, color);
 
   event_bar_ = std::make_shared<orbit_gl::CallstackThreadBar>(
-      this, app_, time_graph, viewport, layout, capture_data, thread_id, color);
+      this, app_, timeline_info_, viewport, layout, capture_data, thread_id, color);
 
   tracepoint_bar_ = std::make_shared<orbit_gl::TracepointThreadBar>(
-      this, app_, time_graph, viewport, layout, capture_data, thread_id, color);
-}
-
-std::string ThreadTrack::GetThreadNameFromTid(uint32_t thread_id) {
-  return capture_data_->GetThreadName(thread_id);
+      this, app_, timeline_info_, viewport, layout, capture_data, thread_id, color);
 }
 
 std::string ThreadTrack::GetName() const {
@@ -100,19 +93,19 @@ int ThreadTrack::GetNumberOfPrioritizedTrailingCharacters() const {
 }
 
 const TimerInfo* ThreadTrack::GetLeft(const TimerInfo& timer_info) const {
-  return scope_tree_.FindPreviousScopeAtDepth(timer_info);
+  return thread_track_data_provider_->GetLeft(timer_info);
 }
 
 const TimerInfo* ThreadTrack::GetRight(const TimerInfo& timer_info) const {
-  return scope_tree_.FindNextScopeAtDepth(timer_info);
+  return thread_track_data_provider_->GetRight(timer_info);
 }
 
 const TimerInfo* ThreadTrack::GetUp(const TimerInfo& timer_info) const {
-  return scope_tree_.FindParent(timer_info);
+  return thread_track_data_provider_->GetUp(timer_info);
 }
 
 const TimerInfo* ThreadTrack::GetDown(const TimerInfo& timer_info) const {
-  return scope_tree_.FindFirstChild(timer_info);
+  return thread_track_data_provider_->GetDown(timer_info);
 }
 
 std::string ThreadTrack::GetBoxTooltip(const Batcher& batcher, PickingId id) const {
@@ -200,8 +193,8 @@ bool ThreadTrack::IsTrackSelected() const {
 
 float ThreadTrack::GetDefaultBoxHeight() const {
   auto box_height = layout_->GetTextBoxHeight();
-  if (collapse_toggle_->IsCollapsed() && track_data_->GetMaxDepth() > 0) {
-    return box_height / static_cast<float>(track_data_->GetMaxDepth());
+  if (collapse_toggle_->IsCollapsed() && GetDepth() > 0) {
+    return box_height / static_cast<float>(GetDepth());
   }
   return box_height;
 }
@@ -215,11 +208,11 @@ Color ThreadTrack::GetTimerColor(const TimerInfo& timer_info, const internal::Dr
   bool is_group_id_highlighted =
       group_id != kOrbitDefaultGroupId && group_id == draw_data.highlighted_group_id;
   bool is_highlighted = !is_selected && (is_function_id_highlighted || is_group_id_highlighted);
-  return GetTimerColor(timer_info, is_selected, is_highlighted);
+  return GetTimerColor(timer_info, is_selected, is_highlighted, draw_data);
 }
 
-Color ThreadTrack::GetTimerColor(const TimerInfo& timer_info, bool is_selected,
-                                 bool is_highlighted) const {
+Color ThreadTrack::GetTimerColor(const TimerInfo& timer_info, bool is_selected, bool is_highlighted,
+                                 const internal::DrawData& /*draw_data*/) const {
   const Color kInactiveColor(100, 100, 100, 255);
   const Color kSelectionColor(0, 128, 255, 255);
   if (is_highlighted) {
@@ -234,7 +227,7 @@ Color ThreadTrack::GetTimerColor(const TimerInfo& timer_info, bool is_selected,
 
   std::optional<Color> user_color = GetUserColor(timer_info);
 
-  Color color = kInactiveColor;
+  Color color;
   if (user_color.has_value()) {
     color = user_color.value();
   } else {
@@ -242,7 +235,7 @@ Color ThreadTrack::GetTimerColor(const TimerInfo& timer_info, bool is_selected,
   }
 
   constexpr uint8_t kOddAlpha = 210;
-  if (!(timer_info.depth() & 0x1)) {
+  if ((timer_info.depth() & 0x1) == 0) {
     color[3] = kOddAlpha;
   }
 
@@ -251,7 +244,7 @@ Color ThreadTrack::GetTimerColor(const TimerInfo& timer_info, bool is_selected,
 
 bool ThreadTrack::IsEmpty() const {
   return thread_state_bar_->IsEmpty() && event_bar_->IsEmpty() && tracepoint_bar_->IsEmpty() &&
-         track_data_->IsEmpty();
+         thread_track_data_provider_->IsEmpty(thread_id_);
 }
 
 void ThreadTrack::UpdatePositionOfSubtracks() {
@@ -263,35 +256,16 @@ void ThreadTrack::UpdatePositionOfSubtracks() {
   float current_y = pos[1] + layout_->GetTrackTabHeight() + layout_->GetTrackContentTopMargin();
 
   thread_state_bar_->SetPos(pos[0], current_y);
-  if (!thread_state_bar_->IsEmpty()) {
+  if (thread_state_bar_->ShouldBeRendered()) {
     current_y += (space_between_subtracks + thread_state_track_height);
   }
 
   event_bar_->SetPos(pos[0], current_y);
-  if (!event_bar_->IsEmpty()) {
+  if (event_bar_->ShouldBeRendered()) {
     current_y += (space_between_subtracks + event_track_height);
   }
 
   tracepoint_bar_->SetPos(pos[0], current_y);
-}
-
-void ThreadTrack::Draw(Batcher& batcher, TextRenderer& text_renderer,
-                       const DrawContext& draw_context) {
-  TimerTrack::Draw(batcher, text_renderer, draw_context);
-
-  DrawContext inner_draw_context = draw_context.IncreasedIndentationLevel();
-
-  if (!thread_state_bar_->IsEmpty()) {
-    thread_state_bar_->Draw(batcher, text_renderer, inner_draw_context);
-  }
-
-  if (!event_bar_->IsEmpty()) {
-    event_bar_->Draw(batcher, text_renderer, inner_draw_context);
-  }
-
-  if (!tracepoint_bar_->IsEmpty()) {
-    tracepoint_bar_->Draw(batcher, text_renderer, inner_draw_context);
-  }
 }
 
 void ThreadTrack::OnPick(int x, int y) {
@@ -299,20 +273,9 @@ void ThreadTrack::OnPick(int x, int y) {
   app_->set_selected_thread_id(GetThreadId());
 }
 
-std::vector<orbit_gl::CaptureViewElement*> ThreadTrack::GetVisibleChildren() {
-  std::vector<CaptureViewElement*> result;
-  if (!thread_state_bar_->IsEmpty()) {
-    result.push_back(thread_state_bar_.get());
-  }
-
-  if (!event_bar_->IsEmpty()) {
-    result.push_back(event_bar_.get());
-  }
-
-  if (!tracepoint_bar_->IsEmpty()) {
-    result.push_back(tracepoint_bar_.get());
-  }
-
+std::vector<orbit_gl::CaptureViewElement*> ThreadTrack::GetAllChildren() const {
+  auto result = Track::GetAllChildren();
+  result.insert(result.end(), {thread_state_bar_.get(), event_bar_.get(), tracepoint_bar_.get()});
   return result;
 }
 
@@ -345,9 +308,8 @@ std::string ThreadTrack::GetTooltip() const {
 }
 
 float ThreadTrack::GetHeight() const {
-  const uint32_t depth = collapse_toggle_->IsCollapsed()
-                             ? std::min<uint32_t>(1, track_data_->GetMaxDepth())
-                             : track_data_->GetMaxDepth();
+  const uint32_t depth =
+      collapse_toggle_->IsCollapsed() ? std::min<uint32_t>(1, GetDepth()) : GetDepth();
 
   bool gap_between_tracks_and_timers =
       (!thread_state_bar_->IsEmpty() || !event_bar_->IsEmpty() || !tracepoint_bar_->IsEmpty()) &&
@@ -355,15 +317,6 @@ float ThreadTrack::GetHeight() const {
   return GetHeaderHeight() +
          (gap_between_tracks_and_timers ? layout_->GetSpaceBetweenTracksAndThread() : 0) +
          layout_->GetTextBoxHeight() * depth + layout_->GetTrackContentBottomMargin();
-}
-
-// TODO(b/176216022): Make a general interface for capture view elements for setting the width to
-// every child.
-void ThreadTrack::SetWidth(float width) {
-  Track::SetWidth(width);
-  thread_state_bar_->SetWidth(width);
-  event_bar_->SetWidth(width);
-  tracepoint_bar_->SetWidth(width);
 }
 
 float ThreadTrack::GetHeaderHeight() const {
@@ -401,46 +354,16 @@ float ThreadTrack::GetYFromDepth(uint32_t depth) const {
          GetDefaultBoxHeight() * static_cast<float>(depth);
 }
 
+// TODO (http://b/202110356): Erase this function when erasing all OnTimer() in TimerTracks.
 void ThreadTrack::OnTimer(const TimerInfo& timer_info) {
-  if (process_id_ == orbit_base::kInvalidProcessId) {
-    process_id_ = timer_info.process_id();
-  }
-
-  // Thread tracks use a ScopeTree so we don't need to create one TimerChain per depth.
-  // Allocate a single TimerChain into which all timers will be appended.
-
-  // Pass ownership to timer_chain. TODO(b/194268477): Pass timer_info as a value instead of
-  // reference to be able to move it.
-  const auto& timer_info_chain_ref = track_data_->AddTimer(/*depth=*/0, timer_info);
-
-  if (scope_tree_update_type_ == ScopeTreeUpdateType::kAlways) {
-    absl::MutexLock lock(&scope_tree_mutex_);
-    scope_tree_.Insert(&timer_info_chain_ref);
-  }
+  thread_track_data_provider_->AddTimer(timer_info);
 }
 
-void ThreadTrack::OnCaptureComplete() {
-  if (scope_tree_update_type_ != ScopeTreeUpdateType::kOnCaptureComplete) {
-    return;
-  }
-  // Build ScopeTree from timer chains.
-  std::vector<const TimerChain*> timer_chains = track_data_->GetChains();
-  for (const TimerChain* timer_chain : timer_chains) {
-    CHECK(timer_chain != nullptr);
-    absl::MutexLock lock(&scope_tree_mutex_);
-    for (const auto& block : *timer_chain) {
-      for (size_t k = 0; k < block.size(); ++k) {
-        scope_tree_.Insert(&block[k]);
-      }
-    }
-  }
-}
-
-[[nodiscard]] static std::pair<float, float> GetBoxPosXAndWidth(const internal::DrawData& draw_data,
-                                                                const TimeGraph* time_graph,
-                                                                const TimerInfo& timer_info) {
-  double start_us = time_graph->GetUsFromTick(timer_info.start());
-  double end_us = time_graph->GetUsFromTick(timer_info.end());
+[[nodiscard]] static std::pair<float, float> GetBoxPosXAndWidth(
+    const internal::DrawData& draw_data, const orbit_gl::TimelineInfoInterface* timeline_info,
+    const TimerInfo& timer_info) {
+  double start_us = timeline_info->GetUsFromTick(timer_info.start());
+  double end_us = timeline_info->GetUsFromTick(timer_info.end());
   double elapsed_us = end_us - start_us;
   double normalized_start = start_us * draw_data.inv_time_window;
   double normalized_length = elapsed_us * draw_data.inv_time_window;
@@ -450,78 +373,48 @@ void ThreadTrack::OnCaptureComplete() {
   return {world_timer_x, world_timer_width};
 }
 
-[[nodiscard]] static inline uint64_t GetNextPixelBoundaryTimeNs(
-    float world_x, const internal::DrawData& draw_data) {
-  float normalized_x = (world_x - draw_data.track_start_x) / draw_data.track_width;
-  int pixel_x = static_cast<int>(
-      ceil(normalized_x * draw_data.viewport->WorldToScreenWidth(draw_data.track_width)));
-  return draw_data.min_tick + pixel_x * draw_data.ns_per_pixel;
-}
-
 // We minimize overdraw when drawing lines for small events by discarding events that would just
 // draw over an already drawn pixel line. When zoomed in enough that all events are drawn as boxes,
 // this has no effect. When zoomed  out, many events will be discarded quickly.
-void ThreadTrack::UpdatePrimitives(Batcher* batcher, uint64_t min_tick, uint64_t max_tick,
-                                   PickingMode picking_mode, float z_offset) {
-  CHECK(batcher);
+void ThreadTrack::DoUpdatePrimitives(Batcher& batcher, TextRenderer& text_renderer,
+                                     uint64_t min_tick, uint64_t max_tick,
+                                     PickingMode /*picking_mode*/) {
+  // TODO(b/203181055): The parent class already provides an implementation, but this is completely
+  // ignored because ThreadTrack uses the ScopeTree, and TimerTrack doesn't.
+  // TimerTrack::DoUpdatePrimitives(batcher, text_renderer, min_tick, max_tick, picking_mode);
+  ORBIT_SCOPE_WITH_COLOR("ThreadTrack::DoUpdatePrimitives", kOrbitColorYellow);
   visible_timer_count_ = 0;
-  UpdatePrimitivesOfSubtracks(batcher, min_tick, max_tick, picking_mode, z_offset);
 
   const internal::DrawData draw_data =
-      GetDrawData(min_tick, max_tick, GetWidth(), z_offset, batcher, time_graph_, viewport_,
+      GetDrawData(min_tick, max_tick, GetPos()[0], GetWidth(), &batcher, timeline_info_, viewport_,
                   collapse_toggle_->IsCollapsed(), app_->selected_timer(),
                   app_->GetFunctionIdToHighlight(), app_->GetGroupIdToHighlight());
 
-  absl::MutexLock lock(&scope_tree_mutex_);
+  uint64_t resolution_in_pixels = draw_data.viewport->WorldToScreen({draw_data.track_width, 0})[0];
+  for (uint32_t depth = 0; depth < GetDepth(); depth++) {
+    float world_timer_y = GetYFromDepth(depth);
 
-  for (const auto& [depth, ordered_nodes] : scope_tree_.GetOrderedNodesByDepth()) {
-    auto first_node_to_draw = ordered_nodes.lower_bound(min_tick);
-    if (first_node_to_draw != ordered_nodes.begin()) --first_node_to_draw;
-
-    track_data_->UpdateMaxDepth(depth);
-
-    float world_timer_y = GetYFromDepth(depth - 1);
-    uint64_t next_pixel_start_time_ns = min_tick;
-
-    for (auto it = first_node_to_draw; it != ordered_nodes.end() && it->first < max_tick; ++it) {
-      const orbit_client_protos::TimerInfo& timer_info = *it->second->GetScope();
-      if (timer_info.end() <= next_pixel_start_time_ns) continue;
+    for (const TimerInfo* timer_info : thread_track_data_provider_->GetTimersAtDepthDiscretized(
+             thread_id_, depth, resolution_in_pixels, min_tick, max_tick)) {
       ++visible_timer_count_;
 
-      Color color = GetTimerColor(timer_info, draw_data);
-      std::unique_ptr<PickingUserData> user_data = CreatePickingUserData(*batcher, timer_info);
+      Color color = GetTimerColor(*timer_info, draw_data);
+      std::unique_ptr<PickingUserData> user_data = CreatePickingUserData(batcher, *timer_info);
 
       auto box_height = GetDefaultBoxHeight();
-      const auto [pos_x, size_x] = GetBoxPosXAndWidth(draw_data, time_graph_, timer_info);
+      const auto [pos_x, size_x] = GetBoxPosXAndWidth(draw_data, timeline_info_, *timer_info);
       const Vec2 pos = {pos_x, world_timer_y};
       const Vec2 size = {size_x, box_height};
 
-      auto timer_duration = timer_info.end() - timer_info.start();
+      auto timer_duration = timer_info->end() - timer_info->start();
       if (timer_duration > draw_data.ns_per_pixel) {
-        if (!collapse_toggle_->IsCollapsed() && BoxHasRoomForText(size[0])) {
-          DrawTimesliceText(timer_info, draw_data.track_start_x, z_offset, pos, size);
+        if (!collapse_toggle_->IsCollapsed() && BoxHasRoomForText(text_renderer, size[0])) {
+          DrawTimesliceText(text_renderer, *timer_info, draw_data.track_start_x, pos, size);
         }
-        batcher->AddShadedBox(pos, size, draw_data.z, color, std::move(user_data));
+        batcher.AddShadedBox(pos, size, draw_data.z, color, std::move(user_data));
       } else {
-        batcher->AddVerticalLine(pos, box_height, draw_data.z, color, std::move(user_data));
+        batcher.AddVerticalLine(pos, box_height, draw_data.z, color, std::move(user_data));
       }
-
-      // Use the time at boundary of the next pixel as a threshold to avoid overdraw.
-      next_pixel_start_time_ns = GetNextPixelBoundaryTimeNs(pos[0] + size[0], draw_data);
     }
-  }
-}
-
-void ThreadTrack::UpdatePrimitivesOfSubtracks(Batcher* batcher, uint64_t min_tick,
-                                              uint64_t max_tick, PickingMode picking_mode,
-                                              float z_offset) {
-  if (!thread_state_bar_->IsEmpty()) {
-    thread_state_bar_->UpdatePrimitives(batcher, min_tick, max_tick, picking_mode, z_offset);
-  }
-  if (!event_bar_->IsEmpty()) {
-    event_bar_->UpdatePrimitives(batcher, min_tick, max_tick, picking_mode, z_offset);
-  }
-  if (!tracepoint_bar_->IsEmpty()) {
-    tracepoint_bar_->UpdatePrimitives(batcher, min_tick, max_tick, picking_mode, z_offset);
   }
 }

@@ -10,44 +10,30 @@
 #include <thread>
 #include <utility>
 
-#include "TracingInterface/Tracer.h"
-#include "capture.pb.h"
+#include "GrpcProtos/capture.pb.h"
+#include "LinuxTracing/TracerListener.h"
+#include "LinuxTracing/UserSpaceInstrumentationAddresses.h"
 
 namespace orbit_linux_tracing {
 
-class Tracer : public orbit_tracing_interface::Tracer {
+class Tracer {
  public:
-  explicit Tracer(orbit_grpc_protos::CaptureOptions capture_options)
-      : orbit_tracing_interface::Tracer(std::move(capture_options)) {}
+  virtual void Start() = 0;
+  virtual void Stop() = 0;
 
-  ~Tracer() { Stop(); }
+  // The `FunctionEntry` and `FunctionExit` events are received from user space instrumentation and
+  // piped back into `LinuxTracing` using these two methods. This way they can be processed together
+  // with stack samples, allowing us to correctly unwind the samples that fall inside one or more
+  // dynamically instrumented functions, just like we do with u(ret)probes.
+  virtual void ProcessFunctionEntry(const orbit_grpc_protos::FunctionEntry& function_entry) = 0;
+  virtual void ProcessFunctionExit(const orbit_grpc_protos::FunctionExit& function_exit) = 0;
 
-  Tracer(const Tracer&) = delete;
-  Tracer& operator=(const Tracer&) = delete;
-  Tracer(Tracer&&) = default;
-  Tracer& operator=(Tracer&&) = default;
+  virtual ~Tracer() = default;
 
-  void Start() override {
-    *exit_requested_ = false;
-    thread_ = std::make_shared<std::thread>(&Tracer::Run, this);
-  }
-
-  void Stop() override {
-    *exit_requested_ = true;
-    if (thread_ != nullptr && thread_->joinable()) {
-      thread_->join();
-    }
-    thread_.reset();
-  }
-
- private:
-  // exit_requested_ must outlive this object because it is used by thread_.
-  // The control block of shared_ptr is thread safe (i.e., reference counting
-  // and pointee's lifetime management are atomic and thread safe).
-  std::shared_ptr<std::atomic<bool>> exit_requested_ = std::make_unique<std::atomic<bool>>(true);
-  std::shared_ptr<std::thread> thread_;
-
-  void Run();
+  [[nodiscard]] static std::unique_ptr<Tracer> Create(
+      const orbit_grpc_protos::CaptureOptions& capture_options,
+      std::unique_ptr<UserSpaceInstrumentationAddresses> user_space_instrumentation_addresses,
+      TracerListener* listener);
 };
 
 }  // namespace orbit_linux_tracing

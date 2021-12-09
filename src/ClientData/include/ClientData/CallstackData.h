@@ -15,8 +15,8 @@
 #include <vector>
 
 #include "CallstackTypes.h"
+#include "ClientProtos/capture_data.pb.h"
 #include "absl/container/flat_hash_map.h"
-#include "capture_data.pb.h"
 
 namespace orbit_client_data {
 
@@ -60,12 +60,12 @@ class CallstackData {
       const std::function<void(const orbit_client_protos::CallstackEvent&)>& action) const;
 
   [[nodiscard]] uint64_t max_time() const {
-    std::lock_guard lock(mutex_);
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
     return max_time_;
   }
 
   [[nodiscard]] uint64_t min_time() const {
-    std::lock_guard lock(mutex_);
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
     return min_time_;
   }
 

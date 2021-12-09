@@ -22,11 +22,14 @@
 #include <vector>
 
 #include "ClientFlags/ClientFlags.h"
+#include "MetricsUploader/ScopedMetric.h"
 #include "OrbitBase/Future.h"
 #include "OrbitBase/Logging.h"
 #include "OrbitBase/Promise.h"
+#include "OrbitBase/Result.h"
 #include "OrbitSsh/AddrAndPort.h"
 #include "OrbitSshQt/ScopedConnection.h"
+#include "OrbitSshQt/Session.h"
 #include "OrbitSshQt/SftpChannel.h"
 #include "OrbitSshQt/SftpCopyToLocalOperation.h"
 #include "OrbitSshQt/SftpCopyToRemoteOperation.h"
@@ -86,11 +89,13 @@ void DeferToBackgroundThreadAndWait(QObject* context, Func&& func) {
   QEventLoop waiting_loop;  // This event loop processes main thread events while we wait for the
                             // background thread to finish executing func();
 
-  QMetaObject::invokeMethod(
-      context, [func = std::forward<Func>(func), waiting_loop = QPointer{&waiting_loop}]() mutable {
-        func();
-        if (waiting_loop) QMetaObject::invokeMethod(waiting_loop, &QEventLoop::quit);
-      });
+  QMetaObject::invokeMethod(context,
+                            [func = std::forward<Func>(func),
+                             waiting_loop = QPointer<QEventLoop>{&waiting_loop}]() mutable {
+                              func();
+                              if (waiting_loop)
+                                QMetaObject::invokeMethod(waiting_loop, &QEventLoop::quit);
+                            });
 
   waiting_loop.exec();
 }
@@ -124,13 +129,15 @@ ServiceDeployManager::ServiceDeployManager(const DeploymentConfiguration* deploy
 
   background_thread_.start();
   moveToThread(&background_thread_);
+
+  QObject::connect(
+      this, &ServiceDeployManager::statusMessage, this, [](const QString& status_message) {
+        LOG("ServiceDeployManager status message: \"%s\"", status_message.toStdString());
+      });
 }
 
 ServiceDeployManager::~ServiceDeployManager() {
-  // ssh_watchdog_timer is registered in background_thread_, so it has to be stopped there to
-  // not trigger a race condition.
-  QMetaObject::invokeMethod(
-      this, [this]() { ssh_watchdog_timer_.stop(); }, Qt::BlockingQueuedConnection);
+  Shutdown();
   background_thread_.quit();
   background_thread_.wait();
 }
@@ -154,11 +161,21 @@ outcome::result<bool> ServiceDeployManager::CheckIfInstalled() {
     version = version.substr(1);
   }
   const auto command = absl::StrFormat(
-      "/usr/bin/dpkg-query -W -f '${Version}' orbitprofiler 2>/dev/null | grep -xF '%s'", version);
+      "/usr/bin/dpkg-query -W -f '${Version}' orbitprofiler | grep -xF '%s' && cd / && md5sum -c "
+      "/var/lib/dpkg/info/orbitprofiler.md5sums",
+      version);
 
   orbit_ssh_qt::Task check_if_installed_task{&session_.value(), command};
 
   orbit_qt_utils::EventLoop loop{};
+  QObject::connect(&check_if_installed_task, &orbit_ssh_qt::Task::readyReadStdOut, this,
+                   [&check_if_installed_task]() {
+                     LOG("CheckIfInstalled stdout: %s", check_if_installed_task.ReadStdOut());
+                   });
+  QObject::connect(&check_if_installed_task, &orbit_ssh_qt::Task::readyReadStdErr, this,
+                   [&check_if_installed_task]() {
+                     LOG("CheckIfInstalled stderr: %s", check_if_installed_task.ReadStdErr());
+                   });
   QObject::connect(&check_if_installed_task, &orbit_ssh_qt::Task::finished, &loop,
                    &orbit_qt_utils::EventLoop::exit);
 
@@ -170,6 +187,7 @@ outcome::result<bool> ServiceDeployManager::CheckIfInstalled() {
   check_if_installed_task.Start();
 
   OUTCOME_TRY(auto&& result, loop.exec());
+  LOG("CheckIfInstalled task returned exit code: %d", result);
   if (result == 0) {
     // Already installed
     emit statusMessage("The correct version of OrbitService is already installed.");
@@ -245,9 +263,11 @@ outcome::result<void> ServiceDeployManager::CopyFileToRemote(
   return outcome::success();
 }
 
-outcome::result<void> ServiceDeployManager::StopSftpChannel(
+outcome::result<void> ServiceDeployManager::ShutdownSftpChannel(
     orbit_ssh_qt::SftpChannel* sftp_channel) {
+  SCOPED_TIMED_LOG("ServiceDeployManager::ShutdownSftpChannel");
   CHECK(QThread::currentThread() == thread());
+  CHECK(sftp_channel != nullptr);
 
   orbit_qt_utils::EventLoop loop{};
   auto quit_handler = ConnectQuitHandler(&loop, sftp_channel, &orbit_ssh_qt::SftpChannel::stopped);
@@ -260,8 +280,6 @@ outcome::result<void> ServiceDeployManager::StopSftpChannel(
   OUTCOME_TRY(loop.exec());
   return outcome::success();
 }
-
-void ServiceDeployManager::StopSftpChannel() { (void)StopSftpChannel(sftp_channel_.get()); }
 
 outcome::result<void> ServiceDeployManager::CopyOrbitServicePackage() {
   CHECK(QThread::currentThread() == thread());
@@ -283,64 +301,96 @@ outcome::result<void> ServiceDeployManager::CopyOrbitServicePackage() {
   return outcome::success();
 }
 
-ErrorMessageOr<void> ServiceDeployManager::CopyFileToLocal(std::string source,
-                                                           std::string destination) {
+orbit_base::Future<ErrorMessageOr<void>> ServiceDeployManager::CopyFileToLocal(
+    std::string source, std::string destination) {
   orbit_base::Promise<ErrorMessageOr<void>> promise;
   auto future = promise.GetFuture();
 
-  DeferToBackgroundThreadAndWait(
-      this, [this, source = std::move(source), destination = std::move(destination),
-             promise = std::move(promise)]() mutable {
-        promise.SetResult(CopyFileToLocalImpl(source, destination));
-      });
+  // This schedules the call of `CopyFileToLocalImpl` on the background thread.
+  QMetaObject::invokeMethod(this,
+                            [this, source = std::move(source), destination = std::move(destination),
+                             promise = std::move(promise)]() mutable {
+                              CopyFileToLocalImpl(std::move(promise), source, destination);
+                            });
 
-  if (!future.IsFinished()) return ErrorMessage{"Copy operation was aborted."};
-
-  return future.Get();
+  return future;
 }
 
-ErrorMessageOr<void> ServiceDeployManager::CopyFileToLocalImpl(std::string_view source,
-                                                               std::string_view destination) {
+void ServiceDeployManager::CopyFileToLocalImpl(orbit_base::Promise<ErrorMessageOr<void>> promise,
+                                               std::string_view source,
+                                               std::string_view destination) {
   CHECK(QThread::currentThread() == thread());
+
+  if (copy_file_operation_in_progress_) {
+    waiting_copy_operations_.emplace_back([this, promise = std::move(promise),
+                                           source = std::string{source},
+                                           destination = std::string{destination}]() mutable {
+      CopyFileToLocalImpl(std::move(promise), source, destination);
+    });
+    return;
+  }
+
+  copy_file_operation_in_progress_ = true;
+
   LOG("Copying remote \"%s\" to local \"%s\"", source, destination);
 
-  auto sftp_channel = StartSftpChannel();
+  // NOLINTNEXTLINE - Unfortunately we have to fall back to a raw `new` here.
+  auto operation =
+      new orbit_ssh_qt::SftpCopyToLocalOperation{&session_.value(), sftp_channel_.get()};
 
-  if (!sftp_channel) {
-    return ErrorMessage(
-        absl::StrFormat(R"(Unable to start sftp channel to copy the remote "%s" to "%s": %s)",
-                        source, destination, sftp_channel.error().message()));
-  }
+  // Making operation a child of the ServiceDeployManager ensures it will be deleted at the latest
+  // when ServiceDeployManager gets deleted. That's important when the copy procedure gets aborted
+  // and both callbacks below won't be executed.
+  operation->setParent(this);
 
-  orbit_ssh_qt::SftpCopyToLocalOperation operation{&session_.value(), sftp_channel.value().get()};
+  // The finish handler handles both the error and the success case and will be triggered
+  // from the ::stopped and ::errorOccured signals (see below).
+  // By having a single handler we don't need to worry about sharing resources that are not supposed
+  // to be shared like the promise.
+  auto finish_handler = [this, promise = std::move(promise), source = std::string{source},
+                         destination = std::string{destination},
+                         operation](ErrorMessageOr<void> result) mutable {
+    if (promise.HasResult()) return;
 
-  orbit_qt_utils::EventLoop loop{};
-  auto quit_handler =
-      ConnectQuitHandler(&loop, &operation, &orbit_ssh_qt::SftpCopyToLocalOperation::stopped);
-  auto error_handler = ConnectErrorHandler(&loop, &operation,
-                                           &orbit_ssh_qt::SftpCopyToLocalOperation::errorOccurred);
-  auto cancel_handler = ConnectCancelHandler(&loop, this);
+    operation->deleteLater();  // We can't just call `delete operation;` here because that also
+                               // triggers the deletion of this closure object. Instead we queue a
+                               // job on the event queue for deleting it later.
 
-  operation.CopyFileToLocal(source, destination);
+    copy_file_operation_in_progress_ = false;
 
-  auto result = loop.exec();
-  if (!result) {
-    return ErrorMessage(absl::StrFormat(R"(Error copying remote "%s" to "%s": %s)", source,
-                                        destination, result.error().message()));
-  }
+    if (!waiting_copy_operations_.empty()) {
+      // This calls the copy operation from the event loop in the background thread
+      QMetaObject::invokeMethod(this, std::move(waiting_copy_operations_.front()),
+                                Qt::QueuedConnection);
+      waiting_copy_operations_.pop_front();
+    }
 
-  auto sftp_channel_stop_result = StopSftpChannel(sftp_channel.value().get());
+    if (result.has_error()) {
+      promise.SetResult(
+          ErrorMessage{absl::StrFormat(R"(Error copying remote "%s" to "%s": %s)", source,
+                                       destination, result.error().message())});
+      return;
+    }
 
-  if (!sftp_channel_stop_result) {
-    std::string sftp_error_message =
-        absl::StrFormat(R"(Error closing sftp channel (after copied remote "%s" to "%s": %s))",
-                        source, destination, sftp_channel_stop_result.error().message());
-    ERROR("%s", sftp_error_message);
-    return ErrorMessage(
-        absl::StrFormat("Download of file %s failed: %s", source, sftp_error_message));
-  }
+    promise.SetResult(outcome::success());
+  };
 
-  return outcome::success();
+  // Since we need to call the finish handler from two different slots and it's not copyable,
+  // we first have to move the handler into a shared_ptr which we can share between the two slots.
+  // This will also take care of lifetime management since the finish handler closure will get
+  // deleted when the `operation` object gets deleted.
+  auto shared_finish_handler =
+      std::make_shared<decltype(finish_handler)>(std::move(finish_handler));
+
+  QObject::connect(operation, &orbit_ssh_qt::SftpCopyToLocalOperation::stopped,
+                   [shared_finish_handler]() { (*shared_finish_handler)(outcome::success()); });
+
+  QObject::connect(operation, &orbit_ssh_qt::SftpCopyToLocalOperation::errorOccurred,
+                   [shared_finish_handler](std::error_code error_code) {
+                     (*shared_finish_handler)(ErrorMessage{error_code.message()});
+                   });
+
+  operation->CopyFileToLocal(source, destination);
 }
 
 outcome::result<void> ServiceDeployManager::CopyOrbitServiceExecutable(
@@ -420,6 +470,9 @@ outcome::result<void> ServiceDeployManager::StartOrbitService() {
   OUTCOME_TRY(loop.exec());
   QObject::connect(&orbit_service_task_.value(), &orbit_ssh_qt::Task::errorOccurred, this,
                    &ServiceDeployManager::handleSocketError);
+  QObject::connect(
+      &orbit_service_task_.value(), &orbit_ssh_qt::Task::finished, this,
+      [](int exit_code) { LOG("The OrbitService Task finished with exit code: %d", exit_code); });
   return outcome::success();
 }
 
@@ -459,6 +512,9 @@ outcome::result<void> ServiceDeployManager::StartOrbitServicePrivileged(
   OUTCOME_TRY(loop.exec());
   QObject::connect(&orbit_service_task_.value(), &orbit_ssh_qt::Task::errorOccurred, this,
                    &ServiceDeployManager::handleSocketError);
+  QObject::connect(
+      &orbit_service_task_.value(), &orbit_ssh_qt::Task::finished, this,
+      [](int exit_code) { LOG("The OrbitService Task finished with exit code: %d", exit_code); });
   return outcome::success();
 }
 
@@ -526,19 +582,33 @@ void ServiceDeployManager::StartWatchdog() {
   orbit_service_task_->Write(kSshWatchdogPassphrase);
 
   QObject::connect(&ssh_watchdog_timer_, &QTimer::timeout, [this]() {
-    if (orbit_service_task_) {
-      orbit_service_task_->Write(".");
-    } else {
-      ssh_watchdog_timer_.stop();
-    }
+    CHECK(orbit_service_task_.has_value());
+    orbit_service_task_->Write(".");
   });
 
   ssh_watchdog_timer_.start(kSshWatchdogInterval);
 }
 
-outcome::result<ServiceDeployManager::GrpcPort> ServiceDeployManager::Exec() {
+outcome::result<ServiceDeployManager::GrpcPort> ServiceDeployManager::Exec(
+    orbit_metrics_uploader::MetricsUploader* metrics_uploader) {
+  orbit_metrics_uploader::ScopedMetric connect_metric{
+      metrics_uploader, orbit_metrics_uploader::OrbitLogEvent::ORBIT_INSTANCE_CONNECT};
+
   outcome::result<GrpcPort> result = outcome::success(GrpcPort{0});
   DeferToBackgroundThreadAndWait(this, [&]() { result = ExecImpl(); });
+
+  if (!result.has_value()) {
+    if (result.error() == make_error_code(Error::kUserCanceledServiceDeployment)) {
+      connect_metric.SetStatusCode(orbit_metrics_uploader::OrbitLogEvent::CANCELLED);
+      LOG("OrbitService deployment has been aborted by the user");
+    } else {
+      connect_metric.SetStatusCode(orbit_metrics_uploader::OrbitLogEvent::INTERNAL_ERROR);
+      ERROR("OrbitService deployment failed, error: %s", result.error().message());
+    }
+  } else {
+    LOG("Deployment successful, grpc_port: %d", result.value().grpc_port);
+  }
+
   return result;
 }
 
@@ -609,64 +679,83 @@ void ServiceDeployManager::handleSocketError(std::error_code e) {
   emit socketErrorOccurred(e);
 }
 
-void ServiceDeployManager::ShutdownTunnel(std::optional<orbit_ssh_qt::Tunnel>* tunnel) {
-  if (!tunnel || !*tunnel) {
-    return;
-  }
+outcome::result<void> ServiceDeployManager::ShutdownTunnel(orbit_ssh_qt::Tunnel* tunnel) {
+  SCOPED_TIMED_LOG("ServiceDeployManager::StopTunnel");
+  CHECK(tunnel != nullptr);
 
   orbit_qt_utils::EventLoop loop{};
-  auto quit_handler = ConnectQuitHandler(&loop, &tunnel->value(), &orbit_ssh_qt::Tunnel::started);
-  auto error_handler =
-      ConnectQuitHandler(&loop, &tunnel->value(), &orbit_ssh_qt::Tunnel::errorOccurred);
+  auto quit_handler = ConnectQuitHandler(&loop, tunnel, &orbit_ssh_qt::Tunnel::stopped);
+  auto error_handler = ConnectQuitHandler(&loop, tunnel, &orbit_ssh_qt::Tunnel::errorOccurred);
   auto cancel_handler = ConnectCancelHandler(&loop, this);
 
-  tunnel->value().Stop();
+  tunnel->Stop();
 
-  (void)loop.exec();
-  *tunnel = std::nullopt;
+  OUTCOME_TRY(loop.exec());
+  return outcome::success();
 }
 
-void ServiceDeployManager::ShutdownOrbitService() {
-  if (!orbit_service_task_) {
-    return;
-  }
+outcome::result<void> ServiceDeployManager::ShutdownTask(orbit_ssh_qt::Task* task) {
+  SCOPED_TIMED_LOG("ServiceDeployManager::ShutdownOrbitService");
+  CHECK(task != nullptr);
 
   orbit_qt_utils::EventLoop loop{};
-  auto quit_handler =
-      ConnectQuitHandler(&loop, &orbit_service_task_.value(), &orbit_ssh_qt::Task::finished);
-  auto error_handler =
-      ConnectQuitHandler(&loop, &orbit_service_task_.value(), &orbit_ssh_qt::Task::errorOccurred);
+  auto quit_handler = ConnectQuitHandler(&loop, task, &orbit_ssh_qt::Task::stopped);
+  auto error_handler = ConnectQuitHandler(&loop, task, &orbit_ssh_qt::Task::errorOccurred);
   auto cancel_handler = ConnectCancelHandler(&loop, this);
 
-  orbit_service_task_->Stop();
+  task->Stop();
 
-  (void)loop.exec();
-  orbit_service_task_ = std::nullopt;
+  OUTCOME_TRY(loop.exec());
+  return outcome::success();
 }
 
-void ServiceDeployManager::ShutdownSession() {
-  if (!session_) {
-    return;
-  }
+outcome::result<void> ServiceDeployManager::ShutdownSession(orbit_ssh_qt::Session* session) {
+  SCOPED_TIMED_LOG("ServiceDeployManager::ShutdownSession");
+  CHECK(session != nullptr);
 
   orbit_qt_utils::EventLoop loop{};
-  auto quit_handler = ConnectQuitHandler(&loop, &session_.value(), &orbit_ssh_qt::Session::stopped);
-  auto error_handler =
-      ConnectQuitHandler(&loop, &session_.value(), &orbit_ssh_qt::Session::errorOccurred);
+  auto quit_handler = ConnectQuitHandler(&loop, session, &orbit_ssh_qt::Session::stopped);
+  auto error_handler = ConnectQuitHandler(&loop, session, &orbit_ssh_qt::Session::errorOccurred);
   auto cancel_handler = ConnectCancelHandler(&loop, this);
 
-  session_->Disconnect();
+  session->Disconnect();
 
-  (void)loop.exec();
-  session_ = std::nullopt;
+  OUTCOME_TRY(loop.exec());
+  return outcome::success();
 }
 
 void ServiceDeployManager::Shutdown() {
+  SCOPED_TIMED_LOG("ServiceDeployManager::Shutdown");
   DeferToBackgroundThreadAndWait(this, [this]() {
-    StopSftpChannel();
-    ShutdownTunnel(&grpc_tunnel_);
-    ShutdownOrbitService();
-    ShutdownSession();
+    if (sftp_channel_ != nullptr) {
+      outcome::result<void> shutdown_result = ShutdownSftpChannel(sftp_channel_.get());
+      if (shutdown_result.has_error()) {
+        ERROR("Unable to ShutdownSftpChannel: %s", shutdown_result.error().message());
+      }
+      sftp_channel_.reset();
+    }
+    if (grpc_tunnel_.has_value()) {
+      outcome::result<void> shutdown_result = ShutdownTunnel(&grpc_tunnel_.value());
+      if (shutdown_result.has_error()) {
+        ERROR("Unable to ShutdownTunnel: %s", shutdown_result.error().message());
+      }
+      grpc_tunnel_ = std::nullopt;
+    }
+    ssh_watchdog_timer_.stop();
+    if (orbit_service_task_.has_value()) {
+      outcome::result<void> shutdown_result = ShutdownTask(&orbit_service_task_.value());
+      if (shutdown_result.has_error()) {
+        ERROR("Unable to ShutdownTask: %s", shutdown_result.error().message());
+      }
+      orbit_service_task_ = std::nullopt;
+    }
+    if (session_.has_value()) {
+      outcome::result<void> shutdown_result = ShutdownSession(&session_.value());
+      if (shutdown_result.has_error()) {
+        ERROR("Unable to ShutdownSession: %s", shutdown_result.error().message());
+      }
+      session_ = std::nullopt;
+    }
   });
 }
 

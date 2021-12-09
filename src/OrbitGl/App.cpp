@@ -15,7 +15,9 @@
 #include <absl/synchronization/mutex.h>
 #include <absl/time/time.h>
 #include <imgui.h>
+#include <stdlib.h>
 
+#include <QProcess>
 #include <chrono>
 #include <cinttypes>
 #include <cstddef>
@@ -27,7 +29,6 @@
 #include <thread>
 #include <utility>
 
-#include "CallstackDataView.h"
 #include "CaptureClient/CaptureListener.h"
 #include "CaptureFile/CaptureFile.h"
 #include "CaptureFile/CaptureFileHelpers.h"
@@ -43,6 +44,8 @@
 #include "ClientFlags/ClientFlags.h"
 #include "ClientModel/CaptureSerializer.h"
 #include "ClientModel/SamplingDataPostProcessor.h"
+#include "ClientProtos/capture_data.pb.h"
+#include "ClientProtos/preset.pb.h"
 #include "CodeReport/Disassembler.h"
 #include "CodeReport/DisassemblyReport.h"
 #include "CodeReport/SourceCodeReport.h"
@@ -54,6 +57,9 @@
 #include "FrameTrackOnlineProcessor.h"
 #include "GlCanvas.h"
 #include "GrpcProtos/Constants.h"
+#include "GrpcProtos/capture.pb.h"
+#include "GrpcProtos/module.pb.h"
+#include "GrpcProtos/symbol.pb.h"
 #include "ImGuiOrbit.h"
 #include "Introspection/Introspection.h"
 #include "MainThreadExecutor.h"
@@ -61,6 +67,7 @@
 #include "MetricsUploader/CaptureMetric.h"
 #include "MetricsUploader/MetricsUploader.h"
 #include "MetricsUploader/ScopedMetric.h"
+#include "MetricsUploader/orbit_log_event.pb.h"
 #include "ObjectUtils/Address.h"
 #include "ObjectUtils/ElfFile.h"
 #include "OrbitBase/File.h"
@@ -78,12 +85,6 @@
 #include "SymbolPaths/QSettingsWrapper.h"
 #include "Symbols/SymbolHelper.h"
 #include "TimeGraph.h"
-#include "capture.pb.h"
-#include "capture_data.pb.h"
-#include "module.pb.h"
-#include "orbit_log_event.pb.h"
-#include "preset.pb.h"
-#include "symbol.pb.h"
 
 using orbit_base::Future;
 
@@ -120,13 +121,13 @@ using orbit_client_services::TracepointServiceClient;
 using orbit_gl::MainWindowInterface;
 
 using orbit_grpc_protos::CaptureFinished;
+using orbit_grpc_protos::CaptureOptions;
 using orbit_grpc_protos::CaptureStarted;
 using orbit_grpc_protos::ClientCaptureEvent;
 using orbit_grpc_protos::CrashOrbitServiceRequest_CrashType;
 using orbit_grpc_protos::InstrumentedFunction;
 using orbit_grpc_protos::ModuleInfo;
 using orbit_grpc_protos::TracepointInfo;
-using orbit_grpc_protos::UnwindingMethod;
 
 using orbit_metrics_uploader::CaptureMetric;
 using orbit_metrics_uploader::ScopedMetric;
@@ -134,6 +135,10 @@ using orbit_metrics_uploader::ScopedMetric;
 using orbit_preset_file::PresetFile;
 
 using orbit_data_views::DataViewType;
+
+using DynamicInstrumentationMethod =
+    orbit_grpc_protos::CaptureOptions::DynamicInstrumentationMethod;
+using UnwindingMethod = orbit_grpc_protos::CaptureOptions::UnwindingMethod;
 
 namespace {
 
@@ -169,7 +174,9 @@ orbit_data_views::PresetLoadState GetPresetLoadStateForProcess(const PresetFile&
 orbit_metrics_uploader::CaptureStartData CreateCaptureStartData(
     const std::vector<FunctionInfo>& instrumented_functions, int64_t number_of_frame_tracks,
     bool thread_states, int64_t memory_information_sampling_period_ms,
-    bool lib_orbit_vulkan_layer_loaded, uint64_t max_local_marker_depth_per_command_buffer) {
+    bool lib_orbit_vulkan_layer_loaded, uint64_t max_local_marker_depth_per_command_buffer,
+    DynamicInstrumentationMethod dynamic_instrumentation_method,
+    uint64_t callstack_samples_per_second, UnwindingMethod callstack_unwinding_method) {
   orbit_metrics_uploader::CaptureStartData capture_start_data{};
   capture_start_data.number_of_instrumented_functions = instrumented_functions.size();
   capture_start_data.number_of_frame_tracks = number_of_frame_tracks;
@@ -190,6 +197,19 @@ orbit_metrics_uploader::CaptureStartData CreateCaptureStartData(
     capture_start_data.max_local_marker_depth_per_command_buffer =
         max_local_marker_depth_per_command_buffer;
   }
+  capture_start_data.dynamic_instrumentation_method =
+      dynamic_instrumentation_method == orbit_grpc_protos::CaptureOptions::kKernelUprobes
+          ? orbit_metrics_uploader::
+                OrbitCaptureData_DynamicInstrumentationMethod_DYNAMIC_INSTRUMENTATION_METHOD_KERNEL
+          : orbit_metrics_uploader::
+                OrbitCaptureData_DynamicInstrumentationMethod_DYNAMIC_INSTRUMENTATION_METHOD_ORBIT;
+  capture_start_data.callstack_samples_per_second = callstack_samples_per_second;
+  capture_start_data.callstack_unwinding_method =
+      callstack_unwinding_method == orbit_grpc_protos::CaptureOptions::kDwarf
+          ? orbit_metrics_uploader::
+                OrbitCaptureData_CallstackUnwindingMethod_CALLSTACK_UNWINDING_METHOD_DWARF
+          : orbit_metrics_uploader::
+                OrbitCaptureData_CallstackUnwindingMethod_CALLSTACK_UNWINDING_METHOD_FRAME_POINTER;
   return capture_start_data;
 }
 
@@ -276,9 +296,20 @@ void OrbitApp::OnCaptureStarted(const orbit_grpc_protos::CaptureStarted& capture
   absl::MutexLock mutex_lock(&mutex);
   bool initialization_complete = false;
 
+  if (file_path.has_value()) {
+    metrics_capture_complete_data_.file_path = file_path.value();
+  }
+
   main_thread_executor_->Schedule(
       [this, &initialization_complete, &mutex, &capture_started, file_path = std::move(file_path),
        frame_track_function_ids = std::move(frame_track_function_ids)]() mutable {
+        absl::flat_hash_map<Track::Type, bool> track_type_visibility;
+        bool had_capture = capture_window_->GetTimeGraph();
+        if (had_capture) {
+          track_type_visibility =
+              capture_window_->GetTimeGraph()->GetTrackManager()->GetAllTrackTypesVisibility();
+        }
+
         ClearCapture();
 
         if (file_path.has_value()) {
@@ -287,11 +318,16 @@ void OrbitApp::OnCaptureStarted(const orbit_grpc_protos::CaptureStarted& capture
 
         // It is safe to do this write on the main thread, as the capture thread is suspended until
         // this task is completely executed.
-        capture_data_ = std::make_unique<CaptureData>(
-            module_manager_.get(), capture_started, file_path, std::move(frame_track_function_ids));
+        capture_data_ =
+            std::make_unique<CaptureData>(module_manager_.get(), capture_started, file_path,
+                                          std::move(frame_track_function_ids), data_source_);
         capture_window_->CreateTimeGraph(capture_data_.get());
         TrackManager* track_manager = GetMutableTimeGraph()->GetTrackManager();
-        track_manager->SetIsDataFromSavedCapture(is_loading_capture_);
+        track_manager->SetIsDataFromSavedCapture(data_source_ ==
+                                                 CaptureData::DataSource::kLoadedCapture);
+        if (had_capture) {
+          track_manager->RestoreAllTrackTypesVisibility(track_type_visibility);
+        }
 
         frame_track_online_processor_ =
             orbit_gl::FrameTrackOnlineProcessor(GetCaptureData(), GetMutableTimeGraph());
@@ -333,10 +369,7 @@ void OrbitApp::OnCaptureStarted(const orbit_grpc_protos::CaptureStarted& capture
 }
 
 Future<void> OrbitApp::OnCaptureComplete() {
-  for (ThreadTrack* thread_track : GetMutableTimeGraph()->GetTrackManager()->GetThreadTracks()) {
-    thread_track->OnCaptureComplete();
-  }
-  capture_data_->OnCaptureComplete(GetMutableTimeGraph()->GetAllThreadTrackTimerChains());
+  capture_data_->OnCaptureComplete();
 
   GetMutableCaptureData().FilterBrokenCallstacks();
   PostProcessedSamplingData post_processed_sampling_data =
@@ -574,17 +607,33 @@ void OrbitApp::OnErrorEnablingOrbitApiEvent(
 void OrbitApp::OnErrorEnablingUserSpaceInstrumentationEvent(
     orbit_grpc_protos::ErrorEnablingUserSpaceInstrumentationEvent error_event) {
   main_thread_executor_->Schedule([this, error_event = std::move(error_event)]() {
+    const std::string message =
+        absl::StrCat(error_event.message(),
+                     "\nAll functions will be instrumented using the slower kernel (uprobes) "
+                     "functionality.\n");
     main_window_->AppendToCaptureLog(MainWindowInterface::CaptureLogSeverity::kSevereWarning,
-                                     GetCaptureTimeAt(error_event.timestamp_ns()),
-                                     error_event.message());
-
+                                     GetCaptureTimeAt(error_event.timestamp_ns()), message);
     if (!IsLoadingCapture()) {
-      constexpr const char* kDontShowAgainErrorEnablingUserSpaceInstrumentationWarningKey =
-          "DontShowAgainErrorEnablingUserSpaceInstrumentationWarning";
-      main_window_->ShowWarningWithDontShowAgainCheckboxIfNeeded(
-          "Could not enable user space instrumentation", error_event.message(),
-          kDontShowAgainErrorEnablingUserSpaceInstrumentationWarningKey);
+      // We use 'SendWarningToUi' here since we don't want the "don't show again" checkbox. The user
+      // should always be notified.
+      SendWarningToUi("Could not enable dynamic instrumentation", message);
     }
+  });
+}
+
+void OrbitApp::OnWarningInstrumentingWithUserSpaceInstrumentationEvent(
+    orbit_grpc_protos::WarningInstrumentingWithUserSpaceInstrumentationEvent warning_event) {
+  main_thread_executor_->Schedule([this, warning_event = std::move(warning_event)]() {
+    std::string message = "Failed to instrument some functions:\n";
+    for (const auto& function : warning_event.functions_that_failed_to_instrument()) {
+      message = absl::StrCat(message, function.error_message(), "\n");
+    }
+    message = absl::StrCat(message,
+                           "\nThe functions above will be instrumented using the slower kernel "
+                           "(uprobes) functionality.\n");
+
+    main_window_->AppendToCaptureLog(MainWindowInterface::CaptureLogSeverity::kWarning,
+                                     GetCaptureTimeAt(warning_event.timestamp_ns()), message);
   });
 }
 
@@ -763,7 +812,7 @@ void OrbitApp::RenderImGuiDebugUI() {
   ImGui::SetNextWindowPos(ImVec2(0, 0));
   ImGui::PushStyleColor(ImGuiCol_WindowBg, IM_COL32(25, 25, 25, 255));
   ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0.0f);
-  ImGui::Begin("OrbitDebug", nullptr, ImVec2(0, 0), 1.f, window_flags);
+  ImGui::Begin("OrbitDebug", nullptr, window_flags);
 
   if (ImGui::BeginTabBar("DebugTabBar", ImGuiTabBarFlags_None)) {
     if (ImGui::BeginTabItem("CaptureWindow")) {
@@ -795,6 +844,7 @@ void OrbitApp::RenderImGuiDebugUI() {
   ImGui::End();
 
   ImGui::Render();
+  Orbit_ImGui_RenderDrawLists(ImGui::GetDrawData());
   debug_canvas_->RequestRedraw();
 }
 
@@ -1075,11 +1125,10 @@ void OrbitApp::SetClipboard(const std::string& text) {
 }
 
 ErrorMessageOr<void> OrbitApp::OnSavePreset(const std::string& filename) {
-  ScopedMetric metric{metrics_uploader_,
-                      orbit_metrics_uploader::OrbitLogEvent_LogEventType_ORBIT_PRESET_SAVE};
+  ScopedMetric metric{metrics_uploader_, orbit_metrics_uploader::OrbitLogEvent::ORBIT_PRESET_SAVE};
   auto save_result = SavePreset(filename);
   if (save_result.has_error()) {
-    metric.SetStatusCode(orbit_metrics_uploader::OrbitLogEvent_StatusCode_INTERNAL_ERROR);
+    metric.SetStatusCode(orbit_metrics_uploader::OrbitLogEvent::INTERNAL_ERROR);
     return save_result.error();
   }
   ListPresets();
@@ -1178,9 +1227,11 @@ Future<ErrorMessageOr<CaptureListener::CaptureOutcome>> OrbitApp::LoadCaptureFro
     ErrorMessageOr<CaptureListener::CaptureOutcome> load_result{CaptureOutcome::kComplete};
 
     // Set is_loading_capture_ to true for the duration of this scope.
-    is_loading_capture_ = true;
-    orbit_base::unique_resource scope_exit{&is_loading_capture_,
-                                           [](std::atomic<bool>* value) { *value = false; }};
+    data_source_ = CaptureData::DataSource::kLoadedCapture;
+    orbit_base::unique_resource scope_exit{&data_source_,
+                                           [](std::atomic<CaptureData::DataSource>* value) {
+                                             *value = CaptureData::DataSource::kLiveCapture;
+                                           }};
 
     ScopedMetric metric{metrics_uploader_,
                         capture_file_or_error.has_value()
@@ -1194,13 +1245,13 @@ Future<ErrorMessageOr<CaptureListener::CaptureOutcome>> OrbitApp::LoadCaptureFro
     }
 
     if (load_result.has_error()) {
-      metric.SetStatusCode(orbit_metrics_uploader::OrbitLogEvent_StatusCode_INTERNAL_ERROR);
+      metric.SetStatusCode(orbit_metrics_uploader::OrbitLogEvent::INTERNAL_ERROR);
       return load_result;
     }
 
     switch (load_result.value()) {
       case CaptureOutcome::kCancelled:
-        metric.SetStatusCode(orbit_metrics_uploader::OrbitLogEvent_StatusCode_CANCELLED);
+        metric.SetStatusCode(orbit_metrics_uploader::OrbitLogEvent::CANCELLED);
         break;
       case CaptureOutcome::kComplete:
         OnCaptureComplete();
@@ -1220,6 +1271,13 @@ Future<ErrorMessageOr<CaptureListener::CaptureOutcome>> OrbitApp::LoadCaptureFro
                                   });
 
   return load_future;
+}
+
+orbit_base::Future<ErrorMessageOr<void>> OrbitApp::MoveCaptureFile(
+    const std::filesystem::path& src, const std::filesystem::path& dest) {
+  return thread_pool_->Schedule([src, dest]() { return orbit_base::MoveFile(src, dest); })
+      .ThenIfSuccess(main_thread_executor_,
+                     [this, dest] { capture_file_info_manager_.AddOrTouchCaptureFile(dest); });
 }
 
 void OrbitApp::OnLoadCaptureCancelRequested() { capture_loading_cancellation_requested_ = true; }
@@ -1301,9 +1359,6 @@ void OrbitApp::StartCapture() {
   // non-zero since 0 is reserved for invalid ids.
   uint64_t function_id = 1;
   for (const auto& function : selected_functions) {
-    const ModuleData* module = module_manager_->GetModuleByPathAndBuildId(
-        function.module_path(), function.module_build_id());
-    CHECK(module != nullptr);
     if (user_defined_capture_data.ContainsFrameTrack(function)) {
       frame_track_function_ids.insert(function_id);
     }
@@ -1311,16 +1366,17 @@ void OrbitApp::StartCapture() {
   }
 
   TracepointInfoSet selected_tracepoints = data_manager_->selected_tracepoints();
-  bool collect_scheduling_info = true;
+  bool collect_scheduling_info = !IsDevMode() || data_manager_->collect_scheduler_info();
   bool collect_thread_states = data_manager_->collect_thread_states();
-  bool collect_gpu_jobs = true;
+  bool collect_gpu_jobs = !IsDevMode() || data_manager_->trace_gpu_submissions();
   bool enable_api = data_manager_->get_enable_api();
   bool enable_introspection = IsDevMode() && data_manager_->get_enable_introspection();
-  bool enable_user_space_instrumentation =
-      IsDevMode() && data_manager_->enable_user_space_instrumentation();
+  const DynamicInstrumentationMethod dynamic_instrumentation_method =
+      data_manager_->dynamic_instrumentation_method();
   double samples_per_second = data_manager_->samples_per_second();
   uint16_t stack_dump_size = data_manager_->stack_dump_size();
-  UnwindingMethod unwinding_method = data_manager_->unwinding_method();
+  const UnwindingMethod unwinding_method =
+      IsDevMode() ? data_manager_->unwinding_method() : CaptureOptions::kDwarf;
   uint64_t max_local_marker_depth_per_command_buffer =
       data_manager_->max_local_marker_depth_per_command_buffer();
 
@@ -1353,7 +1409,9 @@ void OrbitApp::StartCapture() {
       CreateCaptureStartData(
           selected_functions, user_defined_capture_data.frame_track_functions().size(),
           data_manager_->collect_thread_states(), memory_information_sampling_period_ms_for_metrics,
-          orbit_vulkan_layer_loaded_by_process, max_local_marker_depth_per_command_buffer)};
+          orbit_vulkan_layer_loaded_by_process, max_local_marker_depth_per_command_buffer,
+          dynamic_instrumentation_method, static_cast<uint64_t>(samples_per_second),
+          unwinding_method)};
 
   metrics_capture_complete_data_ = orbit_metrics_uploader::CaptureCompleteData{};
 
@@ -1371,7 +1429,7 @@ void OrbitApp::StartCapture() {
       /*record_arguments=*/false, absl::GetFlag(FLAGS_show_return_values),
       std::move(selected_tracepoints), samples_per_second, stack_dump_size, unwinding_method,
       collect_scheduling_info, collect_thread_states, collect_gpu_jobs, enable_api,
-      enable_introspection, enable_user_space_instrumentation,
+      enable_introspection, dynamic_instrumentation_method,
       max_local_marker_depth_per_command_buffer, collect_memory_info, memory_sampling_period_ms,
       std::move(capture_event_processor));
 
@@ -1416,8 +1474,8 @@ void OrbitApp::StopCapture() {
   auto capture_time_us =
       std::chrono::duration<double, std::micro>(GetTimeGraph()->GetCaptureTimeSpanUs());
   auto capture_time_ms = std::chrono::duration_cast<std::chrono::milliseconds>(capture_time_us);
-  metrics_uploader_->SendLogEvent(
-      orbit_metrics_uploader::OrbitLogEvent_LogEventType_ORBIT_CAPTURE_DURATION, capture_time_ms);
+  metrics_uploader_->SendLogEvent(orbit_metrics_uploader::OrbitLogEvent::ORBIT_CAPTURE_DURATION,
+                                  capture_time_ms);
 
   CHECK(capture_stop_requested_callback_);
   capture_stop_requested_callback_();
@@ -1535,9 +1593,9 @@ orbit_base::Future<ErrorMessageOr<std::filesystem::path>> OrbitApp::RetrieveModu
                                                   {absl::GetFlag(FLAGS_instance_symbols_folder)});
       });
 
-  auto download_file =
-      [this, module_file_path, scoped_status = std::move(scoped_status)](
-          ErrorMessageOr<std::string> result) mutable -> ErrorMessageOr<std::filesystem::path> {
+  auto download_file = [this, module_file_path, scoped_status = std::move(scoped_status)](
+                           ErrorMessageOr<std::string> result) mutable
+      -> orbit_base::Future<ErrorMessageOr<std::filesystem::path>> {
     if (result.has_error()) return result.error();
 
     const std::string& debug_file_path = result.value();
@@ -1549,18 +1607,30 @@ orbit_base::Future<ErrorMessageOr<std::filesystem::path>> OrbitApp::RetrieveModu
     scoped_status.UpdateMessage(
         absl::StrFormat(R"(Copying debug info file for "%s" from remote: "%s"...)",
                         module_file_path, debug_file_path));
-    SCOPED_TIMED_LOG("Copying \"%s\"", debug_file_path);
-    auto scp_result = secure_copy_callback_(debug_file_path, local_debug_file_path.string());
+    const std::chrono::time_point<std::chrono::steady_clock> copy_begin =
+        std::chrono::steady_clock::now();
+    LOG("Copying \"%s\" started", debug_file_path);
+    orbit_base::Future<ErrorMessageOr<void>> copy_result =
+        secure_copy_callback_(debug_file_path, local_debug_file_path.string());
 
-    if (scp_result.has_error()) {
-      return ErrorMessage{absl::StrFormat("Could not copy debug info file from the remote: %s",
-                                          scp_result.error().message())};
-    }
-
-    return local_debug_file_path;
+    orbit_base::ImmediateExecutor immediate_executor{};
+    return copy_result.Then(
+        &immediate_executor,
+        [debug_file_path, local_debug_file_path, scoped_status = std::move(scoped_status),
+         copy_begin](ErrorMessageOr<void> sftp_result) -> ErrorMessageOr<std::filesystem::path> {
+          if (sftp_result.has_error()) {
+            return ErrorMessage{
+                absl::StrFormat("Could not copy debug info file from the remote: %s",
+                                sftp_result.error().message())};
+          }
+          const auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(
+              std::chrono::steady_clock::now() - copy_begin);
+          LOG("Copying \"%s\" took %.3f ms", debug_file_path, duration.count());
+          return local_debug_file_path;
+        });
   };
 
-  return check_file_on_remote.Then(main_thread_executor_, std::move(download_file));
+  return UnwrapFuture(check_file_on_remote.Then(main_thread_executor_, std::move(download_file)));
 }
 
 orbit_base::Future<void> OrbitApp::RetrieveModulesAndLoadSymbols(
@@ -1590,12 +1660,11 @@ orbit_base::Future<ErrorMessageOr<void>> OrbitApp::RetrieveModuleAndLoadSymbols(
 
 orbit_base::Future<ErrorMessageOr<void>> OrbitApp::RetrieveModuleAndLoadSymbols(
     const std::string& module_path, const std::string& build_id) {
-  ScopedMetric metric(metrics_uploader_,
-                      orbit_metrics_uploader::OrbitLogEvent_LogEventType_ORBIT_SYMBOL_LOAD);
+  ScopedMetric metric(metrics_uploader_, orbit_metrics_uploader::OrbitLogEvent::ORBIT_SYMBOL_LOAD);
 
   const ModuleData* const module_data = GetModuleByPathAndBuildId(module_path, build_id);
   if (module_data == nullptr) {
-    metric.SetStatusCode(orbit_metrics_uploader::OrbitLogEvent_StatusCode_INTERNAL_ERROR);
+    metric.SetStatusCode(orbit_metrics_uploader::OrbitLogEvent::INTERNAL_ERROR);
     return {ErrorMessage{absl::StrFormat("Module \"%s\" was not found", module_path)}};
   }
   if (module_data->is_loaded()) return {outcome::success()};
@@ -1607,12 +1676,12 @@ orbit_base::Future<ErrorMessageOr<void>> OrbitApp::RetrieveModuleAndLoadSymbols(
             return LoadSymbols(local_file_path, module_path, build_id);
           }));
 
-  load_result.Then(main_thread_executor_, [metric = std::move(metric)](
-                                              const ErrorMessageOr<void>& result) mutable {
-    if (result.has_error()) {
-      metric.SetStatusCode(orbit_metrics_uploader::OrbitLogEvent_StatusCode_INTERNAL_ERROR);
-    }
-  });
+  load_result.Then(main_thread_executor_,
+                   [metric = std::move(metric)](const ErrorMessageOr<void>& result) mutable {
+                     if (result.has_error()) {
+                       metric.SetStatusCode(orbit_metrics_uploader::OrbitLogEvent::INTERNAL_ERROR);
+                     }
+                   });
 
   return load_result;
 }
@@ -1632,7 +1701,7 @@ orbit_base::Future<ErrorMessageOr<std::filesystem::path>> OrbitApp::RetrieveModu
     return it->second;
   }
 
-  auto local_symbols_path = FindModuleLocally(module_path, build_id);
+  auto local_symbols_path = FindModuleLocally(*module_data);
 
   if (local_symbols_path.has_value()) {
     return local_symbols_path;
@@ -1713,56 +1782,61 @@ orbit_base::Future<ErrorMessageOr<std::filesystem::path>> OrbitApp::RetrieveModu
 }
 
 static ErrorMessageOr<std::filesystem::path> FindModuleLocallyImpl(
-    const orbit_symbols::SymbolHelper& symbol_helper, const std::filesystem::path& module_path,
-    const std::string& build_id) {
-  if (build_id.empty()) {
-    return ErrorMessage(absl::StrFormat(
-        "Unable to find local symbols for module \"%s\", build id is empty", module_path.string()));
+    const orbit_symbols::SymbolHelper& symbol_helper, const ModuleData& module_data) {
+  if (module_data.build_id().empty()) {
+    return ErrorMessage(
+        absl::StrFormat("Unable to find local symbols for module \"%s\", build id is empty",
+                        module_data.file_path()));
   }
 
   std::string error_message;
   {
-    const auto symbols_path = symbol_helper.FindSymbolsFileLocally(module_path, build_id,
-                                                                   orbit_symbol_paths::LoadPaths());
+    std::vector<fs::path> search_paths = orbit_symbol_paths::LoadPaths();
+    fs::path module_path(module_data.file_path());
+    search_paths.emplace_back(module_path.parent_path());
+
+    const auto symbols_path =
+        symbol_helper.FindSymbolsFileLocally(module_data.file_path(), module_data.build_id(),
+                                             module_data.object_file_type(), search_paths);
     if (symbols_path.has_value()) {
       LOG("Found symbols for module \"%s\" in user provided symbol folder. Symbols filename: "
           "\"%s\"",
-          module_path.string(), symbols_path.value().string());
+          module_data.file_path(), symbols_path.value().string());
       return symbols_path.value();
     }
     error_message += "\n* " + symbols_path.error().message();
   }
   {
-    const auto symbols_path = symbol_helper.FindSymbolsInCache(module_path, build_id);
+    const auto symbols_path =
+        symbol_helper.FindSymbolsInCache(module_data.file_path(), module_data.build_id());
     if (symbols_path.has_value()) {
       LOG("Found symbols for module \"%s\" in cache. Symbols filename: \"%s\"",
-          module_path.string(), symbols_path.value().string());
+          module_data.file_path(), symbols_path.value().string());
       return symbols_path.value();
     }
     error_message += "\n* " + symbols_path.error().message();
   }
   if (absl::GetFlag(FLAGS_local)) {
-    const auto symbols_included_in_module =
-        orbit_symbols::SymbolHelper::VerifySymbolsFile(module_path, build_id);
+    const auto symbols_included_in_module = orbit_symbols::SymbolHelper::VerifySymbolsFile(
+        module_data.file_path(), module_data.build_id());
     if (symbols_included_in_module.has_value()) {
-      LOG("Found symbols included in module: \"%s\"", module_path.string());
-      return module_path;
+      LOG("Found symbols included in module: \"%s\"", module_data.file_path());
+      return module_data.file_path();
     }
     error_message += "\n* Symbols are not included in module file: " +
                      symbols_included_in_module.error().message();
   }
 
   error_message = absl::StrFormat("Did not find local symbols for module \"%s\": %s",
-                                  module_path.string(), error_message);
+                                  module_data.file_path(), error_message);
   LOG("%s", error_message);
   return ErrorMessage(error_message);
 }
 
-ErrorMessageOr<std::filesystem::path> OrbitApp::FindModuleLocally(
-    const std::filesystem::path& module_path, const std::string& build_id) {
+ErrorMessageOr<std::filesystem::path> OrbitApp::FindModuleLocally(const ModuleData& module_data) {
   const auto scoped_status = CreateScopedStatus(absl::StrFormat(
-      "Searching for symbols on local machine for module: \"%s\"...", module_path.string()));
-  return FindModuleLocallyImpl(symbol_helper_, module_path, build_id);
+      "Searching for symbols on local machine for module: \"%s\"...", module_data.file_path()));
+  return FindModuleLocallyImpl(symbol_helper_, module_data);
 }
 
 void OrbitApp::AddSymbols(const std::filesystem::path& module_file_path,
@@ -1796,8 +1870,14 @@ orbit_base::Future<ErrorMessageOr<void>> OrbitApp::LoadSymbols(
   auto scoped_status = CreateScopedStatus(absl::StrFormat(
       R"(Loading symbols for "%s" from file "%s"...)", module_file_path, symbols_path.string()));
 
-  auto load_symbols_from_file = thread_pool_->Schedule(
-      [symbols_path]() { return orbit_symbols::SymbolHelper::LoadSymbolsFromFile(symbols_path); });
+  auto load_symbols_from_file =
+      thread_pool_->Schedule([this, symbols_path, module_file_path, module_build_id]() {
+        const ModuleData* module_data =
+            GetModuleByPathAndBuildId(module_file_path, module_build_id);
+        orbit_object_utils::ObjectFileInfo object_file_info{
+            module_data->load_bias(), module_data->executable_segment_offset()};
+        return orbit_symbols::SymbolHelper::LoadSymbolsFromFile(symbols_path, object_file_info);
+      });
 
   auto add_symbols =
       [this, module_id, scoped_status = std::move(scoped_status)](
@@ -1951,8 +2031,7 @@ void OrbitApp::EnableFrameTracksByName(const ModuleData* module,
 }
 
 void OrbitApp::LoadPreset(const PresetFile& preset_file) {
-  ScopedMetric metric{metrics_uploader_,
-                      orbit_metrics_uploader::OrbitLogEvent_LogEventType_ORBIT_PRESET_LOAD};
+  ScopedMetric metric{metrics_uploader_, orbit_metrics_uploader::OrbitLogEvent::ORBIT_PRESET_LOAD};
   std::vector<orbit_base::Future<std::string>> load_module_results{};
   auto module_paths = preset_file.GetModulePaths();
   load_module_results.reserve(module_paths.size());
@@ -1986,7 +2065,7 @@ void OrbitApp::LoadPreset(const PresetFile& preset_file) {
         module_paths_not_found.end());
 
     if (tried_to_load_amount == module_paths_not_found.size()) {
-      metric.SetStatusCode(orbit_metrics_uploader::OrbitLogEvent_StatusCode_INTERNAL_ERROR);
+      metric.SetStatusCode(orbit_metrics_uploader::OrbitLogEvent::INTERNAL_ERROR);
       SendErrorToUi("Preset loading failed",
                     absl::StrFormat("None of the modules of the preset were loaded:\n* %s",
                                     absl::StrJoin(module_paths_not_found, "\n* ")));
@@ -2008,6 +2087,36 @@ void OrbitApp::LoadPreset(const PresetFile& preset_file) {
 
     FireRefreshCallbacks();
   });
+}
+
+void OrbitApp::ShowPresetInExplorer(const PresetFile& preset) {
+  const auto file_exists = orbit_base::FileExists(preset.file_path());
+  if (file_exists.has_error()) {
+    SendErrorToUi("Unable to find preset file: %s", file_exists.error().message());
+    return;
+  }
+
+#if defined(__linux)
+  const QString program{"dbus-send"};
+  const QStringList arguments = {"--session",
+                                 "--print-reply",
+                                 "--dest=org.freedesktop.FileManager1",
+                                 "--type=method_call",
+                                 "/org/freedesktop/FileManager1",
+                                 "org.freedesktop.FileManager1.ShowItems",
+                                 QString::fromStdString(absl::StrFormat(
+                                     "array:string:file:////%s", preset.file_path().string())),
+                                 "string:"};
+#elif defined(_WIN32)
+  const QString program{"explorer.exe"};
+  const QStringList arguments = {
+      QString::fromStdString(absl::StrFormat("/select,%s", preset.file_path().string()))};
+#endif  // defined(__linux)
+  // QProcess::startDetached starts the program `program` with the arguments `arguments` in a new
+  // process, and detaches from it. Returns true on success; otherwise returns false.
+  if (QProcess::startDetached(program, arguments)) return;
+
+  SendErrorToUi("%s", "Unable to show preset file in explorer.");
 }
 
 void OrbitApp::UpdateProcessAndModuleList() {
@@ -2137,8 +2246,16 @@ orbit_base::Future<std::vector<ErrorMessageOr<void>>> OrbitApp::ReloadModules(
   return orbit_base::JoinFutures(absl::MakeConstSpan(reloaded_modules));
 }
 
+void OrbitApp::SetCollectSchedulerInfo(bool collect_scheduler_info) {
+  data_manager_->set_collect_scheduler_info(collect_scheduler_info);
+}
+
 void OrbitApp::SetCollectThreadStates(bool collect_thread_states) {
   data_manager_->set_collect_thread_states(collect_thread_states);
+}
+
+void OrbitApp::SetTraceGpuSubmissions(bool trace_gpu_submissions) {
+  data_manager_->set_trace_gpu_submissions(trace_gpu_submissions);
 }
 
 void OrbitApp::SetEnableApi(bool enable_api) { data_manager_->set_enable_api(enable_api); }
@@ -2147,8 +2264,8 @@ void OrbitApp::SetEnableIntrospection(bool enable_introspection) {
   data_manager_->set_enable_introspection(enable_introspection);
 }
 
-void OrbitApp::SetEnableUserSpaceInstrumentation(bool enable) {
-  data_manager_->set_enable_user_space_instrumentation(enable);
+void OrbitApp::SetDynamicInstrumentationMethod(DynamicInstrumentationMethod method) {
+  data_manager_->set_dynamic_instrumentation_method(method);
 }
 
 void OrbitApp::SetSamplesPerSecond(double samples_per_second) {
@@ -2159,7 +2276,7 @@ void OrbitApp::SetStackDumpSize(uint16_t stack_dump_size) {
   data_manager_->set_stack_dump_size(stack_dump_size);
 }
 
-void OrbitApp::SetUnwindingMethod(orbit_grpc_protos::UnwindingMethod unwinding_method) {
+void OrbitApp::SetUnwindingMethod(UnwindingMethod unwinding_method) {
   data_manager_->set_unwinding_method(unwinding_method);
 }
 
@@ -2195,15 +2312,14 @@ void OrbitApp::DeselectFunction(const orbit_client_protos::FunctionInfo& func) {
   const auto result = process->FindModuleByAddress(absolute_address);
   if (result.has_error()) return false;
 
-  const std::string& module_path = result.value().file_path();
-  const std::string& module_build_id = result.value().build_id();
-  const uint64_t module_base_address = result.value().start();
+  const orbit_client_data::ModuleInMemory& module_in_memory = result.value();
 
-  const ModuleData* module = GetModuleByPathAndBuildId(module_path, module_build_id);
+  const ModuleData* module = module_manager_->GetModuleByModuleInMemoryAndAbsoluteAddress(
+      module_in_memory, absolute_address);
   if (module == nullptr) return false;
 
   const uint64_t offset = orbit_object_utils::SymbolAbsoluteAddressToOffset(
-      absolute_address, module_base_address, module->executable_segment_offset());
+      absolute_address, module_in_memory.start(), module->executable_segment_offset());
   const FunctionInfo* function = module->FindFunctionByOffset(offset, false);
   if (function == nullptr) return false;
 
@@ -2287,7 +2403,9 @@ uint64_t OrbitApp::GetGroupIdToHighlight() const {
 }
 
 void OrbitApp::SelectCallstackEvents(const std::vector<CallstackEvent>& selected_callstack_events,
-                                     uint32_t thread_id) {
+                                     bool origin_is_multiple_threads) {
+  data_manager_->SelectCallstackEvents(selected_callstack_events);
+
   const CallstackData& callstack_data = GetCaptureData().GetCallstackData();
   std::unique_ptr<CallstackData> selection_callstack_data = std::make_unique<CallstackData>();
   for (const CallstackEvent& event : selected_callstack_events) {
@@ -2297,7 +2415,7 @@ void OrbitApp::SelectCallstackEvents(const std::vector<CallstackEvent>& selected
   GetMutableCaptureData().set_selection_callstack_data(std::move(selection_callstack_data));
 
   // Generate selection report.
-  bool generate_summary = thread_id == orbit_base::kAllProcessThreadsTid;
+  bool generate_summary = origin_is_multiple_threads;
   PostProcessedSamplingData processed_sampling_data =
       orbit_client_model::CreatePostProcessedSamplingData(
           *GetCaptureData().GetSelectionCallstackData(), GetCaptureData(), generate_summary);
@@ -2308,6 +2426,11 @@ void OrbitApp::SelectCallstackEvents(const std::vector<CallstackEvent>& selected
   SetSelectionReport(std::move(processed_sampling_data),
                      GetCaptureData().GetSelectionCallstackData()->GetUniqueCallstacksCopy(),
                      generate_summary);
+}
+
+const std::vector<orbit_client_protos::CallstackEvent>& OrbitApp::GetSelectedCallstackEvents(
+    uint32_t thread_id) {
+  return data_manager_->GetSelectedCallstackEvents(thread_id);
 }
 
 void OrbitApp::UpdateAfterSymbolLoading() {
@@ -2372,7 +2495,7 @@ orbit_data_views::DataView* OrbitApp::GetOrCreateDataView(DataViewType type) {
 
     case DataViewType::kCallstack:
       if (!callstack_data_view_) {
-        callstack_data_view_ = std::make_unique<CallstackDataView>(this);
+        callstack_data_view_ = std::make_unique<orbit_data_views::CallstackDataView>(this);
         panels_.push_back(callstack_data_view_.get());
       }
       return callstack_data_view_.get();
@@ -2404,7 +2527,7 @@ orbit_data_views::DataView* OrbitApp::GetOrCreateDataView(DataViewType type) {
 
     case DataViewType::kTracepoints:
       if (!tracepoints_data_view_) {
-        tracepoints_data_view_ = std::make_unique<TracepointsDataView>(this);
+        tracepoints_data_view_ = std::make_unique<orbit_data_views::TracepointsDataView>(this);
         panels_.push_back(tracepoints_data_view_.get());
       }
       return tracepoints_data_view_.get();
@@ -2417,7 +2540,7 @@ orbit_data_views::DataView* OrbitApp::GetOrCreateDataView(DataViewType type) {
 
 orbit_data_views::DataView* OrbitApp::GetOrCreateSelectionCallstackDataView() {
   if (selection_callstack_data_view_ == nullptr) {
-    selection_callstack_data_view_ = std::make_unique<CallstackDataView>(this);
+    selection_callstack_data_view_ = std::make_unique<orbit_data_views::CallstackDataView>(this);
     panels_.push_back(selection_callstack_data_view_.get());
   }
   return selection_callstack_data_view_.get();
@@ -2441,7 +2564,9 @@ bool OrbitApp::IsCapturing() const {
   return capture_client_ != nullptr && capture_client_->IsCapturing();
 }
 
-bool OrbitApp::IsLoadingCapture() const { return is_loading_capture_; }
+bool OrbitApp::IsLoadingCapture() const {
+  return data_source_ == orbit_client_data::CaptureData::DataSource::kLoadedCapture;
+}
 
 ScopedStatus OrbitApp::CreateScopedStatus(const std::string& initial_message) {
   CHECK(std::this_thread::get_id() == main_thread_id_);
@@ -2583,6 +2708,10 @@ void OrbitApp::JumpToTimerAndZoom(uint64_t function_id, JumpToTimerMode selectio
       break;
     }
   }
+}
+
+std::vector<const TimerInfo*> OrbitApp::GetAllTimersForHookedFunction(uint64_t function_id) const {
+  return GetTimeGraph()->GetAllTimersForHookedFunction(function_id);
 }
 
 void OrbitApp::RefreshFrameTracks() {

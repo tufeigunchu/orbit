@@ -8,10 +8,10 @@
 #include <string>
 #include <vector>
 
+#include "ClientProtos/capture_data.pb.h"
 #include "DataViews/AppInterface.h"
 #include "DataViews/DataView.h"
 #include "OrbitBase/ThreadPool.h"
-#include "capture_data.pb.h"
 
 namespace orbit_data_views {
 class FunctionsDataView : public DataView {
@@ -26,22 +26,17 @@ class FunctionsDataView : public DataView {
 
   const std::vector<Column>& GetColumns() override;
   int GetDefaultSortingColumn() override { return kColumnAddressInModule; }
-  std::vector<std::string> GetContextMenu(int clicked_index,
-                                          const std::vector<int>& selected_indices) override;
+  std::vector<std::vector<std::string>> GetContextMenuWithGrouping(
+      int clicked_index, const std::vector<int>& selected_indices) override;
   std::string GetValue(int row, int column) override;
   std::string GetLabel() override { return "Functions"; }
 
-  void OnContextMenu(const std::string& action, int menu_index,
-                     const std::vector<int>& item_indices) override;
   void AddFunctions(std::vector<const orbit_client_protos::FunctionInfo*> functions);
   void ClearFunctions();
 
  protected:
   void DoSort() override;
   void DoFilter() override;
-  [[nodiscard]] const orbit_client_protos::FunctionInfo* GetFunction(int row) const {
-    return functions_[indices_[row]];
-  }
 
   std::vector<std::string> filter_tokens_;
 
@@ -54,14 +49,11 @@ class FunctionsDataView : public DataView {
     kNumColumns
   };
 
-  static const std::string kMenuActionSelect;
-  static const std::string kMenuActionUnselect;
-  static const std::string kMenuActionEnableFrameTrack;
-  static const std::string kMenuActionDisableFrameTrack;
-  static const std::string kMenuActionDisassembly;
-  static const std::string kMenuActionSourceCode;
-
  private:
+  [[nodiscard]] const orbit_client_protos::FunctionInfo* GetFunctionInfoFromRow(int row) override {
+    return functions_[indices_[row]];
+  }
+
   static bool ShouldShowSelectedFunctionIcon(AppInterface* app,
                                              const orbit_client_protos::FunctionInfo& function);
   static bool ShouldShowFrameTrackIcon(AppInterface* app,

@@ -26,26 +26,29 @@
 #include "ClientData/ModuleManager.h"
 #include "ClientData/PostProcessedSamplingData.h"
 #include "ClientData/ProcessData.h"
+#include "ClientData/ThreadTrackDataProvider.h"
 #include "ClientData/TimerChain.h"
+#include "ClientData/TimerData.h"
+#include "ClientData/TimerDataManager.h"
 #include "ClientData/TimestampIntervalSet.h"
 #include "ClientData/TracepointCustom.h"
 #include "ClientData/TracepointData.h"
-#include "ClientData/TrackData.h"
-#include "ClientData/TrackDataManager.h"
+#include "ClientProtos/capture_data.pb.h"
+#include "GrpcProtos/capture.pb.h"
+#include "GrpcProtos/process.pb.h"
+#include "GrpcProtos/tracepoint.pb.h"
 #include "OrbitBase/Logging.h"
-#include "capture.pb.h"
-#include "capture_data.pb.h"
-#include "process.pb.h"
-#include "tracepoint.pb.h"
 
 namespace orbit_client_data {
 
 class CaptureData {
  public:
+  enum class DataSource { kLiveCapture, kLoadedCapture };
   explicit CaptureData(orbit_client_data::ModuleManager* module_manager,
                        const orbit_grpc_protos::CaptureStarted& capture_started,
                        std::optional<std::filesystem::path> file_path,
-                       absl::flat_hash_set<uint64_t> frame_track_function_ids);
+                       absl::flat_hash_set<uint64_t> frame_track_function_ids,
+                       DataSource data_source);
 
   // We can not copy the unique_ptr, so we can not copy this object.
   CaptureData& operator=(const CaptureData& other) = delete;
@@ -90,18 +93,17 @@ class CaptureData {
   [[nodiscard]] const std::string& GetModulePathByAddress(uint64_t absolute_address) const;
   [[nodiscard]] std::optional<std::string> FindModuleBuildIdByAddress(
       uint64_t absolute_address) const;
-  [[nodiscard]] const orbit_client_data::ModuleData* GetModuleByPathAndBuildId(
-      const std::string& module_path, const std::string& build_id) const {
-    return module_manager_->GetModuleByPathAndBuildId(module_path, build_id);
-  }
 
   [[nodiscard]] const orbit_client_protos::FunctionInfo* FindFunctionByAddress(
       uint64_t absolute_address, bool is_exact) const;
-  [[nodiscard]] orbit_client_data::ModuleData* FindModuleByAddress(uint64_t absolute_address) const;
+  [[nodiscard]] const orbit_client_data::ModuleData* FindModuleByAddress(
+      uint64_t absolute_address) const;
+  [[nodiscard]] orbit_client_data::ModuleData* FindMutableModuleByAddress(
+      uint64_t absolute_address);
 
   static const std::string kUnknownFunctionOrModuleName;
 
-  [[nodiscard]] const absl::flat_hash_map<int32_t, std::string>& thread_names() const {
+  [[nodiscard]] const absl::flat_hash_map<uint32_t, std::string>& thread_names() const {
     return thread_names_;
   }
 
@@ -115,7 +117,7 @@ class CaptureData {
     thread_names_.insert_or_assign(thread_id, std::move(thread_name));
   }
 
-  [[nodiscard]] const absl::flat_hash_map<int32_t,
+  [[nodiscard]] const absl::flat_hash_map<uint32_t,
                                           std::vector<orbit_client_protos::ThreadStateSliceInfo>>&
   thread_state_slices() const {
     return thread_state_slices_;
@@ -149,7 +151,7 @@ class CaptureData {
   void AddFunctionStats(uint64_t instrumented_function_id,
                         orbit_client_protos::FunctionStats stats);
 
-  void OnCaptureComplete(const std::vector<const orbit_client_data::TimerChain*>& chains);
+  void OnCaptureComplete();
 
   [[nodiscard]] const CallstackData& GetCallstackData() const { return callstack_data_; };
 
@@ -235,8 +237,12 @@ class CaptureData {
     return frame_track_function_ids_;
   }
 
-  [[nodiscard]] std::pair<uint64_t, TrackData*> CreateTrackData() {
-    return track_data_manager_.CreateTrackData();
+  [[nodiscard]] std::pair<uint64_t, TimerData*> CreateTimerData() {
+    return timer_data_manager_.CreateTimerData();
+  }
+
+  [[nodiscard]] ThreadTrackDataProvider* GetThreadTrackDataProvider() const {
+    return thread_track_data_provider_.get();
   }
 
  private:
@@ -263,10 +269,10 @@ class CaptureData {
 
   absl::flat_hash_map<uint64_t, orbit_client_protos::FunctionStats> functions_stats_;
 
-  absl::flat_hash_map<int32_t, std::string> thread_names_;
+  absl::flat_hash_map<uint32_t, std::string> thread_names_;
 
   // For each thread, assume sorted by timestamp and not overlapping.
-  absl::flat_hash_map<int32_t, std::vector<orbit_client_protos::ThreadStateSliceInfo>>
+  absl::flat_hash_map<uint32_t, std::vector<orbit_client_protos::ThreadStateSliceInfo>>
       thread_state_slices_ GUARDED_BY(thread_state_slices_mutex_);
   mutable absl::Mutex thread_state_slices_mutex_;
 
@@ -279,7 +285,8 @@ class CaptureData {
 
   std::optional<std::filesystem::path> file_path_;
 
-  TrackDataManager track_data_manager_;
+  TimerDataManager timer_data_manager_;
+  std::unique_ptr<ThreadTrackDataProvider> thread_track_data_provider_;
 };
 
 }  // namespace orbit_client_data

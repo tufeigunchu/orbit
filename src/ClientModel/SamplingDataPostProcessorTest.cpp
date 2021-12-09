@@ -11,8 +11,8 @@
 #include "ClientData/CaptureData.h"
 #include "ClientData/ModuleManager.h"
 #include "ClientModel/SamplingDataPostProcessor.h"
+#include "ClientProtos/capture_data.pb.h"
 #include "OrbitBase/ThreadConstants.h"
-#include "capture_data.pb.h"
 
 using orbit_client_data::CallstackCount;
 using orbit_client_data::CaptureData;
@@ -136,7 +136,7 @@ class SamplingDataPostProcessorTest : public ::testing::Test {
 
   ModuleManager module_manager_;
   CaptureData capture_data_{&module_manager_, CaptureStarted{}, std::filesystem::path{},
-                            absl::flat_hash_set<uint64_t>{}};
+                            absl::flat_hash_set<uint64_t>{}, CaptureData::DataSource::kLiveCapture};
 
   void AddCallstackInfo(uint64_t callstack_id, const std::vector<uint64_t>& callstack_frames,
                         CallstackInfo::CallstackType callstack_type) {

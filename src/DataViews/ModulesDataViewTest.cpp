@@ -10,18 +10,22 @@
 #include <string>
 
 #include "ClientData/ProcessData.h"
+#include "DataViewTestUtils.h"
 #include "DataViews/DataView.h"
 #include "DataViews/ModulesDataView.h"
 #include "DisplayFormats/DisplayFormats.h"
+#include "GrpcProtos/module.pb.h"
 #include "MockAppInterface.h"
-#include "OrbitBase/File.h"
-#include "OrbitBase/ReadFileToString.h"
-#include "OrbitBase/TemporaryFile.h"
-#include "TestUtils/TestUtils.h"
-#include "module.pb.h"
 
 using orbit_client_data::ModuleData;
 using orbit_client_data::ModuleInMemory;
+using orbit_data_views::CheckCopySelectionIsInvoked;
+using orbit_data_views::CheckExportToCsvIsInvoked;
+using orbit_data_views::ContextMenuEntry;
+using orbit_data_views::FlattenContextMenuWithGrouping;
+using orbit_data_views::kMenuActionCopySelection;
+using orbit_data_views::kMenuActionExportToCsv;
+using orbit_data_views::kMenuActionLoadSymbols;
 using orbit_grpc_protos::ModuleInfo;
 
 namespace {
@@ -36,11 +40,11 @@ const std::array<std::string, kNumModules> kFilePaths{
 const std::array<std::string, kNumModules> kBuildIds{"build_id_0", "build_id_1", "build_id_2"};
 
 // ModulesDataView also has column index constants defined, but they are declared as private.
-constexpr int kColumnName = 0;
-constexpr int kColumnPath = 1;
-constexpr int kColumnAddressRange = 2;
-constexpr int kColumnFileSize = 3;
-constexpr int kColumnLoaded = 4;
+constexpr int kColumnLoaded = 0;
+constexpr int kColumnName = 1;
+constexpr int kColumnPath = 2;
+constexpr int kColumnAddressRange = 3;
+constexpr int kColumnFileSize = 4;
 constexpr int kNumColumns = 5;
 
 std::string GetExpectedDisplayAddressRangeByIndex(size_t index) {
@@ -113,72 +117,54 @@ TEST_F(ModulesDataViewTest, ColumnValuesAreCorrect) {
 
 TEST_F(ModulesDataViewTest, ContextMenuEntriesArePresent) {
   AddModulesByIndices({0});
+  std::vector<std::string> context_menu =
+      FlattenContextMenuWithGrouping(view_.GetContextMenuWithGrouping(0, {0}));
 
-  EXPECT_THAT(view_.GetContextMenu(0, {0}),
-              testing::UnorderedElementsAre("Load Symbols", "Copy Selection", "Export to CSV"));
+  CheckSingleAction(context_menu, kMenuActionCopySelection, ContextMenuEntry::kEnabled);
+  CheckSingleAction(context_menu, kMenuActionExportToCsv, ContextMenuEntry::kEnabled);
+  CheckSingleAction(context_menu, kMenuActionLoadSymbols, ContextMenuEntry::kEnabled);
 }
 
 TEST_F(ModulesDataViewTest, ContextMenuActionsAreInvoked) {
   AddModulesByIndices({0});
-  std::vector<std::string> context_menu = view_.GetContextMenu(0, {0});
+  std::vector<std::string> context_menu =
+      FlattenContextMenuWithGrouping(view_.GetContextMenuWithGrouping(0, {0}));
   ASSERT_FALSE(context_menu.empty());
 
   // Load Symbols
   {
     const auto load_symbols_index =
-        std::find(context_menu.begin(), context_menu.end(), "Load Symbols") - context_menu.begin();
+        std::find(context_menu.begin(), context_menu.end(), kMenuActionLoadSymbols) -
+        context_menu.begin();
     ASSERT_LT(load_symbols_index, context_menu.size());
 
     EXPECT_CALL(app_, RetrieveModulesAndLoadSymbols)
         .Times(1)
         .WillOnce(testing::Return(orbit_base::Future<void>{}));
-    view_.OnContextMenu("Load Symbols", static_cast<int>(load_symbols_index), {0});
+    view_.OnContextMenu(std::string{kMenuActionLoadSymbols}, static_cast<int>(load_symbols_index),
+                        {0});
   }
 
   // Copy Selection
   {
-    const auto copy_selection_index =
-        std::find(context_menu.begin(), context_menu.end(), "Copy Selection") -
-        context_menu.begin();
-    ASSERT_LT(copy_selection_index, context_menu.size());
-
-    std::string clipboard;
-    EXPECT_CALL(app_, SetClipboard).Times(1).WillOnce(testing::SaveArg<0>(&clipboard));
-    view_.OnContextMenu("Copy Selection", static_cast<int>(copy_selection_index), {0});
-    EXPECT_EQ(clipboard,
-              absl::StrFormat("Name\tPath\tAddress Range\tFile Size\tLoaded\n"
-                              "%s\t%s\t%s\t%s\t\n",
-                              kNames[0], kFilePaths[0], GetExpectedDisplayAddressRangeByIndex(0),
-                              GetExpectedDisplayFileSizeByIndex(0)));
+    std::string expected_clipboard = absl::StrFormat(
+        "Loaded\tName\tPath\tAddress Range\tFile Size\n"
+        "\t%s\t%s\t%s\t%s\n",
+        kNames[0], kFilePaths[0], GetExpectedDisplayAddressRangeByIndex(0),
+        GetExpectedDisplayFileSizeByIndex(0));
+    CheckCopySelectionIsInvoked(context_menu, app_, view_, expected_clipboard);
   }
 
   // Export to CSV
   {
-    const auto export_to_csv_index =
-        std::find(context_menu.begin(), context_menu.end(), "Copy Selection") -
-        context_menu.begin();
-    ASSERT_LT(export_to_csv_index, context_menu.size());
-
-    ErrorMessageOr<orbit_base::TemporaryFile> temporary_file_or_error =
-        orbit_base::TemporaryFile::Create();
-    ASSERT_THAT(temporary_file_or_error, orbit_test_utils::HasNoError());
-    const std::filesystem::path temporary_file_path = temporary_file_or_error.value().file_path();
-    temporary_file_or_error.value().CloseAndRemove();
-
-    EXPECT_CALL(app_, GetSaveFile).Times(1).WillOnce(testing::Return(temporary_file_path.string()));
-    view_.OnContextMenu("Export to CSV", static_cast<int>(export_to_csv_index), {0});
-
-    ErrorMessageOr<std::string> contents_or_error =
-        orbit_base::ReadFileToString(temporary_file_path);
-    ASSERT_THAT(contents_or_error, orbit_test_utils::HasNoError());
-
-    EXPECT_EQ(contents_or_error.value(),
-              absl::StrFormat(R"("Name","Path","Address Range","File Size","Loaded")"
-                              "\r\n"
-                              R"("%s","%s","%s","%s","")"
-                              "\r\n",
-                              kNames[0], kFilePaths[0], GetExpectedDisplayAddressRangeByIndex(0),
-                              GetExpectedDisplayFileSizeByIndex(0)));
+    std::string expected_contents =
+        absl::StrFormat(R"("Loaded","Name","Path","Address Range","File Size")"
+                        "\r\n"
+                        R"("","%s","%s","%s","%s")"
+                        "\r\n",
+                        kNames[0], kFilePaths[0], GetExpectedDisplayAddressRangeByIndex(0),
+                        GetExpectedDisplayFileSizeByIndex(0));
+    CheckExportToCsvIsInvoked(context_menu, app_, view_, expected_contents);
   }
 }
 

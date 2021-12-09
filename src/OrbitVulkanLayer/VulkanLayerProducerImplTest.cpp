@@ -5,7 +5,7 @@
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
 
-#include "CaptureEventProducer/FakeProducerSideService.h"
+#include "FakeProducerSideService/FakeProducerSideService.h"
 #include "VulkanLayerProducerImpl.h"
 
 namespace orbit_vulkan_layer {
@@ -55,7 +55,7 @@ class VulkanLayerProducerImplTest : public ::testing::Test {
     fake_server_.reset();
   }
 
-  std::optional<orbit_capture_event_producer::FakeProducerSideService> fake_service_;
+  std::optional<orbit_fake_producer_side_service::FakeProducerSideService> fake_service_;
   std::unique_ptr<grpc::Server> fake_server_;
   std::optional<VulkanLayerProducerImpl> producer_;
   MockCaptureStatusListener mock_listener_;
@@ -80,7 +80,7 @@ const std::string VulkanLayerProducerImplTest::kInternedString3 = "c";
 const uint64_t VulkanLayerProducerImplTest::kExpectedInternedString3Key =
     std::hash<std::string>{}(kInternedString3);
 
-constexpr std::chrono::duration kWaitMessagesSentDuration = std::chrono::milliseconds(25);
+constexpr std::chrono::milliseconds kWaitMessagesSentDuration{25};
 
 const orbit_grpc_protos::CaptureOptions kFakeCaptureOptions = [] {
   orbit_grpc_protos::CaptureOptions capture_options;

@@ -8,6 +8,7 @@
 #include <absl/container/flat_hash_set.h>
 #include <absl/flags/flag.h>
 #include <absl/strings/str_format.h>
+#include <absl/strings/str_join.h>
 #include <absl/strings/str_split.h>
 #include <absl/time/time.h>
 #include <llvm/Demangle/Demangle.h>
@@ -18,20 +19,24 @@
 
 #include "ClientData/CaptureData.h"
 #include "ClientData/FunctionUtils.h"
+#include "ClientProtos/capture_data.pb.h"
 #include "CompareAscendingOrDescending.h"
 #include "DataViews/DataViewType.h"
 #include "DataViews/FunctionsDataView.h"
 #include "DisplayFormats/DisplayFormats.h"
 #include "GrpcProtos/Constants.h"
 #include "OrbitBase/Append.h"
+#include "OrbitBase/File.h"
 #include "OrbitBase/Logging.h"
-#include "capture_data.pb.h"
+#include "OrbitBase/Result.h"
+#include "OrbitBase/ThreadUtils.h"
 
 using orbit_client_data::CaptureData;
 using orbit_client_data::ModuleData;
 
 using orbit_client_protos::FunctionInfo;
 using orbit_client_protos::FunctionStats;
+using orbit_client_protos::TimerInfo;
 
 using orbit_grpc_protos::InstrumentedFunction;
 
@@ -78,7 +83,7 @@ std::string LiveFunctionsDataView::GetValue(int row, int column) {
   const uint64_t function_id = GetInstrumentedFunctionId(row);
   const FunctionStats& stats = app_->GetCaptureData().GetFunctionStatsOrDefault(function_id);
 
-  const FunctionInfo& function = GetInstrumentedFunction(row);
+  const FunctionInfo& function = *GetFunctionInfoFromRow(row);
   switch (column) {
     case kColumnSelected:
       return FunctionsDataView::BuildSelectedColumnsString(app_, function);
@@ -195,35 +200,25 @@ void LiveFunctionsDataView::DoSort() {
   }
 }
 
-const std::string LiveFunctionsDataView::kMenuActionSelect = "Hook";
-const std::string LiveFunctionsDataView::kMenuActionUnselect = "Unhook";
-const std::string LiveFunctionsDataView::kMenuActionJumpToFirst = "Jump to first";
-const std::string LiveFunctionsDataView::kMenuActionJumpToLast = "Jump to last";
-const std::string LiveFunctionsDataView::kMenuActionJumpToMin = "Jump to min";
-const std::string LiveFunctionsDataView::kMenuActionJumpToMax = "Jump to max";
-const std::string LiveFunctionsDataView::kMenuActionDisassembly = "Go to Disassembly";
-const std::string LiveFunctionsDataView::kMenuActionIterate = "Add iterator(s)";
-const std::string LiveFunctionsDataView::kMenuActionEnableFrameTrack = "Enable frame track(s)";
-const std::string LiveFunctionsDataView::kMenuActionDisableFrameTrack = "Disable frame track(s)";
-const std::string LiveFunctionsDataView::kMenuActionSourceCode = "Go to Source code";
-
-std::vector<std::string> LiveFunctionsDataView::GetContextMenu(
+std::vector<std::vector<std::string>> LiveFunctionsDataView::GetContextMenuWithGrouping(
     int clicked_index, const std::vector<int>& selected_indices) {
   bool enable_select = false;
   bool enable_unselect = false;
   bool enable_disassembly = false;
   bool enable_source_code = false;
-  bool enable_iterator = false;
   bool enable_enable_frame_track = false;
   bool enable_disable_frame_track = false;
+  bool enable_iterator = false;
 
   const CaptureData& capture_data = app_->GetCaptureData();
   for (int index : selected_indices) {
     uint64_t instrumented_function_id = GetInstrumentedFunctionId(index);
-    const FunctionInfo& instrumented_function = GetInstrumentedFunction(index);
+    const FunctionInfo& instrumented_function = *GetFunctionInfoFromRow(index);
 
     if (app_->IsCaptureConnected(capture_data)) {
-      enable_select |= !app_->IsFunctionSelected(instrumented_function);
+      enable_select |=
+          !app_->IsFunctionSelected(instrumented_function) &&
+          orbit_client_data::function_utils::IsFunctionSelectable(instrumented_function);
       enable_unselect |= app_->IsFunctionSelected(instrumented_function);
       enable_disassembly = true;
       enable_source_code = true;
@@ -242,105 +237,129 @@ std::vector<std::string> LiveFunctionsDataView::GetContextMenu(
     }
   }
 
-  std::vector<std::string> menu;
-  if (enable_select) menu.emplace_back(kMenuActionSelect);
-  if (enable_unselect) menu.emplace_back(kMenuActionUnselect);
-  if (enable_disassembly) menu.emplace_back(kMenuActionDisassembly);
-  if (enable_source_code) menu.emplace_back(kMenuActionSourceCode);
+  std::vector<std::vector<std::string>> menu =
+      DataView::GetContextMenuWithGrouping(clicked_index, selected_indices);
+  menu.begin()->push_back(std::string{kMenuActionExportEventsToCsv});
 
-  if (enable_iterator) {
-    menu.emplace_back(kMenuActionIterate);
-  }
-  if (enable_enable_frame_track) {
-    menu.emplace_back(kMenuActionEnableFrameTrack);
-  }
-  if (enable_disable_frame_track) {
-    menu.emplace_back(kMenuActionDisableFrameTrack);
-  }
-
+  std::vector<std::string> action_group;
+  if (enable_iterator) action_group.emplace_back(std::string{kMenuActionAddIterator});
   // For now, these actions only make sense when one function is selected,
   // so we don't show them otherwise.
   if (selected_indices.size() == 1) {
     uint64_t instrumented_function_id = GetInstrumentedFunctionId(selected_indices[0]);
     const FunctionStats& stats = capture_data.GetFunctionStatsOrDefault(instrumented_function_id);
     if (stats.count() > 0) {
-      menu.insert(menu.end(), {kMenuActionJumpToFirst, kMenuActionJumpToLast, kMenuActionJumpToMin,
-                               kMenuActionJumpToMax});
+      action_group.insert(action_group.end(),
+                          {std::string{kMenuActionJumpToFirst}, std::string{kMenuActionJumpToLast},
+                           std::string{kMenuActionJumpToMin}, std::string{kMenuActionJumpToMax}});
     }
   }
-  orbit_base::Append(menu, DataView::GetContextMenu(clicked_index, selected_indices));
+  menu.insert(menu.begin(), action_group);
+
+  action_group.clear();
+  if (enable_select) action_group.emplace_back(std::string{kMenuActionSelect});
+  if (enable_unselect) action_group.emplace_back(std::string{kMenuActionUnselect});
+  if (enable_disassembly) action_group.emplace_back(std::string{kMenuActionDisassembly});
+  if (enable_source_code) action_group.emplace_back(std::string{kMenuActionSourceCode});
+  if (enable_enable_frame_track) {
+    action_group.emplace_back(std::string{kMenuActionEnableFrameTrack});
+  }
+  if (enable_disable_frame_track) {
+    action_group.emplace_back(std::string{kMenuActionDisableFrameTrack});
+  }
+  menu.insert(menu.begin(), action_group);
+
   return menu;
 }
 
-void LiveFunctionsDataView::OnContextMenu(const std::string& action, int menu_index,
-                                          const std::vector<int>& item_indices) {
-  const CaptureData& capture_data = app_->GetCaptureData();
-  if (action == kMenuActionSelect || action == kMenuActionUnselect ||
-      action == kMenuActionDisassembly || action == kMenuActionSourceCode) {
-    for (int i : item_indices) {
-      const FunctionInfo selected_function = GetInstrumentedFunction(i);
-      if (action == kMenuActionSelect) {
-        app_->SelectFunction(selected_function);
-      } else if (action == kMenuActionUnselect) {
-        app_->DeselectFunction(selected_function);
-        // Unhooking a function implies disabling (and removing) the frame
-        // track for this function. While it would be possible to keep the
-        // current frame track in the capture data, this would lead to a
-        // somewhat inconsistent state where the frame track for this function
-        // is enabled for the current capture but disabled for the next one.
-        app_->DisableFrameTrack(selected_function);
-        app_->RemoveFrameTrack(selected_function);
-      } else if (action == kMenuActionDisassembly) {
-        uint32_t pid = capture_data.process_id();
-        app_->Disassemble(pid, selected_function);
-      } else if (action == kMenuActionSourceCode) {
-        app_->ShowSourceCode(selected_function);
-      }
+void LiveFunctionsDataView::OnIteratorRequested(const std::vector<int>& selection) {
+  for (int i : selection) {
+    uint64_t instrumented_function_id = GetInstrumentedFunctionId(i);
+    const FunctionInfo* instrumented_function = GetFunctionInfoFromRow(i);
+    const FunctionStats& stats =
+        app_->GetCaptureData().GetFunctionStatsOrDefault(instrumented_function_id);
+    if (stats.count() > 0) {
+      live_functions_->AddIterator(instrumented_function_id, instrumented_function);
+      metrics_uploader_->SendLogEvent(orbit_metrics_uploader::OrbitLogEvent::ORBIT_ITERATOR_ADD);
     }
-  } else if (action == kMenuActionJumpToFirst) {
-    CHECK(item_indices.size() == 1);
-    auto function_id = GetInstrumentedFunctionId(item_indices[0]);
+  }
+}
+
+void LiveFunctionsDataView::OnJumpToRequested(const std::string& action,
+                                              const std::vector<int>& selection) {
+  CHECK(selection.size() == 1);
+  auto function_id = GetInstrumentedFunctionId(selection[0]);
+  if (action == kMenuActionJumpToFirst) {
     app_->JumpToTimerAndZoom(function_id, AppInterface::JumpToTimerMode::kFirst);
   } else if (action == kMenuActionJumpToLast) {
-    CHECK(item_indices.size() == 1);
-    auto function_id = GetInstrumentedFunctionId(item_indices[0]);
     app_->JumpToTimerAndZoom(function_id, AppInterface::JumpToTimerMode::kLast);
   } else if (action == kMenuActionJumpToMin) {
-    CHECK(item_indices.size() == 1);
-    uint64_t function_id = GetInstrumentedFunctionId(item_indices[0]);
     app_->JumpToTimerAndZoom(function_id, AppInterface::JumpToTimerMode::kMin);
   } else if (action == kMenuActionJumpToMax) {
-    CHECK(item_indices.size() == 1);
-    uint64_t function_id = GetInstrumentedFunctionId(item_indices[0]);
     app_->JumpToTimerAndZoom(function_id, AppInterface::JumpToTimerMode::kMax);
-  } else if (action == kMenuActionIterate) {
-    for (int i : item_indices) {
-      uint64_t instrumented_function_id = GetInstrumentedFunctionId(i);
-      const FunctionInfo& instrumented_function = GetInstrumentedFunction(i);
-      const FunctionStats& stats =
-          app_->GetCaptureData().GetFunctionStatsOrDefault(instrumented_function_id);
-      if (stats.count() > 0) {
-        live_functions_->AddIterator(instrumented_function_id, &instrumented_function);
-        metrics_uploader_->SendLogEvent(
-            orbit_metrics_uploader::OrbitLogEvent_LogEventType_ORBIT_ITERATOR_ADD);
+  }
+}
+
+void LiveFunctionsDataView::OnExportEventsToCsvRequested(const std::vector<int>& selection) {
+  auto send_error = [&](const std::string& error_msg) {
+    app_->SendErrorToUi("Export all events to CSV", error_msg);
+  };
+
+  std::string file_path = app_->GetSaveFile(".csv");
+  if (file_path.empty()) return;
+
+  ErrorMessageOr<orbit_base::unique_fd> result = orbit_base::OpenFileForWriting(file_path);
+  if (result.has_error()) {
+    send_error(
+        absl::StrFormat("Failed to open \"%s\" file: %s", file_path, result.error().message()));
+    return;
+  }
+  const orbit_base::unique_fd& fd = result.value();
+
+  // Write header line
+  constexpr const char* kFieldSeparator = ",";
+  constexpr const char* kLineSeparator = "\r\n";
+  constexpr size_t kNumColumns = 5;
+  const std::array<std::string, kNumColumns> kNames{"Name", "Thread", "Start", "End",
+                                                    "Duration (ns)"};
+  std::string header_line = absl::StrJoin(
+      kNames, kFieldSeparator,
+      [](std::string* out, const std::string& name) { out->append(FormatValueForCsv(name)); });
+  header_line.append(kLineSeparator);
+  auto write_result = orbit_base::WriteFully(fd, header_line);
+  if (write_result.has_error()) {
+    send_error(
+        absl::StrFormat("Error writing to \"%s\": %s", file_path, write_result.error().message()));
+    return;
+  }
+
+  for (int row : selection) {
+    const FunctionInfo& function = *GetFunctionInfoFromRow(row);
+    std::string function_name = orbit_client_data::function_utils::GetDisplayName(function);
+
+    const uint64_t function_id = GetInstrumentedFunctionId(row);
+    const CaptureData& capture_data = app_->GetCaptureData();
+    for (const TimerInfo* timer : app_->GetAllTimersForHookedFunction(function_id)) {
+      std::string line;
+      line.append(FormatValueForCsv(function_name));
+      line.append(kFieldSeparator);
+      line.append(FormatValueForCsv(absl::StrFormat(
+          "%s [%lu]", capture_data.GetThreadName(timer->thread_id()), timer->thread_id())));
+      line.append(kFieldSeparator);
+      line.append(FormatValueForCsv(absl::StrFormat("%lu", timer->start())));
+      line.append(kFieldSeparator);
+      line.append(FormatValueForCsv(absl::StrFormat("%lu", timer->end())));
+      line.append(kFieldSeparator);
+      line.append(FormatValueForCsv(absl::StrFormat("%lu", timer->end() - timer->start())));
+      line.append(kLineSeparator);
+
+      auto write_result = orbit_base::WriteFully(fd, line);
+      if (write_result.has_error()) {
+        send_error(absl::StrFormat("Error writing to \"%s\": %s", file_path,
+                                   write_result.error().message()));
+        return;
       }
     }
-  } else if (action == kMenuActionEnableFrameTrack) {
-    for (int i : item_indices) {
-      const FunctionInfo& function = GetInstrumentedFunction(i);
-      if (app_->IsCaptureConnected(capture_data)) {
-        app_->SelectFunction(function);
-      }
-      app_->EnableFrameTrack(function);
-      app_->AddFrameTrack(GetInstrumentedFunctionId(i));
-    }
-  } else if (action == kMenuActionDisableFrameTrack) {
-    for (int i : item_indices) {
-      app_->DisableFrameTrack(GetInstrumentedFunction(i));
-      app_->RemoveFrameTrack(GetInstrumentedFunctionId(i));
-    }
-  } else {
-    DataView::OnContextMenu(action, menu_index, item_indices);
   }
 }
 
@@ -443,10 +462,10 @@ uint64_t LiveFunctionsDataView::GetInstrumentedFunctionId(uint32_t row) const {
   return indices_[row];
 }
 
-const FunctionInfo& LiveFunctionsDataView::GetInstrumentedFunction(uint32_t row) const {
-  CHECK(row < indices_.size());
+const FunctionInfo* LiveFunctionsDataView::GetFunctionInfoFromRow(int row) {
+  CHECK(static_cast<unsigned int>(row) < indices_.size());
   CHECK(functions_.find(indices_[row]) != functions_.end());
-  return functions_.at(indices_[row]);
+  return &functions_.at(indices_[row]);
 }
 
 std::optional<int> LiveFunctionsDataView::GetRowFromFunctionId(uint64_t function_id) {

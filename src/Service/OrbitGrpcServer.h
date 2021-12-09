@@ -9,7 +9,7 @@
 #include <string>
 #include <string_view>
 
-#include "CaptureStartStopListener.h"
+#include "CaptureService/CaptureStartStopListener.h"
 
 namespace orbit_service {
 
@@ -28,12 +28,15 @@ class OrbitGrpcServer {
   virtual void Shutdown() = 0;
   virtual void Wait() = 0;
 
-  virtual void AddCaptureStartStopListener(CaptureStartStopListener* listener) = 0;
-  virtual void RemoveCaptureStartStopListener(CaptureStartStopListener* listener) = 0;
+  virtual void AddCaptureStartStopListener(
+      orbit_capture_service::CaptureStartStopListener* listener) = 0;
+  virtual void RemoveCaptureStartStopListener(
+      orbit_capture_service::CaptureStartStopListener* listener) = 0;
 
   // Creates a server listening specified address and registers all
   // necessary services.
-  [[nodiscard]] static std::unique_ptr<OrbitGrpcServer> Create(std::string_view server_address);
+  [[nodiscard]] static std::unique_ptr<OrbitGrpcServer> Create(std::string_view server_address,
+                                                               bool dev_mode);
 };
 
 }  // namespace orbit_service

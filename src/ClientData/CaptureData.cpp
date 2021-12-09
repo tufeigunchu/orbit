@@ -28,11 +28,14 @@ namespace orbit_client_data {
 
 CaptureData::CaptureData(ModuleManager* module_manager, const CaptureStarted& capture_started,
                          std::optional<std::filesystem::path> file_path,
-                         absl::flat_hash_set<uint64_t> frame_track_function_ids)
+                         absl::flat_hash_set<uint64_t> frame_track_function_ids,
+                         DataSource data_source)
     : module_manager_{module_manager},
       selection_callstack_data_(std::make_unique<CallstackData>()),
       frame_track_function_ids_{std::move(frame_track_function_ids)},
-      file_path_{std::move(file_path)} {
+      file_path_{std::move(file_path)},
+      thread_track_data_provider_(
+          std::make_unique<ThreadTrackDataProvider>(data_source == DataSource::kLoadedCapture)) {
   ProcessInfo process_info;
   process_info.set_pid(capture_started.process_id());
   std::filesystem::path executable_path{capture_started.executable_path()};
@@ -110,15 +113,14 @@ void CaptureData::AddFunctionStats(uint64_t instrumented_function_id,
   functions_stats_.insert_or_assign(instrumented_function_id, std::move(stats));
 }
 
-void CaptureData::OnCaptureComplete(
-    const std::vector<const orbit_client_data::TimerChain*>& chains) {
-  // Recalculate standard deviation as the running calculation may have introduced error.
-  for (auto& pair : functions_stats_) {
-    FunctionStats& stats = pair.second;
-    stats.set_variance_ns(0);
-  }
+void CaptureData::OnCaptureComplete() {
+  thread_track_data_provider_->OnCaptureComplete();
 
-  for (const orbit_client_data::TimerChain* chain : chains) {
+  // Recalculate standard deviation as the running calculation may have introduced error.
+  absl::flat_hash_map<int, unsigned long> id_to_sum_of_deviations_squared;
+
+  for (const orbit_client_data::TimerChain* chain :
+       thread_track_data_provider_->GetAllThreadTimerChains()) {
     CHECK(chain);
     for (const orbit_client_data::TimerBlock& block : *chain) {
       for (uint64_t i = 0; i < block.size(); i++) {
@@ -129,16 +131,18 @@ void CaptureData::OnCaptureComplete(
         if (stats.count() > 0) {
           uint64_t elapsed_nanos = timer_info.end() - timer_info.start();
           int64_t deviation = elapsed_nanos - stats.average_time_ns();
-          stats.set_variance_ns(stats.variance_ns() + deviation * deviation);
+          id_to_sum_of_deviations_squared[timer_info.function_id()] += deviation * deviation;
         }
       }
     }
   }
 
-  for (auto& pair : functions_stats_) {
-    FunctionStats& stats = pair.second;
+  for (auto& [id, sum_of_deviations_squared] : id_to_sum_of_deviations_squared) {
+    const auto& stats_it = functions_stats_.find(id);
+    if (stats_it == functions_stats_.end()) continue;
+    FunctionStats& stats = stats_it->second;
     if (stats.count() > 0) {
-      stats.set_variance_ns(stats.variance_ns() / static_cast<double>(stats.count()));
+      stats.set_variance_ns(sum_of_deviations_squared / static_cast<double>(stats.count()));
       stats.set_std_dev_ns(static_cast<uint64_t>(sqrt(stats.variance_ns())));
     }
   }
@@ -237,12 +241,11 @@ CaptureData::FindFunctionAbsoluteAddressByInstructionAbsoluteAddressUsingModules
     uint64_t absolute_address) const {
   const auto module_or_error = process_.FindModuleByAddress(absolute_address);
   if (module_or_error.has_error()) return std::nullopt;
-  const std::string& module_path = module_or_error.value().file_path();
-  const std::string& module_build_id = module_or_error.value().build_id();
-  const uint64_t module_base_address = module_or_error.value().start();
+  const auto& module_in_memory = module_or_error.value();
+  const uint64_t module_base_address = module_in_memory.start();
 
-  const ModuleData* module =
-      module_manager_->GetModuleByPathAndBuildId(module_path, module_build_id);
+  const ModuleData* module = module_manager_->GetModuleByModuleInMemoryAndAbsoluteAddress(
+      module_in_memory, absolute_address);
   if (module == nullptr) return std::nullopt;
 
   const uint64_t offset = orbit_object_utils::SymbolAbsoluteAddressToOffset(
@@ -298,12 +301,10 @@ const FunctionInfo* CaptureData::FindFunctionByAddress(uint64_t absolute_address
   const auto module_or_error = process_.FindModuleByAddress(absolute_address);
   if (module_or_error.has_error()) return nullptr;
   const auto& module_in_memory = module_or_error.value();
-  const std::string& module_path = module_in_memory.file_path();
-  const std::string& module_build_id = module_in_memory.build_id();
   const uint64_t module_base_address = module_in_memory.start();
 
-  const ModuleData* module =
-      module_manager_->GetModuleByPathAndBuildId(module_path, module_build_id);
+  const ModuleData* module = module_manager_->GetModuleByModuleInMemoryAndAbsoluteAddress(
+      module_in_memory, absolute_address);
   if (module == nullptr) return nullptr;
 
   const uint64_t offset = orbit_object_utils::SymbolAbsoluteAddressToOffset(
@@ -311,11 +312,18 @@ const FunctionInfo* CaptureData::FindFunctionByAddress(uint64_t absolute_address
   return module->FindFunctionByOffset(offset, is_exact);
 }
 
-[[nodiscard]] ModuleData* CaptureData::FindModuleByAddress(uint64_t absolute_address) const {
+[[nodiscard]] const ModuleData* CaptureData::FindModuleByAddress(uint64_t absolute_address) const {
   const auto result = process_.FindModuleByAddress(absolute_address);
   if (result.has_error()) return nullptr;
-  return module_manager_->GetMutableModuleByPathAndBuildId(result.value().file_path(),
-                                                           result.value().build_id());
+  return module_manager_->GetModuleByModuleInMemoryAndAbsoluteAddress(result.value(),
+                                                                      absolute_address);
+}
+
+[[nodiscard]] ModuleData* CaptureData::FindMutableModuleByAddress(uint64_t absolute_address) {
+  const auto result = process_.FindModuleByAddress(absolute_address);
+  if (result.has_error()) return nullptr;
+  return module_manager_->GetMutableModuleByModuleInMemoryAndAbsoluteAddress(result.value(),
+                                                                             absolute_address);
 }
 
 uint32_t CaptureData::process_id() const { return process_.pid(); }

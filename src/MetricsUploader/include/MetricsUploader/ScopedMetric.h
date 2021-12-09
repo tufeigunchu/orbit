@@ -8,7 +8,7 @@
 #include <chrono>
 
 #include "MetricsUploader/MetricsUploader.h"
-#include "orbit_log_event.pb.h"
+#include "MetricsUploader/orbit_log_event.pb.h"
 
 namespace orbit_metrics_uploader {
 
@@ -21,12 +21,12 @@ class ScopedMetric {
   ScopedMetric& operator=(ScopedMetric&& other);
   ~ScopedMetric();
 
-  void SetStatusCode(OrbitLogEvent_StatusCode status_code) { status_code_ = status_code; }
+  void SetStatusCode(OrbitLogEvent::StatusCode status_code) { status_code_ = status_code; }
 
  private:
   MetricsUploader* uploader_;
   OrbitLogEvent_LogEventType log_event_type_;
-  OrbitLogEvent_StatusCode status_code_ = OrbitLogEvent_StatusCode_SUCCESS;
+  OrbitLogEvent::StatusCode status_code_ = OrbitLogEvent::SUCCESS;
   std::chrono::steady_clock::time_point start_;
 };
 

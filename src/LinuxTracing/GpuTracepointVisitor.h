@@ -6,7 +6,6 @@
 #define LINUX_TRACING_GPU_TRACEPOINT_EVENT_PROCESSOR_H_
 
 #include <absl/container/flat_hash_map.h>
-#include <absl/hash/hash.h>
 #include <sys/types.h>
 
 #include <cstdint>
@@ -14,22 +13,22 @@
 #include <tuple>
 #include <vector>
 
+#include "LinuxTracing/TracerListener.h"
+#include "OrbitBase/Logging.h"
 #include "PerfEvent.h"
 #include "PerfEventVisitor.h"
-#include "TracingInterface/TracerListener.h"
 
 namespace orbit_linux_tracing {
 
 class GpuTracepointVisitor : public PerfEventVisitor {
  public:
-  explicit GpuTracepointVisitor(orbit_tracing_interface::TracerListener* listener)
-      : listener_{listener} {
+  explicit GpuTracepointVisitor(TracerListener* listener) : listener_{listener} {
     CHECK(listener_ != nullptr);
   }
 
-  void Visit(AmdgpuCsIoctlPerfEvent* event) override;
-  void Visit(AmdgpuSchedRunJobPerfEvent* event) override;
-  void Visit(DmaFenceSignaledPerfEvent* event) override;
+  void Visit(uint64_t event_timestamp, const AmdgpuCsIoctlPerfEventData& event_data) override;
+  void Visit(uint64_t event_timestamp, const AmdgpuSchedRunJobPerfEventData& event_data) override;
+  void Visit(uint64_t event_timestamp, const DmaFenceSignaledPerfEventData& event_data) override;
 
  private:
   // Keys are context, seqno, and timeline.
@@ -40,7 +39,7 @@ class GpuTracepointVisitor : public PerfEventVisitor {
 
   void CreateGpuJobAndSendToListenerIfComplete(const Key& key);
 
-  orbit_tracing_interface::TracerListener* listener_;
+  TracerListener* listener_;
 
   struct AmdgpuCsIoctlEvent {
     pid_t pid;

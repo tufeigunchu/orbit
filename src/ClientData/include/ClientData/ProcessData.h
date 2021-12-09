@@ -18,11 +18,11 @@
 #include <vector>
 
 #include "ClientData/ModuleData.h"
+#include "GrpcProtos/module.pb.h"
+#include "GrpcProtos/process.pb.h"
+#include "GrpcProtos/symbol.pb.h"
 #include "OrbitBase/Logging.h"
 #include "OrbitBase/Result.h"
-#include "module.pb.h"
-#include "process.pb.h"
-#include "symbol.pb.h"
 
 namespace orbit_client_data {
 
@@ -98,9 +98,8 @@ class ProcessData final {
 
  private:
   mutable absl::Mutex mutex_;
-  orbit_grpc_protos::ProcessInfo process_info_;
-
-  std::map<uint64_t, ModuleInMemory> start_address_to_module_in_memory_;
+  orbit_grpc_protos::ProcessInfo process_info_ ABSL_GUARDED_BY(mutex_);
+  std::map<uint64_t, ModuleInMemory> start_address_to_module_in_memory_ ABSL_GUARDED_BY(mutex_);
 };
 
 }  // namespace orbit_client_data

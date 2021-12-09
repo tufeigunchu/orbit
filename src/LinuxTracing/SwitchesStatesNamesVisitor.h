@@ -6,20 +6,19 @@
 #define LINUX_TRACING_THREAD_STATE_VISITOR_H_
 
 #include <absl/container/flat_hash_map.h>
-#include <absl/hash/hash.h>
 #include <sys/types.h>
 
 #include <atomic>
 #include <cstdint>
 #include <optional>
-#include <vector>
 
 #include "ContextSwitchManager.h"
+#include "GrpcProtos/capture.pb.h"
+#include "LinuxTracing/TracerListener.h"
+#include "OrbitBase/Logging.h"
 #include "PerfEvent.h"
 #include "PerfEventVisitor.h"
 #include "ThreadStateManager.h"
-#include "TracingInterface/TracerListener.h"
-#include "capture.pb.h"
 
 namespace orbit_linux_tracing {
 
@@ -29,7 +28,7 @@ namespace orbit_linux_tracing {
 // As for some of these events the process id is not available, but only the thread id, this class
 // also keeps the association between tids and pids system wide. The initial association extracted
 // from the proc filesystem is passed by calling ProcessInitialTidToPidAssociation for each thread,
-// and is updated with ForkPerfEvents (and also ExitPerfEvents, see Visit(ExitPerfEvent*)).
+// and is updated with ForkPerfEvents (and also ExitPerfEvents, see Visit(const ExitPerfEvent&)).
 // For thread states, we are able to collect partial slices at the beginning and at the end of the
 // capture, hence the ProcessInitialState and ProcessRemainingOpenStates methods.
 // Also, we only process thread states of the process with pid specified with
@@ -37,8 +36,7 @@ namespace orbit_linux_tracing {
 // profiling). For this we also need the system-wide association between tids and pids.
 class SwitchesStatesNamesVisitor : public PerfEventVisitor {
  public:
-  explicit SwitchesStatesNamesVisitor(orbit_tracing_interface::TracerListener* listener)
-      : listener_{listener} {
+  explicit SwitchesStatesNamesVisitor(TracerListener* listener) : listener_{listener} {
     CHECK(listener_ != nullptr);
   }
 
@@ -52,23 +50,23 @@ class SwitchesStatesNamesVisitor : public PerfEventVisitor {
   void SetThreadStatePidFilter(pid_t pid) { thread_state_pid_filter_ = pid; }
 
   void ProcessInitialTidToPidAssociation(pid_t tid, pid_t pid);
-  void Visit(ForkPerfEvent* event) override;
-  void Visit(ExitPerfEvent* event) override;
+  void Visit(uint64_t event_timestamp, const ForkPerfEventData& event_data) override;
+  void Visit(uint64_t event_timestamp, const ExitPerfEventData& event_data) override;
 
   void ProcessInitialState(uint64_t timestamp_ns, pid_t tid, char state_char);
-  void Visit(TaskNewtaskPerfEvent* event) override;
-  void Visit(SchedSwitchPerfEvent* event) override;
-  void Visit(SchedWakeupPerfEvent* event) override;
+  void Visit(uint64_t event_timestamp, const TaskNewtaskPerfEventData& event_data) override;
+  void Visit(uint64_t event_timestamp, const SchedSwitchPerfEventData& event_data) override;
+  void Visit(uint64_t timestamp, const SchedWakeupPerfEventData& event_data) override;
   void ProcessRemainingOpenStates(uint64_t timestamp_ns);
 
-  void Visit(TaskRenamePerfEvent* event) override;
+  void Visit(uint64_t event_timestamp, const TaskRenamePerfEventData& event_data) override;
 
  private:
   static std::optional<orbit_grpc_protos::ThreadStateSlice::ThreadState> GetThreadStateFromChar(
       char c);
   static orbit_grpc_protos::ThreadStateSlice::ThreadState GetThreadStateFromBits(uint64_t bits);
 
-  orbit_tracing_interface::TracerListener* listener_;
+  TracerListener* listener_;
   std::atomic<uint64_t>* thread_state_counter_ = nullptr;
 
   bool produce_scheduling_slices_ = false;

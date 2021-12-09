@@ -60,7 +60,7 @@ ErrorMessageOr<uint64_t> FindFunctionAddressWithFallback(pid_t pid, std::string_
 
 }  // namespace
 
-[[nodiscard]] ErrorMessageOr<void*> DlopenInTracee(pid_t pid, std::filesystem::path path,
+[[nodiscard]] ErrorMessageOr<void*> DlopenInTracee(pid_t pid, const std::filesystem::path& path,
                                                    uint32_t flag) {
   // Make sure file exists.
   auto file_exists_or_error = orbit_base::FileExists(path);
@@ -68,7 +68,7 @@ ErrorMessageOr<uint64_t> FindFunctionAddressWithFallback(pid_t pid, std::string_
     return ErrorMessage(absl::StrFormat("Unable to access library at: \"%s\": %s", path,
                                         file_exists_or_error.error().message()));
   }
-  if (file_exists_or_error.value() == false) {
+  if (!file_exists_or_error.value()) {
     return ErrorMessage(absl::StrFormat("Library does not exist at: \"%s\"", path));
   }
 

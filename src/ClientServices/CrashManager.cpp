@@ -9,8 +9,8 @@
 
 #include <chrono>
 
+#include "GrpcProtos/services.grpc.pb.h"
 #include "OrbitBase/Logging.h"
-#include "services.grpc.pb.h"
 
 namespace orbit_client_services {
 namespace {
@@ -40,7 +40,7 @@ void CrashManagerImpl::CrashOrbitService(CrashOrbitServiceRequest_CrashType cras
   request.set_crash_type(crash_type);
 
   grpc::ClientContext context;
-  std::chrono::time_point deadline =
+  std::chrono::system_clock::time_point deadline =
       std::chrono::system_clock::now() + std::chrono::milliseconds(kTimeoutMilliseconds);
   context.set_deadline(deadline);
 

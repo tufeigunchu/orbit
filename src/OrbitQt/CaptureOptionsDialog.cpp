@@ -15,7 +15,14 @@
 
 #include "ClientFlags/ClientFlags.h"
 #include "ui_CaptureOptionsDialog.h"
+
 namespace orbit_qt {
+
+using orbit_grpc_protos::CaptureOptions;
+
+using DynamicInstrumentationMethod =
+    orbit_grpc_protos::CaptureOptions::DynamicInstrumentationMethod;
+using UnwindingMethod = orbit_grpc_protos::CaptureOptions::UnwindingMethod;
 
 CaptureOptionsDialog::CaptureOptionsDialog(QWidget* parent)
     : QDialog{parent}, ui_(std::make_unique<Ui::CaptureOptionsDialog>()) {
@@ -23,6 +30,22 @@ CaptureOptionsDialog::CaptureOptionsDialog(QWidget* parent)
 
   QObject::connect(ui_->buttonBox, &QDialogButtonBox::accepted, this, &QDialog::accept);
   QObject::connect(ui_->buttonBox, &QDialogButtonBox::rejected, this, &QDialog::reject);
+
+  ui_->unwindingMethodComboBox->addItem("DWARF", static_cast<int>(CaptureOptions::kDwarf));
+  ui_->unwindingMethodComboBox->addItem("Frame pointers",
+                                        static_cast<int>(CaptureOptions::kFramePointers));
+  ui_->dynamicInstrumentationMethodComboBox->addItem(
+      "Kernel (Uprobes)", static_cast<int>(CaptureOptions::kKernelUprobes));
+  ui_->dynamicInstrumentationMethodComboBox->addItem(
+      "Orbit", static_cast<int>(CaptureOptions::kUserSpaceInstrumentation));
+  if (!absl::GetFlag(FLAGS_devmode)) {
+    // TODO(b/198748597): Don't hide samplingCheckBox once disabling sampling completely is exposed.
+    ui_->samplingCheckBox->hide();
+    ui_->unwindingMethodWidget->hide();
+    ui_->schedulerCheckBox->hide();
+    ui_->gpuSubmissionsCheckBox->hide();
+    ui_->introspectionCheckBox->hide();
+  }
 
   ui_->localMarkerDepthLineEdit->setValidator(&uint64_validator_);
   ui_->memorySamplingPeriodMsLineEdit->setValidator(new UInt64Validator(1));
@@ -32,22 +55,54 @@ CaptureOptionsDialog::CaptureOptionsDialog(QWidget* parent)
     ui_->memoryWarningThresholdKbLabel->hide();
     ui_->memoryWarningThresholdKbLineEdit->hide();
   }
+}
 
-  if (!absl::GetFlag(FLAGS_devmode)) {
-    ui_->introspectionCheckBox->hide();
-  }
+void CaptureOptionsDialog::SetEnableSampling(bool enable_sampling) {
+  ui_->samplingCheckBox->setChecked(enable_sampling);
+}
 
-  if (absl::GetFlag(FLAGS_devmode)) {
-    ui_->userspaceCheckBox->show();
-  }
+bool CaptureOptionsDialog::GetEnableSampling() const { return ui_->samplingCheckBox->isChecked(); }
+
+void CaptureOptionsDialog::SetSamplingPeriodMs(double sampling_period_ms) {
+  ui_->samplingPeriodMsDoubleSpinBox->setValue(sampling_period_ms);
+}
+
+double CaptureOptionsDialog::GetSamplingPeriodMs() const {
+  return ui_->samplingPeriodMsDoubleSpinBox->value();
+}
+
+void CaptureOptionsDialog::SetUnwindingMethod(UnwindingMethod unwinding_method) {
+  int index = ui_->unwindingMethodComboBox->findData(static_cast<int>(unwinding_method));
+  CHECK(index >= 0);
+  return ui_->unwindingMethodComboBox->setCurrentIndex(index);
+}
+
+UnwindingMethod CaptureOptionsDialog::GetUnwindingMethod() const {
+  return static_cast<UnwindingMethod>(ui_->unwindingMethodComboBox->currentData().toInt());
+}
+
+void CaptureOptionsDialog::SetCollectSchedulerInfo(bool collect_scheduler_info) {
+  ui_->schedulerCheckBox->setChecked(collect_scheduler_info);
+}
+
+bool CaptureOptionsDialog::GetCollectSchedulerInfo() const {
+  return ui_->schedulerCheckBox->isChecked();
+}
+
+void CaptureOptionsDialog::SetCollectThreadStates(bool collect_thread_state) {
+  ui_->threadStateCheckBox->setChecked(collect_thread_state);
 }
 
 bool CaptureOptionsDialog::GetCollectThreadStates() const {
   return ui_->threadStateCheckBox->isChecked();
 }
 
-void CaptureOptionsDialog::SetCollectThreadStates(bool collect_thread_state) {
-  ui_->threadStateCheckBox->setChecked(collect_thread_state);
+void CaptureOptionsDialog::SetTraceGpuSubmissions(bool trace_gpu_submissions) {
+  ui_->gpuSubmissionsCheckBox->setChecked(trace_gpu_submissions);
+}
+
+bool CaptureOptionsDialog::GetTraceGpuSubmissions() const {
+  return ui_->gpuSubmissionsCheckBox->isChecked();
 }
 
 void CaptureOptionsDialog::SetEnableApi(bool enable_api) {
@@ -56,20 +111,23 @@ void CaptureOptionsDialog::SetEnableApi(bool enable_api) {
 
 bool CaptureOptionsDialog::GetEnableApi() const { return ui_->apiCheckBox->isChecked(); }
 
+void CaptureOptionsDialog::SetDynamicInstrumentationMethod(DynamicInstrumentationMethod method) {
+  const int index = ui_->dynamicInstrumentationMethodComboBox->findData(static_cast<int>(method));
+  CHECK(index >= 0);
+  ui_->dynamicInstrumentationMethodComboBox->setCurrentIndex(index);
+}
+
+DynamicInstrumentationMethod CaptureOptionsDialog::GetDynamicInstrumentationMethod() const {
+  return static_cast<DynamicInstrumentationMethod>(
+      ui_->dynamicInstrumentationMethodComboBox->currentData().toInt());
+}
+
 void CaptureOptionsDialog::SetEnableIntrospection(bool enable_introspection) {
   ui_->introspectionCheckBox->setChecked(enable_introspection);
 }
 
 bool CaptureOptionsDialog::GetEnableIntrospection() const {
   return ui_->introspectionCheckBox->isChecked();
-}
-
-void CaptureOptionsDialog::SetEnableUserSpaceInstrumentation(bool enable) {
-  ui_->userspaceCheckBox->setChecked(enable);
-}
-
-bool CaptureOptionsDialog::GetEnableUserSpaceInstrumentation() const {
-  return ui_->userspaceCheckBox->isChecked();
 }
 
 void CaptureOptionsDialog::SetLimitLocalMarkerDepthPerCommandBuffer(

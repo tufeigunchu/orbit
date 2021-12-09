@@ -15,7 +15,9 @@ target_include_directories(LinuxTracing PRIVATE
         ${CMAKE_CURRENT_LIST_DIR})
 
 target_sources(LinuxTracing PUBLIC
-        include/LinuxTracing/Tracer.h)
+        include/LinuxTracing/Tracer.h
+        include/LinuxTracing/TracerListener.h
+        include/LinuxTracing/UserSpaceInstrumentationAddresses.h)
 
 target_sources(LinuxTracing PRIVATE
         ContextSwitchManager.cpp
@@ -37,6 +39,8 @@ target_sources(LinuxTracing PRIVATE
         PerfEvent.h
         PerfEventOpen.cpp
         PerfEventOpen.h
+        PerfEventOrderedStream.cpp
+        PerfEventOrderedStream.h
         PerfEventProcessor.cpp
         PerfEventProcessor.h
         PerfEventQueue.cpp
@@ -52,8 +56,8 @@ target_sources(LinuxTracing PRIVATE
         ThreadStateManager.cpp
         ThreadStateManager.h
         Tracer.cpp
-        TracerThread.cpp
-        TracerThread.h
+        TracerImpl.cpp
+        TracerImpl.h
         UprobesFunctionCallManager.h
         UprobesReturnAddressManager.h
         UprobesUnwindingVisitor.cpp
@@ -62,11 +66,10 @@ target_sources(LinuxTracing PRIVATE
 target_link_libraries(LinuxTracing PUBLIC
         GrpcProtos
         Introspection
+        libunwindstack
         ObjectUtils
         OrbitBase
-        TracingInterface
-        CONAN_PKG::abseil
-        CONAN_PKG::libunwindstack)
+        CONAN_PKG::abseil)
 
 add_executable(LinuxTracingTests)
 
@@ -76,8 +79,10 @@ target_sources(LinuxTracingTests PRIVATE
         LeafFunctionCallManagerTest.cpp
         LinuxTracingUtilsTest.cpp
         LostAndDiscardedEventVisitorTest.cpp
+        MockTracerListener.h
         PerfEventProcessorTest.cpp
         PerfEventQueueTest.cpp
+        SwitchesStatesNamesVisitorTest.cpp
         ThreadStateManagerTest.cpp
         UprobesFunctionCallManagerTest.cpp
         UprobesReturnAddressManagerTest.cpp
@@ -85,7 +90,6 @@ target_sources(LinuxTracingTests PRIVATE
 
 target_link_libraries(LinuxTracingTests PRIVATE
         LinuxTracing
-        TracingInterface
         GTest::GTest
         GTest::Main)
 

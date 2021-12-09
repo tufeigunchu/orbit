@@ -19,7 +19,7 @@ readonly SCRIPT="/mnt/third_party/conan/scripts/build_and_upload_dependencies.sh
 export CONAN_USE_ALWAYS_SHORT_PATHS=1
 
 if [[ -v IN_DOCKER ]]; then
-  pip3 install conan==1.36.0
+  pip3 install conan==1.40.3
   export QT_QPA_PLATFORM=offscreen
 
   if [[ -v ORBIT_PUBLIC_BUILD ]]; then
@@ -100,6 +100,8 @@ else
              -e ORBIT_OVERRIDE_ARTIFACTORY_URL \
              -e IN_DOCKER \
              -e ORBIT_PUBLIC_BUILD \
+             `# Needed to call process_vm_readv. The CI's seccomp profile doesn't work here due to a different docker version` \
+             --security-opt "seccomp=unconfined" \
              `find_container_for_conan_profile $profile` \
              $SCRIPT $profile || exit $?
     done

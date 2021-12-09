@@ -7,6 +7,7 @@ cmake_minimum_required(VERSION 3.15)
 add_library(DataViews STATIC)
 
 target_sources(DataViews PRIVATE
+        CallstackDataView.cpp
         CompareAscendingOrDescending.h
         DataView.cpp
         DataViewUtils.h
@@ -14,10 +15,13 @@ target_sources(DataViews PRIVATE
         FunctionsDataView.cpp
         LiveFunctionsDataView.cpp
         ModulesDataView.cpp
-        PresetsDataView.cpp)
+        PresetsDataView.cpp
+        SamplingReportDataView.cpp
+        TracepointsDataView.cpp)
 
 target_sources(DataViews PUBLIC
         include/DataViews/AppInterface.h
+        include/DataViews/CallstackDataView.h
         include/DataViews/DataView.h
         include/DataViews/DataViewType.h
         include/DataViews/FunctionsDataView.h
@@ -25,7 +29,10 @@ target_sources(DataViews PUBLIC
         include/DataViews/LiveFunctionsInterface.h
         include/DataViews/ModulesDataView.h
         include/DataViews/PresetsDataView.h
-        include/DataViews/PresetLoadState.h)
+        include/DataViews/PresetLoadState.h
+        include/DataViews/SamplingReportDataView.h        
+        include/DataViews/SamplingReportInterface.h
+        include/DataViews/TracepointsDataView.h)
 
 target_include_directories(DataViews PUBLIC include/)
 target_link_libraries(DataViews PUBLIC
@@ -40,13 +47,18 @@ target_link_libraries(DataViews PUBLIC
         CONAN_PKG::abseil)
 
 add_executable(DataViewsTests)
-target_sources(DataViewsTests PRIVATE DataViewTest.cpp
+target_sources(DataViewsTests PRIVATE CallstackDataViewTest.cpp
+                                      DataViewTest.cpp
+                                      DataViewTestUtils.h
+                                      DataViewTestUtils.cpp
                                       DataViewUtilsTest.cpp
                                       FunctionsDataViewTest.cpp
                                       LiveFunctionsDataViewTest.cpp
                                       MockAppInterface.h
                                       ModulesDataViewTest.cpp
-                                      PresetsDataViewTest.cpp)
+                                      PresetsDataViewTest.cpp
+                                      SamplingReportDataViewTest.cpp
+                                      TracepointsDataViewTest.cpp)
 target_link_libraries(DataViewsTests PRIVATE
         DataViews
         TestUtils

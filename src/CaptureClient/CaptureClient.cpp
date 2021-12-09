@@ -15,16 +15,16 @@
 #include <type_traits>
 #include <utility>
 
+#include "ApiUtils/GetFunctionTableAddressPrefix.h"
 #include "CaptureClient/CaptureEventProcessor.h"
 #include "CaptureClient/CaptureListener.h"
 #include "ClientData/FunctionUtils.h"
 #include "ClientData/ModuleData.h"
+#include "GrpcProtos/tracepoint.pb.h"
 #include "Introspection/Introspection.h"
 #include "OrbitBase/Future.h"
 #include "OrbitBase/Logging.h"
 #include "OrbitBase/Result.h"
-#include "capture.pb.h"
-#include "tracepoint.pb.h"
 
 namespace orbit_capture_client {
 
@@ -40,7 +40,9 @@ using orbit_grpc_protos::CaptureResponse;
 using orbit_grpc_protos::ClientCaptureEvent;
 using orbit_grpc_protos::InstrumentedFunction;
 using orbit_grpc_protos::TracepointInfo;
-using orbit_grpc_protos::UnwindingMethod;
+using DynamicInstrumentationMethod =
+    orbit_grpc_protos::CaptureOptions::DynamicInstrumentationMethod;
+using UnwindingMethod = orbit_grpc_protos::CaptureOptions::UnwindingMethod;
 
 using orbit_base::Future;
 
@@ -52,8 +54,9 @@ Future<ErrorMessageOr<CaptureListener::CaptureOutcome>> CaptureClient::Capture(
     bool record_return_values, TracepointInfoSet selected_tracepoints, double samples_per_second,
     uint16_t stack_dump_size, UnwindingMethod unwinding_method, bool collect_scheduling_info,
     bool collect_thread_state, bool collect_gpu_jobs, bool enable_api, bool enable_introspection,
-    bool enable_user_space_instrumentation, uint64_t max_local_marker_depth_per_command_buffer,
-    bool collect_memory_info, uint64_t memory_sampling_period_ms,
+    DynamicInstrumentationMethod dynamic_instrumentation_method,
+    uint64_t max_local_marker_depth_per_command_buffer, bool collect_memory_info,
+    uint64_t memory_sampling_period_ms,
     std::unique_ptr<CaptureEventProcessor> capture_event_processor) {
   absl::MutexLock lock(&state_mutex_);
   if (state_ != State::kStopped) {
@@ -70,14 +73,14 @@ Future<ErrorMessageOr<CaptureListener::CaptureOutcome>> CaptureClient::Capture(
        record_arguments, record_return_values,
        selected_tracepoints = std::move(selected_tracepoints), samples_per_second, stack_dump_size,
        unwinding_method, collect_scheduling_info, collect_thread_state, collect_gpu_jobs,
-       enable_api, enable_introspection, enable_user_space_instrumentation,
+       enable_api, enable_introspection, dynamic_instrumentation_method,
        max_local_marker_depth_per_command_buffer, collect_memory_info, memory_sampling_period_ms,
        capture_event_processor = std::move(capture_event_processor)]() mutable {
         return CaptureSync(process_id, module_manager, selected_functions, record_arguments,
                            record_return_values, selected_tracepoints, samples_per_second,
                            stack_dump_size, unwinding_method, collect_scheduling_info,
                            collect_thread_state, collect_gpu_jobs, enable_api, enable_introspection,
-                           enable_user_space_instrumentation,
+                           dynamic_instrumentation_method,
                            max_local_marker_depth_per_command_buffer, collect_memory_info,
                            memory_sampling_period_ms, capture_event_processor.get());
       });
@@ -91,20 +94,27 @@ Future<ErrorMessageOr<CaptureListener::CaptureOutcome>> CaptureClient::Capture(
 // the Api after having injected liborbit.so.
 [[nodiscard]] static std::vector<ApiFunction> FindApiFunctions(
     const orbit_client_data::ModuleManager& module_manager) {
+  // We have a different function name for each supported platform.
+  static const std::vector<std::string> kOrbitApiGetFunctionTableAddressPrefixes{
+      orbit_api_utils::kOrbitApiGetFunctionTableAddressPrefix,
+      orbit_api_utils::kOrbitApiGetFunctionTableAddressWinPrefix};
   std::vector<ApiFunction> api_functions;
   for (const ModuleData* module_data : module_manager.GetAllModuleData()) {
-    constexpr const char* kOrbitApiGetAddressPrefix = "orbit_api_get_function_table_address_v";
-    for (size_t i = 0; i <= kOrbitApiVersion; ++i) {
-      std::string function_name = absl::StrFormat("%s%u", kOrbitApiGetAddressPrefix, i);
-      const FunctionInfo* function_info = module_data->FindFunctionFromPrettyName(function_name);
-      if (function_info == nullptr) continue;
-      ApiFunction api_function;
-      api_function.set_module_path(function_info->module_path());
-      api_function.set_module_build_id(function_info->module_build_id());
-      api_function.set_address(function_info->address());
-      api_function.set_name(function_name);
-      api_function.set_api_version(i);
-      api_functions.emplace_back(api_function);
+    for (const std::string& orbit_api_get_function_table_address_prefix :
+         kOrbitApiGetFunctionTableAddressPrefixes) {
+      for (size_t i = 0; i <= kOrbitApiVersion; ++i) {
+        std::string function_name =
+            absl::StrFormat("%s%u", orbit_api_get_function_table_address_prefix, i);
+        const FunctionInfo* function_info = module_data->FindFunctionFromPrettyName(function_name);
+        if (function_info == nullptr) continue;
+        ApiFunction api_function;
+        api_function.set_module_path(function_info->module_path());
+        api_function.set_module_build_id(function_info->module_build_id());
+        api_function.set_address(function_info->address());
+        api_function.set_name(function_name);
+        api_function.set_api_version(i);
+        api_functions.emplace_back(api_function);
+      }
     }
   }
   return api_functions;
@@ -116,7 +126,7 @@ ErrorMessageOr<CaptureListener::CaptureOutcome> CaptureClient::CaptureSync(
     bool record_return_values, const TracepointInfoSet& selected_tracepoints,
     double samples_per_second, uint16_t stack_dump_size, UnwindingMethod unwinding_method,
     bool collect_scheduling_info, bool collect_thread_state, bool collect_gpu_jobs, bool enable_api,
-    bool enable_introspection, bool enable_user_space_instrumentation,
+    bool enable_introspection, DynamicInstrumentationMethod dynamic_instrumentation_method,
     uint64_t max_local_marker_depth_per_command_buffer, bool collect_memory_info,
     uint64_t memory_sampling_period_ms, CaptureEventProcessor* capture_event_processor) {
   ORBIT_SCOPE_FUNCTION;
@@ -139,11 +149,8 @@ ErrorMessageOr<CaptureListener::CaptureOutcome> CaptureClient::CaptureSync(
   } else {
     capture_options->set_samples_per_second(samples_per_second);
     capture_options->set_stack_dump_size(stack_dump_size);
-    if (unwinding_method == UnwindingMethod::kFramePointerUnwinding) {
-      capture_options->set_unwinding_method(CaptureOptions::kFramePointers);
-    } else {
-      capture_options->set_unwinding_method(CaptureOptions::kDwarf);
-    }
+    CHECK(unwinding_method != CaptureOptions::kUndefined);
+    capture_options->set_unwinding_method(unwinding_method);
   }
 
   capture_options->set_collect_memory_info(collect_memory_info);
@@ -180,7 +187,9 @@ ErrorMessageOr<CaptureListener::CaptureOutcome> CaptureClient::CaptureSync(
 
   capture_options->set_enable_api(enable_api);
   capture_options->set_enable_introspection(enable_introspection);
-  capture_options->set_enable_user_space_instrumentation(enable_user_space_instrumentation);
+  CHECK(dynamic_instrumentation_method == CaptureOptions::kKernelUprobes ||
+        dynamic_instrumentation_method == CaptureOptions::kUserSpaceInstrumentation);
+  capture_options->set_dynamic_instrumentation_method(dynamic_instrumentation_method);
 
   auto api_functions = FindApiFunctions(module_manager);
   *(capture_options->mutable_api_functions()) = {api_functions.begin(), api_functions.end()};

@@ -12,6 +12,7 @@
 #include <QString>
 #include <QThread>
 #include <QTimer>
+#include <deque>
 #include <memory>
 #include <optional>
 #include <string>
@@ -19,6 +20,10 @@
 #include <system_error>
 
 #include "DeploymentConfigurations.h"
+#include "MetricsUploader/MetricsUploader.h"
+#include "OrbitBase/AnyInvocable.h"
+#include "OrbitBase/Future.h"
+#include "OrbitBase/Promise.h"
 #include "OrbitBase/Result.h"
 #include "OrbitSsh/Context.h"
 #include "OrbitSsh/Credentials.h"
@@ -44,10 +49,12 @@ class ServiceDeployManager : public QObject {
 
   ~ServiceDeployManager() override;
 
-  outcome::result<GrpcPort> Exec();
+  outcome::result<GrpcPort> Exec(
+      orbit_metrics_uploader::MetricsUploader* metrics_uploader = nullptr);
 
   // This method copies remote source file to local destination.
-  ErrorMessageOr<void> CopyFileToLocal(std::string source, std::string destination);
+  orbit_base::Future<ErrorMessageOr<void>> CopyFileToLocal(std::string source,
+                                                           std::string destination);
 
   void Shutdown();
   void Cancel();
@@ -84,19 +91,25 @@ class ServiceDeployManager : public QObject {
       const BareExecutableAndRootPasswordDeployment& config);
   outcome::result<uint16_t> StartTunnel(std::optional<orbit_ssh_qt::Tunnel>* tunnel, uint16_t port);
   outcome::result<std::unique_ptr<orbit_ssh_qt::SftpChannel>> StartSftpChannel();
-  outcome::result<void> StopSftpChannel(orbit_ssh_qt::SftpChannel* sftp_channel);
+  outcome::result<void> ShutdownSftpChannel(orbit_ssh_qt::SftpChannel* sftp_channel);
+  outcome::result<void> ShutdownTunnel(orbit_ssh_qt::Tunnel* tunnel);
+  outcome::result<void> ShutdownTask(orbit_ssh_qt::Task* task);
+  outcome::result<void> ShutdownSession(orbit_ssh_qt::Session* session);
   outcome::result<void> CopyFileToRemote(
       const std::string& source, const std::string& dest,
       orbit_ssh_qt::SftpCopyToRemoteOperation::FileMode dest_mode);
 
-  ErrorMessageOr<void> CopyFileToLocalImpl(std::string_view source, std::string_view destination);
+  // TODO(http://b/209807583): With our current integration of libssh2 we can only ever have one
+  // copy operation at the same time, so we have a bool indicating an ongoing operation and a queue
+  // with waiting operations. Since this all happens in one thread, no synchronization is needed.
+  bool copy_file_operation_in_progress_ = false;
+  std::deque<orbit_base::AnyInvocable<void()>> waiting_copy_operations_;
+
+  void CopyFileToLocalImpl(orbit_base::Promise<ErrorMessageOr<void>> promise,
+                           std::string_view source, std::string_view destination);
   outcome::result<GrpcPort> ExecImpl();
 
   void StartWatchdog();
-  void StopSftpChannel();
-  void ShutdownSession();
-  void ShutdownOrbitService();
-  void ShutdownTunnel(std::optional<orbit_ssh_qt::Tunnel>*);
 
   void handleSocketError(std::error_code);
 };

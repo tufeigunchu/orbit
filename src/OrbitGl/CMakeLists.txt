@@ -20,8 +20,6 @@ target_sources(
          AsyncTrack.h
          BasicPageFaultsTrack.h
          Batcher.h
-         BlockChain.h
-         CallstackDataView.h
          CallstackThreadBar.h
          CallTreeView.h
          CaptureStats.h
@@ -53,11 +51,10 @@ target_sources(
          PageFaultsTrack.h
          PickingManager.h
          SamplingReport.h
-         SamplingReportDataView.h
          SchedulerTrack.h
          SchedulingStats.h
-         ScopeTree.h
          ShortenStringWithEllipsis.h
+         SimpleTimings.h
          StatusListener.h
          SystemMemoryTrack.h
          TextRenderer.h
@@ -66,15 +63,16 @@ target_sources(
          ThreadTrack.h
          TimeGraph.h
          TimeGraphLayout.h
+         TimelineInfoInterface.h
          Timer.h
          TimerInfosIterator.h
          TimerTrack.h
          Track.h
          TrackManager.h
          TriangleToggle.h
-         TracepointsDataView.h
          TracepointThreadBar.h
          TrackTestData.h
+         TranslationStack.h
          VariableTrack.h
          Viewport.h)
 
@@ -91,14 +89,12 @@ target_sources(
           AsyncTrack.cpp
           BasicPageFaultsTrack.cpp
           Batcher.cpp
-          CallstackDataView.cpp
           CallstackThreadBar.cpp
           CallTreeView.cpp
           CaptureStats.cpp
           CaptureViewElement.cpp
           CaptureWindow.cpp
           CGroupAndProcessMemoryTrack.cpp
-          CompareAscendingOrDescending.h
           FramePointerValidatorClient.cpp
           FrameTrack.cpp
           FrameTrackOnlineProcessor.cpp
@@ -120,9 +116,9 @@ target_sources(
           PageFaultsTrack.cpp
           PickingManager.cpp
           SamplingReport.cpp
-          SamplingReportDataView.cpp
           SchedulerTrack.cpp
           SchedulingStats.cpp
+          SimpleTimings.cpp
           SystemMemoryTrack.cpp
           TextRenderer.cpp
           TimeGraph.cpp
@@ -134,8 +130,8 @@ target_sources(
           ThreadTrack.cpp
           Track.cpp
           TrackManager.cpp
+          TranslationStack.cpp
           TriangleToggle.cpp
-          TracepointsDataView.cpp
           TracepointThreadBar.cpp
           TrackTestData.cpp
           Viewport.cpp)
@@ -151,10 +147,10 @@ target_link_libraries(
          ClientModel
          ClientServices
          CodeReport
+         Containers
          DataViews
          DisplayFormats
          GrpcProtos
-         Introspection
          MetricsUploader
          OrbitAccessibility
          OrbitPaths
@@ -183,23 +179,28 @@ endif()
 add_executable(OrbitGlTests)
 
 target_sources(OrbitGlTests PRIVATE
+               CaptureViewElementTester.h
                PickingManagerTest.h
                UnitTestSlider.h)
 
 target_sources(OrbitGlTests PRIVATE
                BatcherTest.cpp
-               BlockChainTest.cpp
                CaptureStatsTest.cpp
+               CaptureViewElementTest.cpp
+               CaptureViewElementTester.cpp
                CaptureWindowTest.cpp
                GlUtilsTest.cpp
                GpuTrackTest.cpp
                MultivariateTimeSeriesTest.cpp
+               PageFaultsTrackTest.cpp
                PickingManagerTest.cpp
                ScopedStatusTest.cpp
-               ScopeTreeTest.cpp
+               SimpleTimingsTest.cpp
                SliderTest.cpp
                ShortenStringWithEllipsisTest.cpp
                TimerInfosIteratorTest.cpp
+               TranslationStackTest.cpp
+               ThreadTrackTest.cpp
                TrackManagerTest.cpp
                ViewportTest.cpp)
 

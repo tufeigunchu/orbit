@@ -17,9 +17,9 @@
 #include <utility>
 #include <vector>
 
-#include "CaptureEventProducer/FakeProducerSideService.h"
 #include "CaptureEventProducer/LockFreeBufferCaptureEventProducer.h"
-#include "capture.pb.h"
+#include "FakeProducerSideService/FakeProducerSideService.h"
+#include "GrpcProtos/capture.pb.h"
 
 namespace orbit_capture_event_producer {
 
@@ -68,12 +68,12 @@ class LockFreeBufferCaptureEventProducerTest : public ::testing::Test {
     fake_server_.reset();
   }
 
-  std::optional<FakeProducerSideService> fake_service_;
+  std::optional<orbit_fake_producer_side_service::FakeProducerSideService> fake_service_;
   std::unique_ptr<grpc::Server> fake_server_;
   std::optional<LockFreeBufferCaptureEventProducerImpl> buffer_producer_;
 };
 
-constexpr std::chrono::duration kWaitMessagesSentDuration = std::chrono::milliseconds(25);
+constexpr std::chrono::milliseconds kWaitMessagesSentDuration{25};
 
 }  // namespace
 

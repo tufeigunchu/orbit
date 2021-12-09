@@ -5,8 +5,9 @@
 #ifndef LINUX_TRACING_LEAF_FUNCTION_CALL_MANAGER_H_
 #define LINUX_TRACING_LEAF_FUNCTION_CALL_MANAGER_H_
 
-#include <capture.pb.h>
+#include <stdint.h>
 
+#include "GrpcProtos/capture.pb.h"
 #include "LibunwindstackMaps.h"
 #include "LibunwindstackUnwinder.h"
 #include "PerfEvent.h"
@@ -33,7 +34,7 @@ class LeafFunctionCallManager {
   // Note that the address of the caller address is computed by decreasing the return address by
   // one in libunwindstack, to match the format of perf_event_open.
   virtual orbit_grpc_protos::Callstack::CallstackType PatchCallerOfLeafFunction(
-      CallchainSamplePerfEvent* event, LibunwindstackMaps* current_maps,
+      const CallchainSamplePerfEventData* event_data, LibunwindstackMaps* current_maps,
       LibunwindstackUnwinder* unwinder);
 
  private:

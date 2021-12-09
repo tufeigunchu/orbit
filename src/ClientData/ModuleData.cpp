@@ -9,10 +9,10 @@
 #include <algorithm>
 
 #include "ClientData/FunctionUtils.h"
+#include "ClientProtos/capture_data.pb.h"
+#include "GrpcProtos/module.pb.h"
 #include "OrbitBase/Logging.h"
 #include "absl/synchronization/mutex.h"
-#include "capture_data.pb.h"
-#include "module.pb.h"
 
 using orbit_client_protos::FunctionInfo;
 using orbit_grpc_protos::ModuleInfo;
@@ -34,6 +34,7 @@ bool ModuleData::UpdateIfChangedAndUnload(ModuleInfo info) {
 
   CHECK(file_path() == info.file_path());
   CHECK(build_id() == info.build_id());
+  CHECK(object_file_type() == info.object_file_type());
 
   if (!NeedsUpdate(info)) return false;
 
@@ -61,6 +62,7 @@ bool ModuleData::UpdateIfChangedAndNotLoaded(orbit_grpc_protos::ModuleInfo info)
 
   CHECK(file_path() == info.file_path());
   CHECK(build_id() == info.build_id());
+  CHECK(object_file_type() == info.object_file_type());
 
   if (!NeedsUpdate(info)) return true;
 
@@ -99,16 +101,6 @@ const FunctionInfo* ModuleData::FindFunctionByElfAddress(uint64_t elf_address,
   if (function->address() + function->size() < elf_address) return nullptr;
 
   return function;
-}
-
-void ModuleData::AddFunctionInfoWithBuildId(const FunctionInfo& function_info,
-                                            const std::string& module_build_id) {
-  absl::MutexLock lock(&mutex_);
-  CHECK(functions_.find(function_info.address()) == functions_.end());
-  auto value = std::make_unique<FunctionInfo>(function_info);
-  value->set_module_build_id(module_build_id);
-  functions_.insert_or_assign(function_info.address(), std::move(value));
-  is_loaded_ = true;
 }
 
 void ModuleData::AddSymbols(const orbit_grpc_protos::ModuleSymbols& module_symbols) {

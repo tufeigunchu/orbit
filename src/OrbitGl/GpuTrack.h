@@ -12,6 +12,7 @@
 #include <string_view>
 
 #include "CallstackThreadBar.h"
+#include "ClientProtos/capture_data.pb.h"
 #include "CoreMath.h"
 #include "GpuDebugMarkerTrack.h"
 #include "GpuSubmissionTrack.h"
@@ -19,7 +20,6 @@
 #include "TimerTrack.h"
 #include "Track.h"
 #include "Viewport.h"
-#include "capture_data.pb.h"
 
 class OrbitApp;
 class TextRenderer;
@@ -36,11 +36,12 @@ std::string MapGpuTimelineToTrackLabel(std::string_view timeline);
 // subtracks to display "submission" related information, as well as "debug markers" (if present).
 class GpuTrack : public Track {
  public:
-  explicit GpuTrack(CaptureViewElement* parent, TimeGraph* time_graph, orbit_gl::Viewport* viewport,
-                    TimeGraphLayout* layout, uint64_t timeline_hash, OrbitApp* app,
-                    const orbit_client_data::CaptureData* capture_data,
-                    orbit_client_data::TrackData* submission_track_data,
-                    orbit_client_data::TrackData* marker_track_data);
+  explicit GpuTrack(CaptureViewElement* parent,
+                    const orbit_gl::TimelineInfoInterface* timeline_info,
+                    orbit_gl::Viewport* viewport, TimeGraphLayout* layout, uint64_t timeline_hash,
+                    OrbitApp* app, const orbit_client_data::CaptureData* capture_data,
+                    orbit_client_data::TimerData* submission_timer_data,
+                    orbit_client_data::TimerData* marker_timer_data);
 
   void OnTimer(const orbit_client_protos::TimerInfo& timer_info) override;
 
@@ -64,12 +65,7 @@ class GpuTrack : public Track {
   [[nodiscard]] std::string GetTooltip() const override;
   [[nodiscard]] float GetHeight() const override;
 
-  void Draw(Batcher& batcher, TextRenderer& text_renderer,
-            const DrawContext& draw_context) override;
-  void UpdatePrimitives(Batcher* batcher, uint64_t min_tick, uint64_t max_tick,
-                        PickingMode picking_mode, float z_offset = 0) override;
-  void SetWidth(float width) override;
-  [[nodiscard]] std::vector<CaptureViewElement*> GetVisibleChildren() override;
+  [[nodiscard]] std::vector<CaptureViewElement*> GetAllChildren() const override;
 
   [[nodiscard]] bool IsEmpty() const override {
     return submission_track_->IsEmpty() && marker_track_->IsEmpty();

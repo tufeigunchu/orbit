@@ -12,33 +12,48 @@
 #include <string>
 
 #include "CallstackThreadBar.h"
+#include "ClientData/ThreadTrackDataProvider.h"
+#include "ClientProtos/capture_data.pb.h"
+#include "Containers/ScopeTree.h"
 #include "CoreMath.h"
 #include "PickingManager.h"
-#include "ScopeTree.h"
 #include "ThreadStateBar.h"
 #include "TimerTrack.h"
 #include "TracepointThreadBar.h"
 #include "Track.h"
 #include "Viewport.h"
-#include "capture_data.pb.h"
 
 class OrbitApp;
 
 class ThreadTrack final : public TimerTrack {
  public:
   enum class ScopeTreeUpdateType { kAlways, kOnCaptureComplete, kNever };
-  explicit ThreadTrack(CaptureViewElement* parent, TimeGraph* time_graph,
+  explicit ThreadTrack(CaptureViewElement* parent,
+                       const orbit_gl::TimelineInfoInterface* timeline_info,
                        orbit_gl::Viewport* viewport, TimeGraphLayout* layout, uint32_t thread_id,
                        OrbitApp* app, const orbit_client_data::CaptureData* capture_data,
-                       orbit_client_data::TrackData* track_data,
-                       ScopeTreeUpdateType scope_tree_update_type);
-
-  void InitializeNameAndLabel();
+                       orbit_client_data::ThreadTrackDataProvider* thread_track_data_provider);
 
   [[nodiscard]] std::string GetName() const override;
   [[nodiscard]] std::string GetLabel() const override;
   [[nodiscard]] int GetNumberOfPrioritizedTrailingCharacters() const override;
   [[nodiscard]] Type GetType() const override { return Type::kThreadTrack; }
+
+  [[nodiscard]] uint32_t GetDepth() const override {
+    return thread_track_data_provider_->GetDepth(thread_id_);
+  }
+  [[nodiscard]] uint32_t GetProcessId() const override {
+    return thread_track_data_provider_->GetProcessId(thread_id_);
+  }
+  [[nodiscard]] size_t GetNumberOfTimers() const override {
+    return thread_track_data_provider_->GetNumberOfTimers(thread_id_);
+  }
+  [[nodiscard]] uint64_t GetMinTime() const override {
+    return thread_track_data_provider_->GetMinTime(thread_id_);
+  }
+  [[nodiscard]] uint64_t GetMaxTime() const override {
+    return thread_track_data_provider_->GetMaxTime(thread_id_);
+  }
   [[nodiscard]] std::string GetTooltip() const override;
 
   [[nodiscard]] const orbit_client_protos::TimerInfo* GetLeft(
@@ -50,11 +65,6 @@ class ThreadTrack final : public TimerTrack {
   [[nodiscard]] const orbit_client_protos::TimerInfo* GetDown(
       const orbit_client_protos::TimerInfo& timer_info) const override;
 
-  void Draw(Batcher& batcher, TextRenderer& text_renderer,
-            const DrawContext& draw_context) override;
-  void UpdatePrimitives(Batcher* batcher, uint64_t min_tick, uint64_t max_tick,
-                        PickingMode picking_mode, float z_offset = 0) override;
-  void SetWidth(float width) override;
   void OnTimer(const orbit_client_protos::TimerInfo& timer_info) override;
   [[nodiscard]] float GetYFromDepth(uint32_t depth) const override;
 
@@ -62,19 +72,26 @@ class ThreadTrack final : public TimerTrack {
 
   [[nodiscard]] bool IsEmpty() const override;
 
-  [[nodiscard]] std::vector<CaptureViewElement*> GetVisibleChildren() override;
+  [[nodiscard]] std::vector<const orbit_client_data::TimerChain*> GetChains() const {
+    return thread_track_data_provider_->GetChains(thread_id_);
+  }
 
-  void OnCaptureComplete();
+  [[nodiscard]] bool IsCollapsible() const override { return GetDepth() > 1; }
+
+  [[nodiscard]] std::vector<CaptureViewElement*> GetAllChildren() const override;
 
  protected:
-  [[nodiscard]] std::string GetThreadNameFromTid(uint32_t tid);
+  void DoUpdatePrimitives(Batcher& batcher, TextRenderer& text_renderer, uint64_t min_tick,
+                          uint64_t max_tick, PickingMode picking_mode) override;
+
   [[nodiscard]] int64_t GetThreadId() const { return thread_id_; }
   [[nodiscard]] bool IsTimerActive(const orbit_client_protos::TimerInfo& timer) const override;
   [[nodiscard]] bool IsTrackSelected() const override;
 
   [[nodiscard]] float GetDefaultBoxHeight() const override;
   [[nodiscard]] Color GetTimerColor(const orbit_client_protos::TimerInfo& timer, bool is_selected,
-                                    bool is_highlighted) const override;
+                                    bool is_highlighted,
+                                    const internal::DrawData& draw_data) const override;
   [[nodiscard]] Color GetTimerColor(const orbit_client_protos::TimerInfo& timer_info,
                                     const internal::DrawData& draw_data);
   [[nodiscard]] std::string GetTimesliceText(
@@ -85,9 +102,6 @@ class ThreadTrack final : public TimerTrack {
   [[nodiscard]] float GetHeaderHeight() const override;
 
   void UpdatePositionOfSubtracks() override;
-  void UpdatePrimitivesOfSubtracks(Batcher* batcher, uint64_t min_tick, uint64_t max_tick,
-                                   PickingMode picking_mode, float z_offset);
-  void UpdateMinMaxTimestamps();
 
   int64_t thread_id_;
 
@@ -95,9 +109,7 @@ class ThreadTrack final : public TimerTrack {
   std::shared_ptr<orbit_gl::CallstackThreadBar> event_bar_;
   std::shared_ptr<orbit_gl::TracepointThreadBar> tracepoint_bar_;
 
-  absl::Mutex scope_tree_mutex_;
-  ScopeTree<const orbit_client_protos::TimerInfo> scope_tree_;
-  ScopeTreeUpdateType scope_tree_update_type_ = ScopeTreeUpdateType::kAlways;
+  orbit_client_data::ThreadTrackDataProvider* thread_track_data_provider_;
 };
 
 #endif  // ORBIT_GL_THREAD_TRACK_H_

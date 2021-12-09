@@ -22,6 +22,7 @@
 #include "OrbitBase/ThreadUtils.h"
 #include "OrbitBase/UniqueResource.h"
 #include "Trampoline.h"
+#include "UserSpaceInstrumentation/AddressRange.h"
 #include "UserSpaceInstrumentation/Attach.h"
 #include "UserSpaceInstrumentation/ExecuteInProcess.h"
 #include "UserSpaceInstrumentation/InjectLibraryInTracee.h"
@@ -33,6 +34,12 @@ namespace {
 using orbit_grpc_protos::CaptureOptions;
 using orbit_grpc_protos::ModuleInfo;
 
+/* copybara:insert(In internal tests the library path depends on the current path)
+// Since some part could potentially change the current working directory we store
+// the initial value here.
+const std::filesystem::path initial_current_path = std::filesystem::current_path();
+*/
+
 ErrorMessageOr<std::filesystem::path> GetLibraryPath() {
   // When packaged, liborbituserspaceinstrumentation.so is found alongside OrbitService. In
   // development, it is found in "../lib", relative to OrbitService.
@@ -40,6 +47,10 @@ ErrorMessageOr<std::filesystem::path> GetLibraryPath() {
   const std::filesystem::path exe_dir = orbit_base::GetExecutableDir();
   std::vector<std::filesystem::path> potential_paths = {exe_dir / kLibName,
                                                         exe_dir / ".." / "lib" / kLibName};
+  /* copybara:insert(In internal tests the library is in a different place)
+  potential_paths.emplace_back(initial_current_path /
+  "@@LIB_ORBIT_USER_SPACE_INSTRUMENTATION_PATH@@");
+  */
   for (const auto& path : potential_paths) {
     if (std::filesystem::exists(path)) {
       return path;
@@ -73,9 +84,11 @@ class InstrumentedProcess {
   [[nodiscard]] static ErrorMessageOr<std::unique_ptr<InstrumentedProcess>> Create(
       const CaptureOptions& capture_options);
 
-  // Instruments the functions capture_options.instrumented_functions and returns a set of
-  // function_id's of successfully instrumented functions.
-  [[nodiscard]] ErrorMessageOr<absl::flat_hash_set<uint64_t>> InstrumentFunctions(
+  // Instruments the functions capture_options.instrumented_functions. Returns a set of
+  // function_id's of successfully instrumented functions, a map of function_id's to errors for
+  // functions that couldn't be instrumented, the address ranges dedicated to trampolines, and the
+  // map name of the injected library.
+  [[nodiscard]] ErrorMessageOr<InstrumentationManager::InstrumentationResult> InstrumentFunctions(
       const CaptureOptions& capture_options);
 
   // Removes the instrumentation for all functions in capture_options.instrumented_functions that
@@ -101,6 +114,10 @@ class InstrumentedProcess {
   [[nodiscard]] ErrorMessageOr<void> EnsureTrampolinesExecutable();
 
   [[nodiscard]] ErrorMessageOr<std::vector<ModuleInfo>> ModulesFromModulePath(std::string path);
+
+  // Returns a vector of the address ranges dedicated to all entry trampolines for this process. The
+  // number of address ranges is usually very small as kTrampolinesPerChunk is high.
+  [[nodiscard]] std::vector<AddressRange> GetEntryTrampolineAddressRanges();
 
   pid_t pid_ = -1;
 
@@ -133,9 +150,7 @@ class InstrumentedProcess {
   struct TrampolineMemoryChunk {
     TrampolineMemoryChunk() = default;
     TrampolineMemoryChunk(std::unique_ptr<MemoryInTracee> m, int first_available)
-        : first_available(first_available) {
-      memory = std::move(m);
-    }
+        : memory(std::move(m)), first_available(first_available) {}
     std::unique_ptr<MemoryInTracee> memory;
     int first_available = 0;
   };
@@ -149,6 +164,10 @@ class InstrumentedProcess {
   // When instrumenting a function we record the address here. This is used when we uninstrument: we
   // look up the original bytes in `trampoline_map_` above.
   absl::flat_hash_set<uint64_t> addresses_of_instrumented_functions_;
+
+  // The absolute canonical path to the library injected into the target process. This path should
+  // appear in the maps of the target process.
+  std::filesystem::path injected_library_path_;
 };
 
 ErrorMessageOr<std::unique_ptr<InstrumentedProcess>> InstrumentedProcess::Create(
@@ -170,6 +189,8 @@ ErrorMessageOr<std::unique_ptr<InstrumentedProcess>> InstrumentedProcess::Create
                                         library_path_or_error.error().message()));
   }
   const std::filesystem::path library_path = library_path_or_error.value();
+  CHECK(library_path.is_absolute());
+  process->injected_library_path_ = std::filesystem::canonical(library_path);
 
   auto library_handle_or_error = DlopenInTracee(pid, library_path, RTLD_NOW);
   if (library_handle_or_error.has_error()) {
@@ -205,9 +226,9 @@ ErrorMessageOr<std::unique_ptr<InstrumentedProcess>> InstrumentedProcess::Create
   return process;
 }
 
-ErrorMessageOr<absl::flat_hash_set<uint64_t>> InstrumentedProcess::InstrumentFunctions(
-    const CaptureOptions& capture_options) {
-  OUTCOME_TRY(AttachAndStopProcess(pid_));
+ErrorMessageOr<InstrumentationManager::InstrumentationResult>
+InstrumentedProcess::InstrumentFunctions(const CaptureOptions& capture_options) {
+  OUTCOME_TRY(auto&& already_attached_tids, AttachAndStopProcess(pid_));
   orbit_base::unique_resource detach_on_exit{pid_, [](int32_t pid) {
                                                if (DetachAndContinueProcess(pid).has_error()) {
                                                  ERROR("Detaching from %i", pid);
@@ -227,17 +248,22 @@ ErrorMessageOr<absl::flat_hash_set<uint64_t>> InstrumentedProcess::InstrumentFun
       &capstone_handle, [](csh* capstone_handle) { cs_close(capstone_handle); }};
 
   OUTCOME_TRY(ExecuteInProcess(pid_, absl::bit_cast<void*>(start_new_capture_function_address_)));
+  // StartNewFunction could (and will) spawn new threads. Stop those too, as the assumption here is
+  // that the target process is completely stopped.
+  OUTCOME_TRY(AttachAndStopNewThreadsOfProcess(pid_, std::move(already_attached_tids)));
 
   OUTCOME_TRY(EnsureTrampolinesWritable());
 
-  absl::flat_hash_set<uint64_t> instrumented_function_ids;
+  InstrumentationManager::InstrumentationResult result;
   for (const auto& function : capture_options.instrumented_functions()) {
     const uint64_t function_id = function.function_id();
     constexpr uint64_t kMaxFunctionPrologueBackupSize = 20;
     const uint64_t backup_size = std::min(kMaxFunctionPrologueBackupSize, function.function_size());
     if (backup_size == 0) {
-      // Can't instrument function of size zero
-      ERROR("Can't instrument function \"%s\" since it has size zero.", function.function_name());
+      const std::string message = absl::StrFormat(
+          "Can't instrument function \"%s\" since it has size zero.", function.function_name());
+      ERROR("%s", message);
+      result.function_ids_to_error_messages[function_id] = message;
       continue;
     }
     // Get all modules with the right path (usually one, but might be more) and get a function
@@ -264,8 +290,11 @@ ErrorMessageOr<absl::flat_hash_set<uint64_t>> InstrumentedProcess::InstrumentFun
                              entry_payload_function_address_, return_trampoline_address_,
                              capstone_handle, relocation_map_);
         if (address_after_prologue_or_error.has_error()) {
-          ERROR("Failed to create trampoline: %s",
-                address_after_prologue_or_error.error().message());
+          const std::string message = absl::StrFormat(
+              "Can't instrument function \"%s\". Failed to create trampoline: %s",
+              function.function_name(), address_after_prologue_or_error.error().message());
+          ERROR("%s", message);
+          result.function_ids_to_error_messages[function_id] = message;
           OUTCOME_TRY(ReleaseMostRecentlyAllocatedTrampolineMemory(module_address_range));
           continue;
         }
@@ -278,24 +307,32 @@ ErrorMessageOr<absl::flat_hash_set<uint64_t>> InstrumentedProcess::InstrumentFun
       }
       const TrampolineData& trampoline_data = it->second;
 
-      auto result = InstrumentFunction(pid_, function_address, function_id,
-                                       trampoline_data.address_after_prologue,
-                                       trampoline_data.trampoline_address);
-      if (result.has_error()) {
-        ERROR("Unable to instrument \"%s\": %s", function.function_name(),
-              result.error().message());
+      auto result_or_error = InstrumentFunction(pid_, function_address, function_id,
+                                                trampoline_data.address_after_prologue,
+                                                trampoline_data.trampoline_address);
+      if (result_or_error.has_error()) {
+        const std::string message =
+            absl::StrFormat("Can't instrument function \"%s\": %s", function.function_name(),
+                            result_or_error.error().message());
+        ERROR("%s", message);
+        result.function_ids_to_error_messages[function_id] = message;
       } else {
         addresses_of_instrumented_functions_.insert(function_address);
-        instrumented_function_ids.insert(function_id);
+        result.instrumented_function_ids.insert(function_id);
       }
     }
   }
+
+  result.entry_trampoline_address_ranges = GetEntryTrampolineAddressRanges();
+  result.return_trampoline_address_range = AddressRange{
+      return_trampoline_address_, return_trampoline_address_ + GetReturnTrampolineSize()};
+  result.injected_library_path = injected_library_path_;
 
   MoveInstructionPointersOutOfOverwrittenCode(pid_, relocation_map_);
 
   OUTCOME_TRY(EnsureTrampolinesExecutable());
 
-  return instrumented_function_ids;
+  return result;
 }
 
 ErrorMessageOr<void> InstrumentedProcess::UninstrumentFunctions() {
@@ -384,6 +421,19 @@ ErrorMessageOr<void> InstrumentedProcess::EnsureTrampolinesExecutable() {
   return outcome::success();
 }
 
+std::vector<AddressRange> InstrumentedProcess::GetEntryTrampolineAddressRanges() {
+  std::vector<AddressRange> address_ranges;
+  for (const auto& [unused_module_address_range, trampoline_memory_chunks] :
+       trampolines_for_modules_) {
+    for (const TrampolineMemoryChunk& trampoline_memory_chunk : trampoline_memory_chunks) {
+      address_ranges.emplace_back(
+          trampoline_memory_chunk.memory->GetAddress(),
+          trampoline_memory_chunk.memory->GetAddress() + trampoline_memory_chunk.memory->GetSize());
+    }
+  }
+  return address_ranges;
+}
+
 std::unique_ptr<InstrumentationManager> InstrumentationManager::Create() {
   static std::mutex mutex;
   std::unique_lock<std::mutex> lock(mutex);
@@ -393,16 +443,16 @@ std::unique_ptr<InstrumentationManager> InstrumentationManager::Create() {
   return std::unique_ptr<InstrumentationManager>(new InstrumentationManager());
 }
 
-InstrumentationManager::~InstrumentationManager() {}
+InstrumentationManager::~InstrumentationManager() = default;
 
-ErrorMessageOr<absl::flat_hash_set<uint64_t>> InstrumentationManager::InstrumentProcess(
-    const CaptureOptions& capture_options) {
+ErrorMessageOr<InstrumentationManager::InstrumentationResult>
+InstrumentationManager::InstrumentProcess(const CaptureOptions& capture_options) {
   const pid_t pid = orbit_base::ToNativeProcessId(capture_options.pid());
 
   // If the user tries to instrument this instance of OrbitService we can't use user space
   // instrumentation: We would need to attach to / stop our own process.
   if (pid == getpid()) {
-    return absl::flat_hash_set<uint64_t>();
+    return InstrumentationResult();
   }
 
   if (!process_map_.contains(pid)) {
@@ -423,10 +473,10 @@ ErrorMessageOr<absl::flat_hash_set<uint64_t>> InstrumentationManager::Instrument
     }
     process_map_.emplace(pid, std::move(process_or_error.value()));
   }
-  OUTCOME_TRY(auto&& instrumented_function_ids,
+  OUTCOME_TRY(auto&& instrumentation_result,
               process_map_[pid]->InstrumentFunctions(capture_options));
 
-  return std::move(instrumented_function_ids);
+  return std::move(instrumentation_result);
 }
 
 ErrorMessageOr<void> InstrumentationManager::UninstrumentProcess(pid_t pid) {

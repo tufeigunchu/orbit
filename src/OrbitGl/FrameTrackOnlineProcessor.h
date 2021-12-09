@@ -8,12 +8,11 @@
 #include <cstdint>
 
 #include "ClientData/CaptureData.h"
+#include "ClientProtos/capture_data.pb.h"
+#include "GrpcProtos/capture.pb.h"
+#include "TimeGraph.h"
 #include "absl/container/flat_hash_map.h"
 #include "absl/container/flat_hash_set.h"
-#include "capture.pb.h"
-#include "capture_data.pb.h"
-
-class TimeGraph;
 
 namespace orbit_gl {
 

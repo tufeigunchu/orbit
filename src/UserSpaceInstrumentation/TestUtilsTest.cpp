@@ -3,6 +3,7 @@
 // found in the LICENSE file.
 
 #include <gtest/gtest.h>
+#include <sys/prctl.h>
 #include <sys/wait.h>
 
 #include <cstdint>
@@ -11,7 +12,6 @@
 #include <string_view>
 
 #include "AccessTraceesMemory.h"
-#include "AddressRange.h"
 #include "FindFunctionAddress.h"
 #include "ObjectUtils/ElfFile.h"
 #include "ObjectUtils/LinuxMap.h"
@@ -19,6 +19,7 @@
 #include "OrbitBase/Logging.h"
 #include "TestUtils.h"
 #include "TestUtils/TestUtils.h"
+#include "UserSpaceInstrumentation/AddressRange.h"
 #include "UserSpaceInstrumentation/Attach.h"
 
 namespace orbit_user_space_instrumentation {
@@ -34,7 +35,11 @@ TEST(TestUtilTest, Disassemble) {
   pid_t pid = fork();
   CHECK(pid != -1);
   if (pid == 0) {
-    int sum = 0;
+    prctl(PR_SET_PDEATHSIG, SIGTERM);
+
+    // Endless loops without side effects are UB and recent versions of clang optimize
+    // it away. Making `sum` volatile avoids that problem.
+    [[maybe_unused]] volatile int sum = 0;
     while (true) {
       sum += SomethingToDisassemble();
     }
@@ -54,12 +59,12 @@ TEST(TestUtilTest, Disassemble) {
 
   // End child process.
   kill(pid, SIGKILL);
-  waitpid(pid, NULL, 0);
+  waitpid(pid, nullptr, 0);
 }
 
 TEST(TestUtilTest, GetFunctionAddressRangeInFile) {
   constexpr const char* kFunctionName = "SomethingToDisassemble";
-  AddressRange range = GetFunctionRelativeAddressRangeOrDie(kFunctionName);
+  AddressRange range = FindFunctionOrDie(kFunctionName).relative_address_range;
   EXPECT_NE(0, range.start);
   EXPECT_LT(range.start, range.end);
 }

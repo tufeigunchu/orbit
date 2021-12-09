@@ -9,7 +9,6 @@
 #include "Geometry.h"
 #include "GrpcProtos/Constants.h"
 #include "TextRenderer.h"
-#include "TimeGraph.h"
 #include "TimeGraphLayout.h"
 #include "Viewport.h"
 
@@ -20,16 +19,17 @@ using orbit_capture_client::CaptureEventProcessor;
 using orbit_grpc_protos::kMissingInfo;
 }  // namespace
 
-PageFaultsTrack::PageFaultsTrack(CaptureViewElement* parent, TimeGraph* time_graph,
+PageFaultsTrack::PageFaultsTrack(CaptureViewElement* parent,
+                                 const orbit_gl::TimelineInfoInterface* timeline_info,
                                  orbit_gl::Viewport* viewport, TimeGraphLayout* layout,
                                  const std::string& cgroup_name, uint64_t memory_sampling_period_ms,
                                  const orbit_client_data::CaptureData* capture_data)
-    : Track(parent, time_graph, viewport, layout, capture_data),
+    : Track(parent, timeline_info, viewport, layout, capture_data),
       major_page_faults_track_{
-          std::make_shared<MajorPageFaultsTrack>(this, time_graph, viewport, layout, cgroup_name,
+          std::make_shared<MajorPageFaultsTrack>(this, timeline_info, viewport, layout, cgroup_name,
                                                  memory_sampling_period_ms, capture_data)},
       minor_page_faults_track_{
-          std::make_shared<MinorPageFaultsTrack>(this, time_graph, viewport, layout, cgroup_name,
+          std::make_shared<MinorPageFaultsTrack>(this, timeline_info, viewport, layout, cgroup_name,
                                                  memory_sampling_period_ms, capture_data)} {
   // PageFaults track is collapsed by default. The major and minor page faults subtracks are
   // expanded by default, but not shown while the page faults track is collapsed.
@@ -46,30 +46,13 @@ float PageFaultsTrack::GetHeight() const {
   }
 
   float height = layout_->GetTrackTabHeight();
-  if (!major_page_faults_track_->IsEmpty()) {
+  if (major_page_faults_track_->ShouldBeRendered()) {
     height += major_page_faults_track_->GetHeight() + layout_->GetSpaceBetweenSubtracks();
   }
-  if (!minor_page_faults_track_->IsEmpty()) {
+  if (minor_page_faults_track_->ShouldBeRendered()) {
     height += minor_page_faults_track_->GetHeight() + layout_->GetSpaceBetweenSubtracks();
   }
   return height;
-}
-
-// TODO(b/176216022): Make a general interface for capture view elements for setting the width to
-// every child.
-void PageFaultsTrack::SetWidth(float width) {
-  Track::SetWidth(width);
-  minor_page_faults_track_->SetWidth(width);
-  major_page_faults_track_->SetWidth(width);
-}
-
-std::vector<orbit_gl::CaptureViewElement*> PageFaultsTrack::GetVisibleChildren() {
-  std::vector<CaptureViewElement*> result;
-  if (collapse_toggle_->IsCollapsed()) return result;
-
-  if (!major_page_faults_track_->IsEmpty()) result.push_back(major_page_faults_track_.get());
-  if (!minor_page_faults_track_->IsEmpty()) result.push_back(minor_page_faults_track_.get());
-  return result;
 }
 
 std::string PageFaultsTrack::GetTooltip() const {
@@ -77,49 +60,40 @@ std::string PageFaultsTrack::GetTooltip() const {
   return "Shows the minor and major page faults statistics.";
 }
 
-void PageFaultsTrack::Draw(Batcher& batcher, TextRenderer& text_renderer,
-                           const DrawContext& draw_context) {
-  Track::Draw(batcher, text_renderer, draw_context);
-
-  if (collapse_toggle_->IsCollapsed()) return;
-
-  const DrawContext sub_track_draw_context = draw_context.IncreasedIndentationLevel();
-  if (!major_page_faults_track_->IsEmpty()) {
-    major_page_faults_track_->Draw(batcher, text_renderer, sub_track_draw_context);
-  }
-
-  if (!minor_page_faults_track_->IsEmpty()) {
-    minor_page_faults_track_->Draw(batcher, text_renderer, sub_track_draw_context);
-  }
+std::vector<CaptureViewElement*> PageFaultsTrack::GetAllChildren() const {
+  auto result = Track::GetAllChildren();
+  result.insert(result.end(), {major_page_faults_track_.get(), minor_page_faults_track_.get()});
+  return result;
 }
 
-void PageFaultsTrack::UpdatePrimitives(Batcher* batcher, uint64_t min_tick, uint64_t max_tick,
-                                       PickingMode picking_mode, float z_offset) {
-  if (!major_page_faults_track_->IsEmpty()) {
-    major_page_faults_track_->UpdatePrimitives(batcher, min_tick, max_tick, picking_mode, z_offset);
-  }
-
-  if (collapse_toggle_->IsCollapsed()) return;
-
-  if (!minor_page_faults_track_->IsEmpty()) {
-    minor_page_faults_track_->UpdatePrimitives(batcher, min_tick, max_tick, picking_mode, z_offset);
-  }
+void PageFaultsTrack::DoUpdatePrimitives(Batcher& batcher, TextRenderer& text_renderer,
+                                         uint64_t min_tick, uint64_t max_tick,
+                                         PickingMode picking_mode) {
+  ORBIT_SCOPE("PageFaultsTrack::DoUpdatePrimitives");
+  Track::DoUpdatePrimitives(batcher, text_renderer, min_tick, max_tick, picking_mode);
 }
 
 void PageFaultsTrack::UpdatePositionOfSubtracks() {
   const Vec2 pos = GetPos();
   if (collapse_toggle_->IsCollapsed()) {
     major_page_faults_track_->SetPos(pos[0], pos[1]);
+    minor_page_faults_track_->SetVisible(false);
+    major_page_faults_track_->SetHeadless(true);
     return;
   }
 
+  major_page_faults_track_->SetHeadless(false);
+  major_page_faults_track_->SetIndentationLevel(indentation_level_ + 1);
+  minor_page_faults_track_->SetVisible(true);
+  minor_page_faults_track_->SetIndentationLevel(indentation_level_ + 1);
+
   float current_y = pos[1] + layout_->GetTrackTabHeight();
-  if (!major_page_faults_track_->IsEmpty()) {
+  if (major_page_faults_track_->ShouldBeRendered()) {
     current_y += layout_->GetSpaceBetweenSubtracks();
   }
   major_page_faults_track_->SetPos(pos[0], current_y);
 
-  if (!minor_page_faults_track_->IsEmpty()) {
+  if (minor_page_faults_track_->ShouldBeRendered()) {
     current_y += (layout_->GetSpaceBetweenSubtracks() + major_page_faults_track_->GetHeight());
   }
   minor_page_faults_track_->SetPos(pos[0], current_y);

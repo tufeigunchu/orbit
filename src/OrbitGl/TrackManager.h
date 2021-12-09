@@ -17,6 +17,7 @@
 
 #include "AsyncTrack.h"
 #include "CGroupAndProcessMemoryTrack.h"
+#include "ClientProtos/capture_data.pb.h"
 #include "FrameTrack.h"
 #include "GpuTrack.h"
 #include "GraphTrack.h"
@@ -29,10 +30,9 @@
 #include "Track.h"
 #include "VariableTrack.h"
 #include "Viewport.h"
-#include "capture_data.pb.h"
 
 class OrbitApp;
-class Timegraph;
+class TimeGraph;
 
 // TrackManager is in charge of the active Tracks in Timegraph (their creation, searching, erasing
 // and sorting).
@@ -50,10 +50,7 @@ class TrackManager {
   void RequestTrackSorting() { sorting_invalidated_ = true; };
   void SetFilter(const std::string& filter);
 
-  [[nodiscard]] float GetVisibleTracksTotalHeight() const;
-  void UpdateTracksForRendering();
-  void UpdateTrackPrimitives(Batcher* batcher, uint64_t min_tick, uint64_t max_tick,
-                             PickingMode picking_mode);
+  void UpdateTrackListForRendering();
 
   [[nodiscard]] std::pair<uint64_t, uint64_t> GetTracksMinMaxTimestamps() const;
 
@@ -88,11 +85,15 @@ class TrackManager {
   void SetTrackTypeVisibility(Track::Type type, bool value);
   [[nodiscard]] bool GetTrackTypeVisibility(Track::Type type) const;
 
+  const absl::flat_hash_map<Track::Type, bool> GetAllTrackTypesVisibility() const;
+  void RestoreAllTrackTypesVisibility(const absl::flat_hash_map<Track::Type, bool>& values);
+
  private:
   [[nodiscard]] int FindMovingTrackIndex();
   void UpdateMovingTrackPositionInVisibleTracks();
   void SortTracks();
   [[nodiscard]] std::vector<ThreadTrack*> GetSortedThreadTracks();
+  // Filter tracks that are already sorted in sorted_tracks_.
   void UpdateVisibleTrackList();
 
   void AddTrack(const std::shared_ptr<Track>& track);

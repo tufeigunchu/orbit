@@ -5,9 +5,8 @@
 #include "IntrospectionWindow.h"
 
 #include "App.h"
+#include "ClientProtos/capture_data.pb.h"
 #include "OrbitBase/Logging.h"
-#include "TimeGraph.h"
-#include "capture_data.pb.h"
 
 using orbit_client_data::CaptureData;
 using orbit_client_protos::TimerInfo;
@@ -176,6 +175,11 @@ class IntrospectionCaptureListener : public orbit_capture_client::CaptureListene
       orbit_grpc_protos::ErrorEnablingUserSpaceInstrumentationEvent /*error_event*/) override {
     UNREACHABLE();
   }
+  void OnWarningInstrumentingWithUserSpaceInstrumentationEvent(
+      orbit_grpc_protos::WarningInstrumentingWithUserSpaceInstrumentationEvent /*warning_event*/)
+      override {
+    UNREACHABLE();
+  }
   void OnLostPerfRecordsEvent(
       orbit_grpc_protos::LostPerfRecordsEvent /*lost_perf_records_event*/) override {
     UNREACHABLE();
@@ -200,7 +204,8 @@ IntrospectionWindow::IntrospectionWindow(OrbitApp* app)
   capture_started.set_executable_path("Orbit");
   absl::flat_hash_set<uint64_t> frame_track_function_ids;
   capture_data_ = std::make_unique<CaptureData>(/*module_manager=*/nullptr, capture_started,
-                                                std::nullopt, std::move(frame_track_function_ids));
+                                                std::nullopt, std::move(frame_track_function_ids),
+                                                CaptureData::DataSource::kLiveCapture);
 }
 
 IntrospectionWindow::~IntrospectionWindow() { StopIntrospection(); }
@@ -219,7 +224,7 @@ void IntrospectionWindow::StartIntrospection() {
   CHECK(!IsIntrospecting());
   set_draw_help(false);
   CreateTimeGraph(capture_data_.get());
-  introspection_listener_ = std::make_unique<orbit_introspection::TracingListener>(
+  introspection_listener_ = std::make_unique<orbit_introspection::IntrospectionListener>(
       [this](const orbit_api::ApiEventVariant& api_event_variant) {
         std::visit(
             [this](const auto& api_event) { HandleCaptureEvent(api_event, &api_event_processor_); },

@@ -14,9 +14,9 @@
 #include "CaptureClient/CaptureEventProcessor.h"
 #include "CaptureClient/CaptureListener.h"
 #include "ClientData/TracepointCustom.h"
-#include "capture.pb.h"
-#include "capture_data.pb.h"
-#include "tracepoint.pb.h"
+#include "ClientProtos/capture_data.pb.h"
+#include "GrpcProtos/capture.pb.h"
+#include "GrpcProtos/tracepoint.pb.h"
 
 namespace orbit_capture_client {
 
@@ -64,6 +64,7 @@ using orbit_grpc_protos::ThreadStateSlice;
 using orbit_grpc_protos::TracepointEvent;
 using orbit_grpc_protos::TracepointInfo;
 using orbit_grpc_protos::WarningEvent;
+using orbit_grpc_protos::WarningInstrumentingWithUserSpaceInstrumentationEvent;
 
 using ::testing::_;
 using ::testing::DoAll;
@@ -111,6 +112,10 @@ class MockCaptureListener : public CaptureListener {
   MOCK_METHOD(void, OnErrorEnablingUserSpaceInstrumentationEvent,
               (orbit_grpc_protos::ErrorEnablingUserSpaceInstrumentationEvent /*error_event*/),
               (override));
+  MOCK_METHOD(
+      void, OnWarningInstrumentingWithUserSpaceInstrumentationEvent,
+      (orbit_grpc_protos::WarningInstrumentingWithUserSpaceInstrumentationEvent /*warning_event*/),
+      (override));
   MOCK_METHOD(void, OnLostPerfRecordsEvent,
               (orbit_grpc_protos::LostPerfRecordsEvent /*lost_perf_records_event*/), (override));
   MOCK_METHOD(
@@ -192,8 +197,11 @@ static void ExpectCallstackSamplesEqual(const CallstackEvent& actual_callstack_e
     case Callstack::kInUprobes:
       EXPECT_EQ(actual_callstack.type(), CallstackInfo::kInUprobes);
       break;
-    case Callstack::kUprobesPatchingFailed:
-      EXPECT_EQ(actual_callstack.type(), CallstackInfo::kUprobesPatchingFailed);
+    case Callstack::kInUserSpaceInstrumentation:
+      EXPECT_EQ(actual_callstack.type(), CallstackInfo::kInUserSpaceInstrumentation);
+      break;
+    case Callstack::kCallstackPatchingFailed:
+      EXPECT_EQ(actual_callstack.type(), CallstackInfo::kCallstackPatchingFailed);
       break;
     case Callstack::kStackTopDwarfUnwindingError:
       EXPECT_EQ(actual_callstack.type(), CallstackInfo::kStackTopDwarfUnwindingError);
@@ -248,7 +256,8 @@ TEST(CaptureEventProcessor, CanHandleOneNonCompleteCallstackSample) {
   CanHandleOneCallstackSampleOfType(Callstack::kDwarfUnwindingError);
   CanHandleOneCallstackSampleOfType(Callstack::kFramePointerUnwindingError);
   CanHandleOneCallstackSampleOfType(Callstack::kInUprobes);
-  CanHandleOneCallstackSampleOfType(Callstack::kUprobesPatchingFailed);
+  CanHandleOneCallstackSampleOfType(Callstack::kInUserSpaceInstrumentation);
+  CanHandleOneCallstackSampleOfType(Callstack::kCallstackPatchingFailed);
   CanHandleOneCallstackSampleOfType(Callstack::kStackTopDwarfUnwindingError);
   CanHandleOneCallstackSampleOfType(Callstack::kStackTopForDwarfUnwindingTooSmall);
 }
@@ -1320,6 +1329,36 @@ TEST(CaptureEventProcessor, CanHandleErrorEnablingUserSpaceInstrumentationEvents
 
   EXPECT_EQ(actual_error_event.timestamp_ns(), kTimestampNs);
   EXPECT_EQ(actual_error_event.message(), kMessage);
+}
+
+TEST(CaptureEventProcessor, CanHandleWarningInstrumentingWithUserSpaceInstrumentationEvents) {
+  MockCaptureListener listener;
+  auto event_processor =
+      CaptureEventProcessor::CreateForCaptureListener(&listener, std::filesystem::path{}, {});
+
+  ClientCaptureEvent event;
+  WarningInstrumentingWithUserSpaceInstrumentationEvent* warning_event =
+      event.mutable_warning_instrumenting_with_user_space_instrumentation_event();
+  constexpr uint64_t kTimestampNs = 100;
+  warning_event->set_timestamp_ns(kTimestampNs);
+  constexpr uint64_t kFunctionId = 42;
+  constexpr const char* kErrorMessage = "error message";
+  orbit_grpc_protos::FunctionThatFailedToBeInstrumented* function =
+      warning_event->add_functions_that_failed_to_instrument();
+  function->set_function_id(kFunctionId);
+  function->set_error_message(kErrorMessage);
+
+  WarningInstrumentingWithUserSpaceInstrumentationEvent actual_warning_event;
+  EXPECT_CALL(listener, OnWarningInstrumentingWithUserSpaceInstrumentationEvent)
+      .Times(1)
+      .WillOnce(SaveArg<0>(&actual_warning_event));
+
+  event_processor->ProcessEvent(event);
+
+  EXPECT_EQ(actual_warning_event.timestamp_ns(), kTimestampNs);
+  EXPECT_EQ(actual_warning_event.functions_that_failed_to_instrument(0).function_id(), kFunctionId);
+  EXPECT_EQ(actual_warning_event.functions_that_failed_to_instrument(0).error_message(),
+            kErrorMessage);
 }
 
 TEST(CaptureEventProcessor, CanHandleLostPerfRecordsEvents) {

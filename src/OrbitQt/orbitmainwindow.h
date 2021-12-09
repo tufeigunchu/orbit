@@ -32,10 +32,12 @@
 
 #include "App.h"
 #include "CallTreeView.h"
+#include "ClientProtos/capture_data.pb.h"
 #include "ClientServices/ProcessManager.h"
 #include "DataViews/DataView.h"
 #include "DataViews/DataViewType.h"
 #include "FilterPanelWidgetAction.h"
+#include "GrpcProtos/process.pb.h"
 #include "MainThreadExecutor.h"
 #include "MetricsUploader/MetricsUploader.h"
 #include "OrbitBase/CrashHandler.h"
@@ -43,9 +45,7 @@
 #include "SessionSetup/TargetConfiguration.h"
 #include "SessionSetup/TargetLabel.h"
 #include "StatusListener.h"
-#include "capture_data.pb.h"
 #include "orbitglwidget.h"
-#include "process.pb.h"
 
 namespace Ui {
 class OrbitMainWindow;
@@ -138,6 +138,7 @@ class OrbitMainWindow final : public QMainWindow, public orbit_gl::MainWindowInt
 
   void on_actionToggle_Capture_triggered();
   void on_actionOpen_Capture_triggered();
+  void on_actionRename_Capture_File_triggered();
   void on_actionCaptureOptions_triggered();
   void on_actionHelp_toggled(bool checked);
   void on_actionIntrospection_triggered();
@@ -154,6 +155,7 @@ class OrbitMainWindow final : public QMainWindow, public orbit_gl::MainWindowInt
   void OnTimerSelectionChanged(const orbit_client_protos::TimerInfo* timer_info);
 
  private:
+  void UpdateFilePath(const std::filesystem::path& file_path);
   void StartMainTimer();
   void SetupCaptureToolbar();
   void SetupMainWindow();
@@ -165,6 +167,9 @@ class OrbitMainWindow final : public QMainWindow, public orbit_gl::MainWindowInt
   void SetupAccessibleNamesForAutomation();
 
   void SaveCurrentTabLayoutAsDefaultInMemory();
+
+  void SaveMainWindowGeometry();
+  void RestoreMainWindowGeometry();
 
   void CreateTabBarContextMenu(QTabWidget* tab_widget, int tab_index, const QPoint& pos);
   void UpdateCaptureStateDependentWidgets();
@@ -181,15 +186,23 @@ class OrbitMainWindow final : public QMainWindow, public orbit_gl::MainWindowInt
 
   void OnProcessListUpdated(const std::vector<orbit_grpc_protos::ProcessInfo>& processes);
 
+  static const QString kEnableCallstackSamplingSettingKey;
+  static const QString kCallstackSamplingPeriodMsSettingKey;
+  static const QString kCallstackUnwindingMethodSettingKey;
+  static const QString kCollectSchedulerInfoSettingKey;
   static const QString kCollectThreadStatesSettingKey;
+  static const QString kTraceGpuSubmissionsSettingKey;
   static const QString kCollectMemoryInfoSettingKey;
   static const QString kEnableApiSettingKey;
   static const QString kEnableIntrospectionSettingKey;
-  static const QString kEnableUserSpaceInstrumentationSettingKey;
+  static const QString kDynamicInstrumentationMethodSettingKey;
   static const QString kMemorySamplingPeriodMsSettingKey;
   static const QString kMemoryWarningThresholdKbSettingKey;
   static const QString kLimitLocalMarkerDepthPerCommandBufferSettingsKey;
   static const QString kMaxLocalMarkerDepthPerCommandBufferSettingsKey;
+  static const QString kMainWindowGeometrySettingKey;
+  static const QString kMainWindowStateSettingKey;
+
   void LoadCaptureOptionsIntoApp();
 
   [[nodiscard]] bool ConfirmExit();

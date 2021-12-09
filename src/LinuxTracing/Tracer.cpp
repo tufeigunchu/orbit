@@ -4,23 +4,19 @@
 
 #include "LinuxTracing/Tracer.h"
 
-#include <pthread.h>
-
-#include <atomic>
 #include <memory>
 
-#include "OrbitBase/ThreadUtils.h"
-#include "TracerThread.h"
-#include "TracingInterface/TracerListener.h"
-#include "capture.pb.h"
+#include "LinuxTracing/UserSpaceInstrumentationAddresses.h"
+#include "TracerImpl.h"
 
 namespace orbit_linux_tracing {
 
-void Tracer::Run() {
-  orbit_base::SetCurrentThreadName("Tracer::Run");
-  TracerThread session{capture_options_};
-  session.SetListener(listener_);
-  session.Run(exit_requested_);
+std::unique_ptr<Tracer> Tracer::Create(
+    const orbit_grpc_protos::CaptureOptions& capture_options,
+    std::unique_ptr<UserSpaceInstrumentationAddresses> user_space_instrumentation_addresses,
+    TracerListener* listener) {
+  return std::make_unique<TracerImpl>(capture_options,
+                                      std::move(user_space_instrumentation_addresses), listener);
 }
 
 }  // namespace orbit_linux_tracing

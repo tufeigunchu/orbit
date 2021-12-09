@@ -25,6 +25,7 @@
 #include <utility>
 #include <vector>
 
+#include "CommandLineUtils/CommandLineUtils.h"
 #include "MetricsUploader/ScopedMetric.h"
 #include "MoveFilesToDocuments/MoveFilesToDocuments.h"
 #include "OrbitBase/File.h"
@@ -44,10 +45,12 @@
 #include "OrbitSsh/Context.h"
 #include "OrbitSshQt/ScopedConnection.h"
 #include "OrbitVersion/OrbitVersion.h"
+#include "SessionSetup/ConnectToTargetDialog.h"
 #include "SessionSetup/Connections.h"
 #include "SessionSetup/DeploymentConfigurations.h"
 #include "SessionSetup/ServiceDeployManager.h"
 #include "SessionSetup/SessionSetupDialog.h"
+#include "SessionSetup/SessionSetupUtils.h"
 #include "SessionSetup/TargetConfiguration.h"
 #include "SourcePathsMapping/MappingManager.h"
 #include "Style/Style.h"
@@ -72,10 +75,32 @@ using orbit_ssh::Context;
 
 Q_DECLARE_METATYPE(std::error_code);
 
-void RunUiInstance(const DeploymentConfiguration& deployment_configuration,
-                   const Context* ssh_context, const QStringList& command_line_flags,
-                   const orbit_base::CrashHandler* crash_handler,
-                   const std::filesystem::path& capture_file_path) {
+static std::optional<orbit_session_setup::TargetConfiguration> ConnectToSpecifiedTarget(
+    orbit_session_setup::SshConnectionArtifacts& connection_artifacts,
+    const QString& connection_target_string,
+    orbit_metrics_uploader::MetricsUploader* metrics_uploader) {
+  auto connection_target_result =
+      orbit_session_setup::ConnectionTarget::FromString(connection_target_string);
+  if (!connection_target_result.has_value()) {
+    ERROR(
+        "Invalid connection target parameter was specified. Expected format: pid@instance_id, got "
+        "\"%s\"",
+        connection_target_string.toStdString());
+    return std::nullopt;
+  }
+
+  auto connection_target = connection_target_result.value();
+  orbit_session_setup::ConnectToTargetDialog dialog(
+      &connection_artifacts, connection_target.instance_id_, connection_target.process_id_,
+      metrics_uploader);
+  return dialog.Exec();
+}
+
+int RunUiInstance(const DeploymentConfiguration& deployment_configuration,
+                  const Context* ssh_context, const QStringList& command_line_flags,
+                  const orbit_base::CrashHandler* crash_handler,
+                  const std::filesystem::path& capture_file_path,
+                  const QString& connection_target) {
   qRegisterMetaType<std::error_code>();
 
   const GrpcPort grpc_port{/*.grpc_port =*/absl::GetFlag(FLAGS_grpc_port)};
@@ -88,21 +113,30 @@ void RunUiInstance(const DeploymentConfiguration& deployment_configuration,
   std::unique_ptr<orbit_metrics_uploader::MetricsUploader> metrics_uploader =
       orbit_metrics_uploader::MetricsUploader::CreateMetricsUploader();
   metrics_uploader->SendLogEvent(
-      orbit_metrics_uploader::OrbitLogEvent_LogEventType_ORBIT_METRICS_UPLOADER_START);
+      orbit_metrics_uploader::OrbitLogEvent::ORBIT_METRICS_UPLOADER_START);
 
-  orbit_metrics_uploader::ScopedMetric metric{
-      metrics_uploader.get(), orbit_metrics_uploader::OrbitLogEvent_LogEventType_ORBIT_EXIT};
+  orbit_metrics_uploader::ScopedMetric metric{metrics_uploader.get(),
+                                              orbit_metrics_uploader::OrbitLogEvent::ORBIT_EXIT};
 
   // If Orbit starts with loading a capture file, we skip SessionSetupDialog and create a
   // FileTarget from capture_file_path. After creating the FileTarget, we reset
-  // skip_profiling_target_dialog as false such that if a user ends the previous session, Orbit
+  // has_file_parameter as false such that if a user ends the previous session, Orbit
   // will return to a SessionSetupDialog.
-  bool skip_profiling_target_dialog = !capture_file_path.empty();
+  bool has_file_parameter = !capture_file_path.empty();
+  bool has_connection_target = !connection_target.isEmpty();
+
   while (true) {
     {
-      if (skip_profiling_target_dialog) {
+      if (has_connection_target) {
+        target_config = ConnectToSpecifiedTarget(ssh_connection_artifacts, connection_target,
+                                                 metrics_uploader.get());
+        if (!target_config.has_value()) {
+          // User closed dialog, or an error occured.
+          return -1;
+        }
+      } else if (has_file_parameter) {
         target_config = orbit_session_setup::FileTarget(capture_file_path);
-        skip_profiling_target_dialog = false;
+        has_file_parameter = false;
       } else {
         orbit_session_setup::SessionSetupDialog target_dialog{
             &ssh_connection_artifacts, std::move(target_config), metrics_uploader.get()};
@@ -122,17 +156,15 @@ void RunUiInstance(const DeploymentConfiguration& deployment_configuration,
 
       OrbitMainWindow w(std::move(target_config.value()), crash_handler, metrics_uploader.get(),
                         command_line_flags);
-
-      // "resize" is required to make "showMaximized" work properly.
-      w.resize(1280, 720);
-      w.showMaximized();
+      w.show();
 
       application_return_code = QApplication::exec();
 
       target_config = w.ClearTargetConfiguration();
     }
 
-    if (application_return_code == OrbitMainWindow::kQuitOrbitReturnCode) {
+    // If a connection target was specified, ending the session will also end Orbit
+    if (has_connection_target || application_return_code == OrbitMainWindow::kQuitOrbitReturnCode) {
       // User closed window
       break;
     }
@@ -144,21 +176,8 @@ void RunUiInstance(const DeploymentConfiguration& deployment_configuration,
 
     UNREACHABLE();
   }
-}
 
-// Extract command line flags by filtering the positional arguments out from the command line
-// arguments.
-static QStringList ExtractCommandLineFlags(const std::vector<std::string>& command_line_args,
-                                           const std::vector<char*>& positional_args) {
-  QStringList command_line_flags;
-  absl::flat_hash_set<std::string> positional_arg_set(positional_args.begin(),
-                                                      positional_args.end());
-  for (const std::string& command_line_arg : command_line_args) {
-    if (!positional_arg_set.contains(command_line_arg)) {
-      command_line_flags << QString::fromStdString(command_line_arg);
-    }
-  }
-  return command_line_flags;
+  return 0;
 }
 
 static void DisplayErrorToUser(const QString& message) {
@@ -220,7 +239,8 @@ int main(int argc, char* argv[]) {
   if (argc > 1) {
     command_line_args.assign(argv + 1, argv + argc);
   }
-  QStringList command_line_flags = ExtractCommandLineFlags(command_line_args, positional_args);
+  QStringList command_line_flags =
+      orbit_command_line_utils::ExtractCommandLineFlags(command_line_args, positional_args);
   // Skip program name in positional_args[0].
   std::vector<std::string> capture_file_paths(positional_args.begin() + 1, positional_args.end());
 
@@ -281,6 +301,11 @@ int main(int argc, char* argv[]) {
     return 0;
   }
 
+  if (absl::GetFlag(FLAGS_clear_settings)) {
+    QSettings{}.clear();
+    return 0;
+  }
+
   orbit_style::ApplyStyle(&app);
 
   const auto open_gl_version = orbit_qt::DetectOpenGlVersion();
@@ -327,6 +352,17 @@ int main(int argc, char* argv[]) {
     return -1;
   }
 
+  const std::string& connection_target = absl::GetFlag(FLAGS_connection_target);
+
+  if (capture_file_paths.size() > 0 && !connection_target.empty()) {
+    LOG("Aborting startup: User specified a connection target and one or multiple capture files at "
+        "the same time.");
+    DisplayErrorToUser(
+        QString("Invalid combination of startup flags: Specify either one or multiple capture "
+                "files to open or a connection target (--connection_target), but not both."));
+    return -1;
+  }
+
   // If more than one capture files are provided, start multiple Orbit instances.
   for (size_t i = 1; i < capture_file_paths.size(); ++i) {
     QStringList arguments;
@@ -334,7 +370,10 @@ int main(int argc, char* argv[]) {
     QProcess::startDetached(orbit_executable, arguments);
   }
 
-  RunUiInstance(deployment_configuration, &context.value(), command_line_flags, crash_handler.get(),
-                capture_file_paths.empty() ? "" : capture_file_paths[0]);
-  return 0;
+  command_line_flags =
+      orbit_command_line_utils::RemoveFlagsNotPassedToMainWindow(command_line_flags);
+
+  return RunUiInstance(deployment_configuration, &context.value(), command_line_flags,
+                       crash_handler.get(), capture_file_paths.empty() ? "" : capture_file_paths[0],
+                       QString::fromStdString(connection_target));
 }

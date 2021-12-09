@@ -11,15 +11,14 @@
 #include "App.h"
 #include "Batcher.h"
 #include "ClientData/TimerChain.h"
+#include "ClientProtos/capture_data.pb.h"
 #include "DisplayFormats/DisplayFormats.h"
 #include "GlUtils.h"
 #include "OrbitBase/Logging.h"
 #include "OrbitBase/ThreadConstants.h"
-#include "TimeGraph.h"
 #include "TimeGraphLayout.h"
 #include "TriangleToggle.h"
 #include "absl/strings/str_format.h"
-#include "capture_data.pb.h"
 
 using orbit_client_data::TimerChain;
 using orbit_client_protos::TimerInfo;
@@ -29,17 +28,17 @@ constexpr const char* kHwQueueString = "hw queue";
 constexpr const char* kHwExecutionString = "hw execution";
 constexpr const char* kCmdBufferString = "command buffer";
 
-GpuSubmissionTrack::GpuSubmissionTrack(Track* parent, TimeGraph* time_graph,
+GpuSubmissionTrack::GpuSubmissionTrack(Track* parent,
+                                       const orbit_gl::TimelineInfoInterface* timeline_info,
                                        orbit_gl::Viewport* viewport, TimeGraphLayout* layout,
                                        uint64_t timeline_hash, OrbitApp* app,
                                        const orbit_client_data::CaptureData* capture_data,
-                                       orbit_client_data::TrackData* track_data)
-    : TimerTrack(parent, time_graph, viewport, layout, app, capture_data, track_data),
+                                       orbit_client_data::TimerData* timer_data)
+    : TimerTrack(parent, timeline_info, viewport, layout, app, capture_data, timer_data),
       timeline_hash_{timeline_hash},
       string_manager_{app->GetStringManager()},
       parent_{parent} {
   draw_background_ = false;
-  text_renderer_ = time_graph->GetTextRenderer();
 }
 
 std::string GpuSubmissionTrack::GetName() const {
@@ -74,7 +73,8 @@ bool GpuSubmissionTrack::IsTimerActive(const TimerInfo& timer_info) const {
 }
 
 Color GpuSubmissionTrack::GetTimerColor(const TimerInfo& timer_info, bool is_selected,
-                                        bool is_highlighted) const {
+                                        bool is_highlighted,
+                                        const internal::DrawData& /*draw_data*/) const {
   const Color kInactiveColor(100, 100, 100, 255);
   const Color kSelectionColor(0, 128, 255, 255);
   if (is_highlighted) {
@@ -151,7 +151,7 @@ float GpuSubmissionTrack::GetYFromTimer(const TimerInfo& timer_info) const {
   if (timer_info.type() == TimerInfo::kGpuCommandBuffer) {
     adjusted_depth += 1.f;
   }
-  return GetPos()[1] + GetHeaderHeight() + layout_->GetTextBoxHeight() * adjusted_depth - gap_space;
+  return GetPos()[1] + GetHeaderHeight() + layout_->GetTextBoxHeight() * adjusted_depth + gap_space;
 }
 
 // When track or its parent is collapsed, only draw "hardware execution" timers.
@@ -174,7 +174,7 @@ std::string GpuSubmissionTrack::GetTimesliceText(const TimerInfo& timer_info) co
 
 float GpuSubmissionTrack::GetHeight() const {
   bool collapsed = IsCollapsed();
-  uint32_t depth = collapsed ? 1 : track_data_->GetMaxDepth();
+  uint32_t depth = collapsed ? 1 : GetDepth();
   uint32_t num_gaps = depth > 0 ? depth - 1 : 0;
   if (has_vulkan_layer_command_buffer_timers_ && !collapsed) {
     depth *= 2;
@@ -186,7 +186,7 @@ float GpuSubmissionTrack::GetHeight() const {
 
 const TimerInfo* GpuSubmissionTrack::GetLeft(const TimerInfo& timer_info) const {
   if (timer_info.timeline_hash() == timeline_hash_) {
-    const TimerChain* chain = track_data_->GetChain(timer_info.depth());
+    const TimerChain* chain = timer_data_->GetChain(timer_info.depth());
     if (chain != nullptr) return chain->GetElementBefore(timer_info);
   }
   return nullptr;
@@ -194,7 +194,7 @@ const TimerInfo* GpuSubmissionTrack::GetLeft(const TimerInfo& timer_info) const 
 
 const TimerInfo* GpuSubmissionTrack::GetRight(const TimerInfo& timer_info) const {
   if (timer_info.timeline_hash() == timeline_hash_) {
-    const TimerChain* chain = track_data_->GetChain(timer_info.depth());
+    const TimerChain* chain = timer_data_->GetChain(timer_info.depth());
     if (chain != nullptr) return chain->GetElementAfter(timer_info);
   }
   return nullptr;
@@ -259,7 +259,7 @@ std::string GpuSubmissionTrack::GetHwQueueTooltip(const TimerInfo& timer_info) c
 std::string GpuSubmissionTrack::GetHwExecutionTooltip(const TimerInfo& timer_info) const {
   CHECK(capture_data_ != nullptr);
   return absl::StrFormat(
-      "<b>Harware Execution</b><br/>"
+      "<b>Hardware Execution</b><br/>"
       "<i>End is marked by \"dma_fence_signaled\" event for this command "
       "buffer submission</i>"
       "<br/>"

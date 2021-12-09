@@ -41,13 +41,13 @@
 #include "CaptureFileInfo/LoadCaptureWidget.h"
 #include "ClientFlags/ClientFlags.h"
 #include "ClientServices/ProcessManager.h"
+#include "GrpcProtos/process.pb.h"
 #include "OrbitBase/Logging.h"
 #include "SessionSetup/ConnectToStadiaWidget.h"
 #include "SessionSetup/Connections.h"
 #include "SessionSetup/OverlayWidget.h"
 #include "SessionSetup/ProcessItemModel.h"
 #include "SessionSetup/TargetConfiguration.h"
-#include "process.pb.h"
 #include "ui_SessionSetupDialog.h"
 
 namespace {
@@ -89,6 +89,7 @@ SessionSetupDialog::SessionSetupDialog(SshConnectionArtifacts* ssh_connection_ar
   CHECK(metrics_uploader_ != nullptr);
 
   ui_->setupUi(this);
+  ui_->stadiaWidget->SetMetricsUploader(metrics_uploader);
   ui_->stadiaWidget->SetSshConnectionArtifacts(ssh_connection_artifacts);
   ui_->processesTableOverlay->raise();
 
@@ -105,10 +106,10 @@ SessionSetupDialog::SessionSetupDialog(SshConnectionArtifacts* ssh_connection_ar
   ui_->processesTableView->sortByColumn(static_cast<int>(ProcessItemModel::Column::kCpu),
                                         Qt::DescendingOrder);
 
-  ui_->processesTableView->horizontalHeader()->resizeSection(
-      static_cast<int>(ProcessItemModel::Column::kPid), 60);
-  ui_->processesTableView->horizontalHeader()->resizeSection(
-      static_cast<int>(ProcessItemModel::Column::kCpu), 60);
+  ui_->processesTableView->horizontalHeader()->setSectionResizeMode(
+      static_cast<int>(ProcessItemModel::Column::kPid), QHeaderView::ResizeToContents);
+  ui_->processesTableView->horizontalHeader()->setSectionResizeMode(
+      static_cast<int>(ProcessItemModel::Column::kCpu), QHeaderView::ResizeToContents);
   ui_->processesTableView->horizontalHeader()->setSectionResizeMode(
       static_cast<int>(ProcessItemModel::Column::kName), QHeaderView::Stretch);
   ui_->processesTableView->verticalHeader()->setDefaultSectionSize(kProcessesRowHeight);
@@ -145,7 +146,7 @@ SessionSetupDialog::SessionSetupDialog(SshConnectionArtifacts* ssh_connection_ar
   }
 
   metrics_uploader_->SendLogEvent(
-      orbit_metrics_uploader::OrbitLogEvent_LogEventType_ORBIT_SESSION_SETUP_WINDOW_OPEN);
+      orbit_metrics_uploader::OrbitLogEvent::ORBIT_SESSION_SETUP_WINDOW_OPEN);
 }
 
 void SessionSetupDialog::SetStateMachineInitialState() {
@@ -175,7 +176,7 @@ std::optional<TargetConfiguration> SessionSetupDialog::Exec() {
   state_machine_.stop();
 
   metrics_uploader_->SendLogEvent(
-      orbit_metrics_uploader::OrbitLogEvent_LogEventType_ORBIT_SESSION_SETUP_WINDOW_CLOSE);
+      orbit_metrics_uploader::OrbitLogEvent::ORBIT_SESSION_SETUP_WINDOW_CLOSE);
 
   if (rc != QDialog::Accepted) return std::nullopt;
 

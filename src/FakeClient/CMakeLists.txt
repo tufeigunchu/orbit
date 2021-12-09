@@ -10,10 +10,13 @@ add_executable(OrbitFakeClient)
 
 target_sources(OrbitFakeClient PRIVATE
         FakeCaptureEventProcessor.h
-        FakeClientMain.cpp)
+        Flags.h
+        FakeClientMain.cpp
+        GraphicsCaptureEventProcessor.h)
 
 target_link_libraries(OrbitFakeClient PRIVATE
         CONAN_PKG::abseil
+        ApiUtils
         CaptureClient
         ClientData
         ClientProtos

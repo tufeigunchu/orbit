@@ -24,8 +24,9 @@
 
 #include "Introspection/Introspection.h"
 #include "ObjectUtils/ElfFile.h"
-#include "ObjectUtils/ObjectFile.h"
+#include "ObjectUtils/SymbolsFile.h"
 #include "OrbitBase/ExecutablePath.h"
+#include "OrbitBase/File.h"
 #include "OrbitBase/Logging.h"
 #include "OrbitBase/ReadFileToString.h"
 #include "OrbitBase/Result.h"
@@ -35,9 +36,11 @@
 using orbit_grpc_protos::ModuleSymbols;
 
 namespace fs = std::filesystem;
-using ::orbit_object_utils::CreateObjectFile;
-using ::orbit_object_utils::ElfFile;
-using ::orbit_object_utils::ObjectFile;
+using orbit_grpc_protos::ModuleInfo;
+using orbit_object_utils::CreateSymbolsFile;
+using orbit_object_utils::ElfFile;
+using orbit_object_utils::ObjectFileInfo;
+using orbit_object_utils::SymbolsFile;
 
 constexpr const char* kDeprecationNote =
     "// !!! Do not remove this comment !!!\n// This file has been migrated in Orbit 1.68. Please "
@@ -144,32 +147,24 @@ static std::vector<fs::path> FindStructuredDebugDirectories() {
 
 ErrorMessageOr<void> SymbolHelper::VerifySymbolsFile(const fs::path& symbols_path,
                                                      const std::string& build_id) {
-  auto object_file_or_error = CreateObjectFile(symbols_path);
-  if (object_file_or_error.has_error()) {
-    return ErrorMessage(absl::StrFormat("Unable to load object file \"%s\": %s",
+  auto symbols_file_or_error = CreateSymbolsFile(symbols_path, ObjectFileInfo());
+  if (symbols_file_or_error.has_error()) {
+    return ErrorMessage(absl::StrFormat("Unable to load symbols file \"%s\", error: %s",
                                         symbols_path.string(),
-                                        object_file_or_error.error().message()));
+                                        symbols_file_or_error.error().message()));
   }
 
-  if (!object_file_or_error.value()->HasDebugSymbols()) {
+  const std::unique_ptr<SymbolsFile>& symbols_file{symbols_file_or_error.value()};
+
+  if (symbols_file->GetBuildId().empty()) {
     return ErrorMessage(
-        absl::StrFormat("Object file \"%s\" does not contain symbols.", symbols_path.string()));
+        absl::StrFormat("Symbols file \"%s\" does not have a build id", symbols_path.string()));
   }
 
-  if (object_file_or_error.value()->IsElf()) {
-    ElfFile* symbols_file = dynamic_cast<ElfFile*>(object_file_or_error.value().get());
-    CHECK(symbols_file != nullptr);
-    if (symbols_file->GetBuildId().empty()) {
-      return ErrorMessage(
-          absl::StrFormat("Symbols file \"%s\" does not have a build id", symbols_path.string()));
-    }
-    const std::string& file_build_id = symbols_file->GetBuildId();
-    if (build_id != file_build_id) {
-      return ErrorMessage(
-          absl::StrFormat(R"(Symbols file "%s" has a different build id: "%s" != "%s")",
-                          symbols_path.string(), build_id, file_build_id));
-    }
-    return outcome::success();
+  if (symbols_file->GetBuildId() != build_id) {
+    return ErrorMessage(
+        absl::StrFormat(R"(Symbols file "%s" has a different build id: "%s" != "%s")",
+                        symbols_path.string(), build_id, symbols_file->GetBuildId()));
   }
 
   return outcome::success();
@@ -181,6 +176,7 @@ SymbolHelper::SymbolHelper()
 
 ErrorMessageOr<fs::path> SymbolHelper::FindSymbolsFileLocally(
     const fs::path& module_path, const std::string& build_id,
+    const ModuleInfo::ObjectFileType& object_file_type,
     absl::Span<const fs::path> directories) const {
   if (build_id.empty()) {
     return ErrorMessage(absl::StrFormat(
@@ -188,22 +184,31 @@ ErrorMessageOr<fs::path> SymbolHelper::FindSymbolsFileLocally(
         module_path.string()));
   }
 
-  for (const auto& structured_debug_directory : structured_debug_directories_) {
-    auto result = FindDebugInfoFileInDebugStore(structured_debug_directory, build_id);
-    if (result.has_value()) return result;
-    LOG("Debug file search was unsuccessful: %s", result.error().message());
+  // structured debug directories is only supported for elf files
+  if (object_file_type == ModuleInfo::kElfFile) {
+    for (const auto& structured_debug_directory : structured_debug_directories_) {
+      auto result = FindDebugInfoFileInDebugStore(structured_debug_directory, build_id);
+      if (result.has_value()) return result;
+      LOG("Debug file search was unsuccessful: %s", result.error().message());
+    }
   }
 
+  // The file extensions for symbols files are .debug for elf files and .pdb for coff files. Only
+  // files with following formats are considered `module.sym_ext`, `module.mod_ext.sym_ext` and
+  // `module.mod_ext`. (`mod_ext` is the module file extension, usually .elf, .so, .exe or .dll;
+  // `sym_ext` is either .debug or .pdb)
+  std::string sym_ext = object_file_type == ModuleInfo::kElfFile ? ".debug" : ".pdb";
+
   const fs::path& filename = module_path.filename();
-  fs::path filename_dot_debug = filename;
-  filename_dot_debug.replace_extension(".debug");
-  fs::path filename_plus_debug = filename;
-  filename_plus_debug.replace_extension(filename.extension().string() + ".debug");
+  fs::path filename_dot_sym_ext = filename;
+  filename_dot_sym_ext.replace_extension(sym_ext);
+  fs::path filename_plus_sym_ext = filename;
+  filename_plus_sym_ext.replace_extension(filename.extension().string() + sym_ext);
 
   std::set<fs::path> search_paths;
   for (const auto& directory : directories) {
-    search_paths.insert(directory / filename_dot_debug);
-    search_paths.insert(directory / filename_plus_debug);
+    search_paths.insert(directory / filename_dot_sym_ext);
+    search_paths.insert(directory / filename_plus_sym_ext);
     search_paths.insert(directory / filename);
   }
 
@@ -230,8 +235,9 @@ ErrorMessageOr<fs::path> SymbolHelper::FindSymbolsFileLocally(
     return symbols_path;
   }
 
-  return ErrorMessage(absl::StrFormat("Could not find a file with debug symbols for module \"%s\"",
-                                      module_path.string()));
+  return ErrorMessage(absl::StrFormat(
+      "Could not find a file with debug symbols on the local machine for module \"%s\"",
+      module_path.string()));
 }
 
 [[nodiscard]] ErrorMessageOr<fs::path> SymbolHelper::FindSymbolsInCache(
@@ -251,18 +257,13 @@ ErrorMessageOr<fs::path> SymbolHelper::FindSymbolsFileLocally(
   return cache_file_path;
 }
 
-ErrorMessageOr<ModuleSymbols> SymbolHelper::LoadSymbolsFromFile(const fs::path& file_path) {
+ErrorMessageOr<ModuleSymbols> SymbolHelper::LoadSymbolsFromFile(
+    const fs::path& file_path, const ObjectFileInfo& object_file_info) {
   ORBIT_SCOPE_FUNCTION;
   SCOPED_TIMED_LOG("LoadSymbolsFromFile: %s", file_path.string());
 
-  auto object_file_or_error = CreateObjectFile(file_path);
-  if (object_file_or_error.has_error()) {
-    return ErrorMessage(absl::StrFormat("Unable to load symbols from object file \"%s\": %s",
-                                        file_path.string(),
-                                        object_file_or_error.error().message()));
-  }
-
-  return object_file_or_error.value()->LoadDebugSymbols();
+  OUTCOME_TRY(auto symbols_file, CreateSymbolsFile(file_path, object_file_info));
+  return symbols_file->LoadDebugSymbols();
 }
 
 fs::path SymbolHelper::GenerateCachedFileName(const fs::path& file_path) const {
@@ -327,15 +328,11 @@ ErrorMessageOr<fs::path> SymbolHelper::FindDebugInfoFileInDebugStore(
   auto full_file_path = debug_directory / ".build-id" / build_id.substr(0, 2) /
                         absl::StrFormat("%s.debug", build_id.substr(2));
 
-  std::error_code error{};
-  if (fs::exists(full_file_path, error)) return full_file_path;
+  OUTCOME_TRY(auto file_exists, orbit_base::FileExists(full_file_path));
 
-  if (error.value() == 0) {
-    return ErrorMessage{absl::StrFormat("File does not exist: \"%s\"", full_file_path.string())};
-  }
+  if (file_exists) return full_file_path;
 
-  return ErrorMessage{absl::StrFormat("Unable to stat the file \"%s\": %s", full_file_path.string(),
-                                      error.message())};
+  return ErrorMessage{absl::StrFormat("File does not exist: \"%s\"", full_file_path.string())};
 }
 
 ErrorMessageOr<bool> FileStartsWithDeprecationNote(const std::filesystem::path& file_name) {

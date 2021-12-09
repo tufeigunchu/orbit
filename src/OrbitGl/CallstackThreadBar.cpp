@@ -17,16 +17,15 @@
 #include "Batcher.h"
 #include "ClientData/CallstackData.h"
 #include "ClientData/CaptureData.h"
+#include "ClientProtos/capture_data.pb.h"
 #include "Geometry.h"
 #include "GlCanvas.h"
 #include "OrbitBase/Logging.h"
 #include "OrbitBase/ThreadConstants.h"
 #include "PickingManager.h"
 #include "ShortenStringWithEllipsis.h"
-#include "TimeGraph.h"
 #include "TimeGraphLayout.h"
 #include "Viewport.h"
-#include "capture_data.pb.h"
 
 using orbit_client_data::CallstackData;
 using orbit_client_data::CaptureData;
@@ -37,19 +36,20 @@ using orbit_client_protos::CallstackInfo;
 namespace orbit_gl {
 
 CallstackThreadBar::CallstackThreadBar(CaptureViewElement* parent, OrbitApp* app,
-                                       TimeGraph* time_graph, orbit_gl::Viewport* viewport,
-                                       TimeGraphLayout* layout, const CaptureData* capture_data,
-                                       ThreadID thread_id, const Color& color)
-    : ThreadBar(parent, app, time_graph, viewport, layout, capture_data, thread_id, "Callstacks",
+                                       const orbit_gl::TimelineInfoInterface* timeline_info,
+                                       orbit_gl::Viewport* viewport, TimeGraphLayout* layout,
+                                       const CaptureData* capture_data, ThreadID thread_id,
+                                       const Color& color)
+    : ThreadBar(parent, app, timeline_info, viewport, layout, capture_data, thread_id, "Callstacks",
                 color) {}
 
 std::string CallstackThreadBar::GetTooltip() const {
   return "Left-click and drag to select samples";
 }
 
-void CallstackThreadBar::Draw(Batcher& batcher, TextRenderer& text_renderer,
-                              const DrawContext& draw_context) {
-  ThreadBar::Draw(batcher, text_renderer, draw_context);
+void CallstackThreadBar::DoDraw(Batcher& batcher, TextRenderer& text_renderer,
+                                const DrawContext& draw_context) {
+  ThreadBar::DoDraw(batcher, text_renderer, draw_context);
 
   if (GetThreadId() == orbit_base::kAllThreadsOfAllProcessesTid) {
     return;
@@ -62,7 +62,6 @@ void CallstackThreadBar::Draw(Batcher& batcher, TextRenderer& text_renderer,
   float event_bar_z = draw_context.picking_mode == PickingMode::kClick
                           ? GlCanvas::kZValueEventBarPicking
                           : GlCanvas::kZValueEventBar;
-  event_bar_z += draw_context.z_offset;
   Color color = GetColor();
   const Vec2 pos = GetPos();
   Box box(pos, Vec2(GetWidth(), GetHeight()), event_bar_z);
@@ -90,17 +89,18 @@ void CallstackThreadBar::Draw(Batcher& batcher, TextRenderer& text_renderer,
     y1 = y0 + GetHeight();
 
     Color picked_color(0, 128, 255, 128);
-    Box picked_box(Vec2(x0, y0), Vec2(x1 - x0, GetHeight()),
-                   GlCanvas::kZValueUi + draw_context.z_offset);
+    Box picked_box(Vec2(x0, y0), Vec2(x1 - x0, GetHeight()), GlCanvas::kZValueUi);
     batcher.AddBox(picked_box, picked_color, shared_from_this());
   }
 }
 
-void CallstackThreadBar::UpdatePrimitives(Batcher* batcher, uint64_t min_tick, uint64_t max_tick,
-                                          PickingMode picking_mode, float z_offset) {
-  ThreadBar::UpdatePrimitives(batcher, min_tick, max_tick, picking_mode, z_offset);
+void CallstackThreadBar::DoUpdatePrimitives(Batcher& batcher, TextRenderer& text_renderer,
+                                            uint64_t min_tick, uint64_t max_tick,
+                                            PickingMode picking_mode) {
+  ORBIT_SCOPE_WITH_COLOR("CallstackThreadBar::DoUpdatePrimitives", kOrbitColorLightBlue);
+  ThreadBar::DoUpdatePrimitives(batcher, text_renderer, min_tick, max_tick, picking_mode);
 
-  float z = GlCanvas::kZValueEvent + z_offset;
+  float z = GlCanvas::kZValueEvent;
   float track_height = layout_->GetEventTrackHeightFromTid(GetThreadId());
   const bool picking = picking_mode != PickingMode::kNone;
 
@@ -111,16 +111,16 @@ void CallstackThreadBar::UpdatePrimitives(Batcher* batcher, uint64_t min_tick, u
 
   if (!picking) {
     // Sampling Events
-    auto action_on_callstack_events = [=](const CallstackEvent& event) {
+    auto action_on_callstack_events = [&](const CallstackEvent& event) {
       const uint64_t time = event.time();
       CHECK(time >= min_tick && time <= max_tick);
-      Vec2 pos(time_graph_->GetWorldFromTick(time), GetPos()[1]);
+      Vec2 pos(timeline_info_->GetWorldFromTick(time), GetPos()[1]);
       Color color = kWhite;
       if (capture_data_->GetCallstackData().GetCallstack(event.callstack_id())->type() !=
           CallstackInfo::kComplete) {
         color = kGreyError;
       }
-      batcher->AddVerticalLine(pos, track_height, z, color);
+      batcher.AddVerticalLine(pos, track_height, z, color);
     };
 
     if (GetThreadId() == orbit_base::kAllProcessThreadsTid) {
@@ -134,9 +134,9 @@ void CallstackThreadBar::UpdatePrimitives(Batcher* batcher, uint64_t min_tick, u
     // Draw selected events
     std::array<Color, 2> selected_color;
     selected_color.fill(kGreenSelection);
-    for (const CallstackEvent& event : time_graph_->GetSelectedCallstackEvents(GetThreadId())) {
-      Vec2 pos(time_graph_->GetWorldFromTick(event.time()), GetPos()[1]);
-      batcher->AddVerticalLine(pos, track_height, z, kGreenSelection);
+    for (const CallstackEvent& event : app_->GetSelectedCallstackEvents(GetThreadId())) {
+      Vec2 pos(timeline_info_->GetWorldFromTick(event.time()), GetPos()[1]);
+      batcher.AddVerticalLine(pos, track_height, z, kGreenSelection);
     }
   } else {
     // Draw boxes instead of lines to make picking easier, even if this may
@@ -144,17 +144,16 @@ void CallstackThreadBar::UpdatePrimitives(Batcher* batcher, uint64_t min_tick, u
     constexpr const float kPickingBoxWidth = 9.0f;
     constexpr const float kPickingBoxOffset = (kPickingBoxWidth - 1.0f) / 2.0f;
 
-    auto action_on_callstack_events = [=](const CallstackEvent& event) {
+    auto action_on_callstack_events = [&, this](const CallstackEvent& event) {
       const uint64_t time = event.time();
       CHECK(time >= min_tick && time <= max_tick);
-      Vec2 pos(time_graph_->GetWorldFromTick(time) - kPickingBoxOffset,
-               GetPos()[1] + track_height - 1);
+      Vec2 pos(timeline_info_->GetWorldFromTick(time) - kPickingBoxOffset, GetPos()[1]);
       Vec2 size(kPickingBoxWidth, track_height);
       auto user_data = std::make_unique<PickingUserData>(
           nullptr,
-          [this, batcher](PickingId id) -> std::string { return GetSampleTooltip(*batcher, id); });
+          [this, &batcher](PickingId id) -> std::string { return GetSampleTooltip(batcher, id); });
       user_data->custom_data_ = &event;
-      batcher->AddShadedBox(pos, size, z, kGreenSelection, std::move(user_data));
+      batcher.AddShadedBox(pos, size, z, kGreenSelection, std::move(user_data));
     };
     if (GetThreadId() == orbit_base::kAllProcessThreadsTid) {
       capture_data_->GetCallstackData().ForEachCallstackEventInTimeRange(
@@ -177,10 +176,26 @@ void CallstackThreadBar::OnPick(int x, int y) {
 }
 
 void CallstackThreadBar::SelectCallstacks() {
-  Vec2& from = mouse_pos_last_click_;
-  Vec2& to = mouse_pos_cur_;
+  Vec2 from = mouse_pos_last_click_;
+  Vec2 to = mouse_pos_cur_;
 
-  time_graph_->SelectCallstacks(from[0], to[0], GetThreadId());
+  if (from > to) {
+    std::swap(from, to);
+  }
+
+  uint64_t t0 = timeline_info_->GetTickFromWorld(from[0]);
+  uint64_t t1 = timeline_info_->GetTickFromWorld(to[0]);
+
+  int64_t thread_id = GetThreadId();
+  bool thread_id_is_all_threads = thread_id == orbit_base::kAllProcessThreadsTid;
+
+  CHECK(capture_data_);
+  auto selected_callstack_events =
+      thread_id_is_all_threads
+          ? capture_data_->GetCallstackData().GetCallstackEventsInTimeRange(t0, t1)
+          : capture_data_->GetCallstackData().GetCallstackEventsOfTidInTimeRange(thread_id, t0, t1);
+
+  app_->SelectCallstackEvents(selected_callstack_events, thread_id_is_all_threads);
 }
 
 bool CallstackThreadBar::IsEmpty() const {
@@ -267,6 +282,9 @@ std::string CallstackThreadBar::GetSampleTooltip(const Batcher& batcher, Picking
   } else {
     // TODO(b/188756080): Show a specific explanation for each CallstackType.
     result += "Callstack not available: the stack could not be unwound successfully";
+    if (app_->IsDevMode()) {
+      result += absl::StrFormat(" (%s)", CallstackInfo::CallstackType_Name(callstack->type()));
+    }
   }
   return result +
          "<br/><br/><i>To select samples, click the bar & drag across multiple samples</i>";

@@ -13,7 +13,7 @@
 #include "ClientData/CaptureData.h"
 #include "ClientData/ModuleManager.h"
 #include "ClientModel/CaptureSerializer.h"
-#include "module.pb.h"
+#include "GrpcProtos/module.pb.h"
 
 using orbit_client_data::CaptureData;
 using orbit_client_data::ModuleManager;
@@ -38,7 +38,11 @@ TEST(CaptureSerializer, GenerateCaptureFileName) {
 
   ModuleManager module_manager;
 
-  CaptureData capture_data{&module_manager, capture_started, std::filesystem::path{}, {}};
+  CaptureData capture_data{&module_manager,
+                           capture_started,
+                           std::filesystem::path{},
+                           {},
+                           CaptureData::DataSource::kLiveCapture};
   EXPECT_TRUE(module_manager.AddOrUpdateModules({module_info}).empty());
   capture_data.mutable_process()->UpdateModuleInfos({module_info});
 

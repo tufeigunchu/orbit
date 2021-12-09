@@ -6,6 +6,7 @@
 #include <absl/strings/str_format.h>
 #include <absl/strings/str_split.h>
 #include <gtest/gtest.h>
+#include <sys/prctl.h>
 #include <sys/ptrace.h>
 #include <sys/types.h>
 #include <sys/wait.h>
@@ -72,8 +73,13 @@ TEST(AllocateInTraceeTest, AllocateAndFree) {
   pid_t pid = fork();
   CHECK(pid != -1);
   if (pid == 0) {
+    prctl(PR_SET_PDEATHSIG, SIGTERM);
+
     // Child just runs an endless loop.
+    volatile uint64_t counter = 0;
     while (true) {
+      // Endless loops without side effects are UB and recent versions of clang optimize it away.
+      ++counter;
     }
   }
 
@@ -134,8 +140,13 @@ TEST(AllocateInTraceeTest, AutomaticAllocateAndFree) {
   pid_t pid = fork();
   CHECK(pid != -1);
   if (pid == 0) {
+    prctl(PR_SET_PDEATHSIG, SIGTERM);
+
     // Child just runs an endless loop.
+    volatile uint64_t counter = 0;
     while (true) {
+      // Endless loops without side effects are UB and recent versions of clang optimize it away.
+      ++counter;
     }
   }
 

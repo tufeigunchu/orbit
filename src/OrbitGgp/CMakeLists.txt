@@ -10,22 +10,27 @@ target_include_directories(OrbitGgp PUBLIC
           ${CMAKE_CURRENT_LIST_DIR}/include)
 
 target_sources(OrbitGgp PUBLIC
+          include/OrbitGgp/Account.h
           include/OrbitGgp/Client.h
           include/OrbitGgp/Error.h
           include/OrbitGgp/Instance.h
           include/OrbitGgp/InstanceItemModel.h
+          include/OrbitGgp/Project.h
           include/OrbitGgp/SshInfo.h)
 
 target_sources(OrbitGgp PRIVATE
+          Account.cpp
           Client.cpp
           Error.cpp
           Instance.cpp
           InstanceItemModel.cpp
+          Project.cpp
           SshInfo.cpp)
 
 target_link_libraries(
   OrbitGgp
   PRIVATE OrbitBase
+          QtUtils
           Qt5::Core
 )
 
@@ -43,9 +48,11 @@ target_sources(OrbitMockGgpWorking PRIVATE MockGgp/Working.cpp)
 add_executable(OrbitGgpTests)
 
 target_sources(OrbitGgpTests PRIVATE 
+          AccountTest.cpp
           ClientTest.cpp
           InstanceTests.cpp
           InstanceItemModelTests.cpp
+          ProjectTest.cpp
           SshInfoTests.cpp
 )
 
@@ -53,6 +60,7 @@ target_link_libraries(OrbitGgpTests PRIVATE
           OrbitGgp
           OrbitBase
           TestUtils
+          QtUtils
           GTest::QtCoreMain
           Qt5::Core
 )

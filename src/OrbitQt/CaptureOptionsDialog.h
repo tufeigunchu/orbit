@@ -12,6 +12,7 @@
 #include <QWidget>
 #include <memory>
 
+#include "GrpcProtos/capture.pb.h"
 #include "OrbitBase/Logging.h"
 #include "ui_CaptureOptionsDialog.h"
 
@@ -44,14 +45,27 @@ class CaptureOptionsDialog : public QDialog {
  public:
   explicit CaptureOptionsDialog(QWidget* parent = nullptr);
 
+  void SetEnableSampling(bool enable_sampling);
+  [[nodiscard]] bool GetEnableSampling() const;
+  void SetSamplingPeriodMs(double sampling_period_ms);
+  [[nodiscard]] double GetSamplingPeriodMs() const;
+  void SetUnwindingMethod(orbit_grpc_protos::CaptureOptions::UnwindingMethod unwinding_method);
+  [[nodiscard]] orbit_grpc_protos::CaptureOptions::UnwindingMethod GetUnwindingMethod() const;
+  void SetCollectSchedulerInfo(bool collect_scheduler_info);
+  [[nodiscard]] bool GetCollectSchedulerInfo() const;
   void SetCollectThreadStates(bool collect_thread_state);
   [[nodiscard]] bool GetCollectThreadStates() const;
+  void SetTraceGpuSubmissions(bool trace_gpu_submissions);
+  [[nodiscard]] bool GetTraceGpuSubmissions() const;
   void SetEnableApi(bool enable_api);
   [[nodiscard]] bool GetEnableApi() const;
+  void SetDynamicInstrumentationMethod(
+      orbit_grpc_protos::CaptureOptions::DynamicInstrumentationMethod method);
+  [[nodiscard]] orbit_grpc_protos::CaptureOptions::DynamicInstrumentationMethod
+  GetDynamicInstrumentationMethod() const;
   void SetEnableIntrospection(bool enable_introspection);
   [[nodiscard]] bool GetEnableIntrospection() const;
-  void SetEnableUserSpaceInstrumentation(bool enable);
-  [[nodiscard]] bool GetEnableUserSpaceInstrumentation() const;
+
   void SetLimitLocalMarkerDepthPerCommandBuffer(bool limit_local_marker_depth_per_command_buffer);
   [[nodiscard]] bool GetLimitLocalMarkerDepthPerCommandBuffer() const;
   void SetMaxLocalMarkerDepthPerCommandBuffer(uint64_t local_marker_depth_per_command_buffer);

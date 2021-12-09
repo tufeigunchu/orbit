@@ -233,7 +233,7 @@ void TextRenderer::AddTextInternal(const char* text, ftgl::vec2* pen,
   float a = color.alpha;
 
   float max_width =
-      formatting.max_size == -1.f ? FLT_MAX : viewport_->WorldToScreenWidth(formatting.max_size);
+      formatting.max_size == -1.f ? FLT_MAX : viewport_->WorldToScreen({formatting.max_size, 0})[0];
   float str_width = 0.f;
   float min_x = FLT_MAX;
   float max_x = -FLT_MAX;
@@ -254,35 +254,37 @@ void TextRenderer::AddTextInternal(const char* text, ftgl::vec2* pen,
       float kerning = (i == 0) ? 0.0f : texture_glyph_get_kerning(glyph, text + i - 1);
       pen->x += kerning;
 
-      float x0 = floorf(pen->x + glyph->offset_x);
-      float y0 = floorf(pen->y - glyph->offset_y);
-      float x1 = floorf(x0 + glyph->width);
-      float y1 = floorf(y0 + glyph->height);
+      Vec3 pos0 = translations_.TranslateAndFloorVertex(
+          Vec3(pen->x + glyph->offset_x, pen->y - glyph->offset_y, z));
+      Vec2 pos1 = Vec2(pos0[0] + glyph->width, pos0[1] + glyph->height);
+      const float transformed_z = pos0[2];
 
       float s0 = glyph->s0;
       float t0 = glyph->t0;
       float s1 = glyph->s1;
       float t1 = glyph->t1;
 
-      vertex_t vertices[4] = {{x0, y0, z, s0, t0, r, g, b, a},
-                              {x0, y1, z, s0, t1, r, g, b, a},
-                              {x1, y1, z, s1, t1, r, g, b, a},
-                              {x1, y0, z, s1, t0, r, g, b, a}};
+      vertex_t vertices[4] = {{pos0[0], pos0[1], transformed_z, s0, t0, r, g, b, a},
+                              {pos0[0], pos1[1], transformed_z, s0, t1, r, g, b, a},
+                              {pos1[0], pos1[1], transformed_z, s1, t1, r, g, b, a},
+                              {pos1[0], pos0[1], transformed_z, s1, t0, r, g, b, a}};
 
-      min_x = std::min(min_x, x0);
-      max_x = std::max(max_x, x1);
-      min_y = std::min(min_y, y0);
-      max_y = std::max(max_y, y1);
+      min_x = std::min(min_x, pos0[0]);
+      max_x = std::max(max_x, pos1[0]);
+      min_y = std::min(min_y, pos0[1]);
+      max_y = std::max(max_y, pos1[1]);
 
       str_width = max_x - min_x;
 
       if (str_width > max_width) {
         break;
       }
-      if (!vertex_buffers_by_layer_.count(z)) {
-        vertex_buffers_by_layer_[z] = ftgl::vertex_buffer_new("vertex:3f,tex_coord:2f,color:4f");
+
+      ftgl::vertex_buffer_t*& vertex_buffer = vertex_buffers_by_layer_[transformed_z];
+      if (vertex_buffer == nullptr) {
+        vertex_buffer = ftgl::vertex_buffer_new("vertex:3f,tex_coord:2f,color:4f");
       }
-      vertex_buffer_push_back(vertex_buffers_by_layer_.at(z), vertices, 4, kIndices.data(), 6);
+      vertex_buffer_push_back(vertex_buffer, vertices, 4, kIndices.data(), 6);
       pen->x += glyph->advance_x;
     }
   }
@@ -304,7 +306,7 @@ void TextRenderer::AddText(const char* text, float x, float y, float z, TextForm
     return;
   }
 
-  Vec2i pen_pos = viewport_->WorldToScreenPos(Vec2(x, y));
+  Vec2i pen_pos = viewport_->WorldToScreen(Vec2(x, y));
   pen_.x = pen_pos[0];
   pen_.y = pen_pos[1];
 
@@ -343,13 +345,13 @@ void TextRenderer::AddText(const char* text, float x, float y, float z, TextForm
   AddTextInternal(text, &pen_, formatting, z, &out_screen_pos, &out_screen_size);
 
   if (out_text_pos) {
-    (*out_text_pos) = viewport_->ScreenToWorldPos(
+    (*out_text_pos) = viewport_->ScreenToWorld(
         Vec2i(static_cast<int>(out_screen_pos.x), static_cast<int>(out_screen_pos.y)));
   }
 
   if (out_text_size) {
-    (*out_text_size)[0] = viewport_->ScreenToWorldWidth(static_cast<int>(out_screen_size.x));
-    (*out_text_size)[1] = viewport_->ScreenToWorldHeight(static_cast<int>(out_screen_size.y));
+    *out_text_size = viewport_->ScreenToWorld(
+        Vec2i(static_cast<int>(out_screen_size.x), static_cast<int>(out_screen_size.y)));
   }
 }
 
@@ -371,9 +373,9 @@ float TextRenderer::AddTextTrailingCharsPrioritized(const char* text, float x, f
     return 0.f;
   }
 
-  float temp_pen_x = viewport_->WorldToScreenPos(Vec2(x, y))[0];
+  float temp_pen_x = viewport_->WorldToScreen(Vec2(x, y))[0];
   float max_width =
-      formatting.max_size == -1.f ? FLT_MAX : viewport_->WorldToScreenWidth(formatting.max_size);
+      formatting.max_size == -1.f ? FLT_MAX : viewport_->WorldToScreen({formatting.max_size, 0})[0];
   float string_width = 0.f;
   int min_x = INT_MAX;
   int max_x = -INT_MAX;
@@ -434,11 +436,11 @@ float TextRenderer::AddTextTrailingCharsPrioritized(const char* text, float x, f
 }
 
 float TextRenderer::GetStringWidth(const char* text, uint32_t font_size) {
-  return viewport_->ScreenToWorldWidth(GetStringWidthScreenSpace(text, font_size));
+  return viewport_->ScreenToWorld({GetStringWidthScreenSpace(text, font_size), 0})[0];
 }
 
 float TextRenderer::GetStringHeight(const char* text, uint32_t font_size) {
-  return viewport_->ScreenToWorldHeight(GetStringHeightScreenSpace(text, font_size));
+  return viewport_->ScreenToWorld({0, GetStringHeightScreenSpace(text, font_size)})[1];
 }
 
 int TextRenderer::GetStringWidthScreenSpace(const char* text, uint32_t font_size) {

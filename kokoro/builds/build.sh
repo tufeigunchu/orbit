@@ -49,32 +49,41 @@ if [ -n "$1" ]; then
   fi
 
   function cleanup {
+    if [[ $? != 0 ]]; then
+      # An error occured, we will print out the conan trace:
+      echo -e "\n\n---------- CONAN TRACE ----------"
+      cat ${REPO_ROOT}/build/conan_trace.log
+      echo -e "---------------------------------\n\n"
+    fi
+
     # Delete all unnecessary files from the src/-directory.
     # Kokoro would copy them otherwise before applying the artifacts regex
     echo "Delete all unnecessary files from the src/-directory."
 
     set +e # This is allowed to fail when deleting
     if [ $CONAN_PROFILE == "coverage_clang9" ]; then
-      # In the coverage_clang9 case, we spare the results at build/package and this
-      # script (well, everything under kokoro).
+      # In the coverage_clang9 case, we spare the results at build/package,
+      # the conan trace file, and this script (well, everything under kokoro).
       echo "Cleanup for coverage_clang9"
       find "${MOUNT_POINT}" ! -path "${MOUNT_POINT}" \
                             ! -path "${MOUNT_POINT}/github" \
                             ! -path "${REPO_ROOT}" \
                             ! -path "${REPO_ROOT}/kokoro*" \
                             ! -path "${REPO_ROOT}/build" \
+                            ! -path "${REPO_ROOT}/build/conan_trace.log" \
                             ! -path "${REPO_ROOT}/build/package*"\
                             -delete
       echo "Cleanup for coverage_clang9 done."
     elif [ "${BUILD_TYPE}" == "presubmit" ]; then
-      # In the presubmit case we only spare the testresults (under build/) and this
-      # script (well, everything under kokoro).
+      # In the presubmit case we only spare the testresults (under build/),
+      # the conan trace file, and this script (well, everything under kokoro).
       echo "Cleanup for presubmit."
       find "${MOUNT_POINT}" ! -path "${MOUNT_POINT}" \
                             ! -path "${MOUNT_POINT}/github" \
                             ! -path "${REPO_ROOT}" \
                             ! -path "${REPO_ROOT}/kokoro*" \
                             ! -path "${REPO_ROOT}/build" \
+                            ! -path "${REPO_ROOT}/build/conan_trace.log" \
                             ! -path "${REPO_ROOT}/build/testresults*"\
                             -delete
       echo "Cleanup for presubmit done."
@@ -110,7 +119,7 @@ if [ -n "$1" ]; then
   # That's a temporary solution. The docker containers should have the
   # correct version of conan already preinstalled. This step will be removed
   # when the docker containers are restructured and versioned.
-  pip3 install conan==1.36.0
+  pip3 install conan==1.40.3
 
   echo "Installing conan configuration (profiles, settings, etc.)..."
   ${REPO_ROOT}/third_party/conan/configs/install.sh ${PUBLIC_BUILD:+--force-public-remotes}
@@ -131,6 +140,9 @@ if [ -n "$1" ]; then
   # Building Orbit
   mkdir -p "${REPO_ROOT}/build/"
 
+  # Enabling Conan Tracing
+  export CONAN_TRACE_FILE="${REPO_ROOT}/build/conan_trace.log"
+
   if [[ $CONAN_PROFILE == ggp_* ]]; then
     readonly PACKAGING_OPTION="-o debian_packaging=True"
   else
@@ -144,18 +156,43 @@ if [ -n "$1" ]; then
     readonly BUILD_OPTION="--build outdated"
   fi
 
-  echo "Invoking conan lock."
-  conan lock create "${REPO_ROOT}/conanfile.py" --user=orbitdeps --channel=stable \
-    ${BUILD_OPTION} \
-    --lockfile="${REPO_ROOT}/third_party/conan/lockfiles/base.lock" -u -pr ${CONAN_PROFILE} \
-    -o crashdump_server="$CRASHDUMP_SERVER" $PACKAGING_OPTION \
-    --lockfile-out="${REPO_ROOT}/build/conan.lock"
+  RET=1
+  RETRIES=4
 
-  echo "Installs the requirements (conan install)."
-  conan install -if "${REPO_ROOT}/build/" \
+  until [ ${RET} -eq 0 ]; do
+    RETRIES=$(($RETRIES - 1))
+    if [ $RETRIES -eq 0 ]; then
+      echo "Number of conan lock retries exceeded. Exiting..."
+      exit 1
+    fi
+
+    echo "Invoking conan lock."
+    RET=0
+    conan lock create "${REPO_ROOT}/conanfile.py" --user=orbitdeps --channel=stable \
+      ${BUILD_OPTION} \
+      --lockfile="${REPO_ROOT}/third_party/conan/lockfiles/base.lock" -pr ${CONAN_PROFILE} \
+      -o crashdump_server="$CRASHDUMP_SERVER" $PACKAGING_OPTION \
+      --lockfile-out="${REPO_ROOT}/build/conan.lock" || RET=$?
+  done
+
+  RET=1
+  RETRIES=4
+
+  until [ ${RET} -eq 0 ]; do
+    RETRIES=$(($RETRIES - 1))
+    if [ $RETRIES -eq 0 ]; then
+      echo "Number of conan install retries exceeded. Exiting..."
+      exit 1
+    fi
+
+    echo "Installs the requirements (conan install)."
+    RET=0
+    conan install -if "${REPO_ROOT}/build/" \
           ${BUILD_OPTION} \
           --lockfile="${REPO_ROOT}/build/conan.lock" \
-          "${REPO_ROOT}" | sed 's/^crashdump_server=.*$/crashump_server=<<hidden>>/'
+          "${REPO_ROOT}" | sed 's/^crashdump_server=.*$/crashump_server=<<hidden>>/' || RET=${PIPESTATUS[0]}
+  done
+
   echo "Starting the build (conan build)."
   conan build -bf "${REPO_ROOT}/build/" "${REPO_ROOT}"
 
@@ -171,11 +208,9 @@ if [ -n "$1" ]; then
   if [ "${BUILD_TYPE}" == "release" ] \
      || [ "${BUILD_TYPE}" == "nightly" ] \
      || [ "${BUILD_TYPE}" == "continuous_on_release_branch" ]; then
-    set +e
     echo "Uploading symbols to the symbol server."
     api_key=$(get_api_key "${OAUTH_TOKEN_HEADER}")
     upload_debug_symbols "${api_key}" "${REPO_ROOT}/build/bin" "${REPO_ROOT}/build/lib"
-    set -e
   fi
 
   # Signing the debian package
@@ -197,7 +232,7 @@ if [ -n "$1" ]; then
   fi
 
   # Package the Debian package, the signature and the ggp client into a zip for integration in the installer.
-  # Also package LinuxTracingIntegrationTests and OrbitFakeClient so that they can be run on YHITI.
+  # Also package LinuxTracingIntegrationTests, OrbitServiceIntegrationTests and OrbitFakeClient so that they can be run on YHITI.
   if [ -f ${KEYSTORE_PATH}/74938_SigningPrivateGpg ] && [[ $CONAN_PROFILE == ggp_* ]]; then
     echo "Create a zip containing OrbitService for integration in the installer."
     pushd "${REPO_ROOT}/build/package" > /dev/null
@@ -208,7 +243,8 @@ if [ -n "$1" ]; then
     cp -v lib/libOrbitVulkanLayer.so Orbit/collector/
     cp -v lib/VkLayer_Orbit_implicit.json Orbit/collector/
     cp -v bin/LinuxTracingIntegrationTests Orbit/collector/
-    cp -v lib/libLinuxTracingIntegrationTestPuppetSharedObject.so Orbit/collector/
+    cp -v bin/OrbitServiceIntegrationTests Orbit/collector/
+    cp -v lib/libIntegrationTestPuppetSharedObject.so Orbit/collector/
     cp -v bin/OrbitFakeClient Orbit/collector/
     zip Collector.zip -r Orbit/
     rm -rf Orbit/
@@ -227,7 +263,7 @@ if [ -n "$1" ]; then
     cp -v LICENSE Orbit/LICENSE.txt
     cp -av "${REPO_ROOT}/contrib/automation_tests" Orbit
     cp -v "${REPO_ROOT}/src/ApiInterface/include/ApiInterface/Orbit.h" Orbit/
-    zip -r Orbit.zip Orbit/
+    zip -r OrbitUI.zip Orbit/
     rm -rf Orbit/
     popd > /dev/null
   fi
@@ -296,6 +332,7 @@ if [ "$(uname -s)" == "Linux" ]; then
     -e KOKORO_JOB_NAME -e CONAN_PROFILE -e BUILD_TYPE \
     -e OAUTH_TOKEN_HEADER -e ORBIT_BYPASS_RELEASE_CHECK \
     -e ORBIT_BUILD_MISSING_PACKAGES \
+    --security-opt "seccomp=${KOKORO_ARTIFACTS_DIR}/github/orbitprofiler/kokoro/builds/linux/seccomp.json" \
     ${CONTAINER} \
     /mnt/github/orbitprofiler/kokoro/builds/build.sh in_docker
 else

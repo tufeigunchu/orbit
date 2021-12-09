@@ -23,8 +23,7 @@ class OrbitConan(ConanFile):
     description = "C/C++ Performance Profiler"
     settings = "os", "compiler", "build_type", "arch"
     generators = ["cmake_multi"]
-    options = {"system_mesa": [True, False],
-               "system_qt": [True, False], "with_gui": [True, False],
+    options = {"system_qt": [True, False], "with_gui": [True, False],
                "debian_packaging": [True, False],
                "fPIC": [True, False],
                "crashdump_server": "ANY",
@@ -33,8 +32,7 @@ class OrbitConan(ConanFile):
                "run_python_tests": [True, False],
                "build_target": "ANY",
                "deploy_opengl_software_renderer": [True, False]}
-    default_options = {"system_mesa": True,
-                       "system_qt": True, "with_gui": True,
+    default_options = {"system_qt": True, "with_gui": True,
                        "debian_packaging": False,
                        "fPIC": True,
                        "crashdump_server": "",
@@ -71,10 +69,6 @@ class OrbitConan(ConanFile):
         self.build_requires('gtest/1.11.0', force_host_context=True)
 
     def requirements(self):
-        if self.settings.os != "Windows" and self.options.with_gui and not self.options.system_qt and self.options.system_mesa:
-            raise ConanInvalidConfiguration("When disabling system_qt, you also have to "
-                                            "disable system mesa.")
-
         if self.options.deploy_opengl_software_renderer and self.settings.os != "Windows":
             raise ConanInvalidConfiguration("The OpenGL software renderer can only be deployed on Windows")
         if self.options.deploy_opengl_software_renderer and not self.options.with_gui:
@@ -83,36 +77,33 @@ class OrbitConan(ConanFile):
             raise ConanInvalidConfiguration("The OpenGL software renderer cannot be deployed when using a system-provided Qt installation.")
 
         self.requires("abseil/20200923.3")
-        self.requires("bzip2/1.0.8")
+        self.requires("bzip2/1.0.8", override=True)
         self.requires("capstone/4.0.1@{}#0".format(self._orbit_channel))
         self.requires("grpc/1.27.3@{}".format(self._orbit_channel))
-        self.requires("c-ares/1.15.0")
+        self.requires("c-ares/1.15.0", override=True)
         self.requires("llvm-core/12.0.0@{}".format(self._orbit_channel))
-        self.requires("lzma_sdk/19.00@orbitdeps/stable#a7bc173325d7463a0757dee5b08bf7fd")
-        self.requires("openssl/1.1.1k")
+        self.requires("lzma_sdk/19.00@orbitdeps/stable#a7bc173325d7463a0757dee5b08bf7fd", override=True)
+        self.requires("openssl/1.1.1k", override=True)
         self.requires("outcome/2.2.0")
         self.requires(
             "libprotobuf-mutator/20200506@{}#90ce749ca62b40e9c061d20fae4410e0".format(self._orbit_channel))
         if self.settings.os != "Windows":
             self.requires(
-                "libunwindstack/20210709@{}".format(self._orbit_channel))
+                "libunwindstack-android-dependencies/20210709@{}".format(self._orbit_channel))
             self.requires("volk/1.2.170")
             self.requires("vulkan-headers/1.1.114.0")
-        self.requires("zlib/1.2.11#9e0c292b60ce77402bd9be60dd68266f")
+        self.requires("zlib/1.2.11#9e0c292b60ce77402bd9be60dd68266f", override=True)
 
         if self.options.with_gui and self.options.with_crash_handling:
             self.requires("crashpad/20200624@{}".format(self._orbit_channel))
 
         if self.options.with_gui:
-            self.requires("freetype/2.10.0@bincrafters/stable#0")
+            self.requires("freetype/2.10.0@bincrafters/stable#0", override=True)
             self.requires("freetype-gl/79b03d9@{}".format(self._orbit_channel))
             self.requires("glad/0.1.34")
-            self.requires("imgui/1.69@bincrafters/stable#0")
-            self.requires("libpng/1.6.37@bincrafters/stable#0")
+            self.requires("imgui/1.85")
+            self.requires("libpng/1.6.37@bincrafters/stable#0", override=True)
             self.requires("libssh2/1.9.0#df2b6034da12cc5cb68bd3c5c22601bf")
-
-            if not self.options.system_mesa:
-                self.requires("libxi/1.7.10@bincrafters/stable#0")
 
             if not self.options.system_qt:
                 self.requires("qt/5.15.1@{}#e659e981368e4baba1a201b75ddb89b6".format(self._orbit_channel))
@@ -293,6 +284,7 @@ chmod -v 4775 /opt/developer/tools/OrbitService
         self.copy("OrbitClientGgp", src="bin/", dst="bin")
         self.copy("OrbitClientGgp.exe", src="bin/", dst="bin")
         self.copy("OrbitClientGgp.debug", src="bin/", dst="bin")
+        self.copy("crashpad_handler", src="bin/", dst="bin")
         self.copy("crashpad_handler.exe", src="bin/", dst="bin")
         self.copy("NOTICE")
         self.copy("NOTICE.Chromium")
@@ -304,11 +296,14 @@ chmod -v 4775 /opt/developer/tools/OrbitService
         self.copy("VkLayer_Orbit_implicit.json", src="lib/", dst="lib")
         self.copy("LinuxTracingIntegrationTests", src="bin/", dst="bin")
         self.copy("LinuxTracingIntegrationTests.debug", src="bin/", dst="bin")
-        self.copy("libLinuxTracingIntegrationTestPuppetSharedObject.so", src="lib/", dst="lib")
-        self.copy("libLinuxTracingIntegrationTestPuppetSharedObject.so.debug", src="lib/", dst="lib")
+        self.copy("OrbitServiceIntegrationTests", src="bin/", dst="bin")
+        self.copy("OrbitServiceIntegrationTests.debug", src="bin/", dst="bin")
+        self.copy("libIntegrationTestPuppetSharedObject.so", src="lib/", dst="lib")
+        self.copy("libIntegrationTestPuppetSharedObject.so.debug", src="lib/", dst="lib")
         self.copy("OrbitFakeClient", src="bin/", dst="bin")
         self.copy("OrbitFakeClient.debug", src="bin/", dst="bin")
         self.copy("opengl32sw.dll", src="bin/", dst="bin")
+        self.copy("msdia140.dll", src="bin/", dst="bin")
 
         if not self.options.system_qt:
             orbit_executable = "Orbit.exe" if self.settings.os == "Windows" else "Orbit"

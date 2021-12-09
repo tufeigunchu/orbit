@@ -10,6 +10,7 @@
 
 #include <functional>
 
+#include "ApiUtils/GetFunctionTableAddressPrefix.h"
 #include "ObjectUtils/Address.h"
 #include "ObjectUtils/LinuxMap.h"
 #include "OrbitBase/ExecutablePath.h"
@@ -20,14 +21,18 @@
 #include "UserSpaceInstrumentation/ExecuteInProcess.h"
 #include "UserSpaceInstrumentation/InjectLibraryInTracee.h"
 
+using orbit_api_utils::kOrbitApiGetFunctionTableAddressPrefix;
+using orbit_api_utils::kOrbitApiGetFunctionTableAddressWinPrefix;
 using orbit_grpc_protos::ApiFunction;
 using orbit_grpc_protos::CaptureOptions;
 using orbit_grpc_protos::ModuleInfo;
+using orbit_user_space_instrumentation::AttachAndStopNewThreadsOfProcess;
 using orbit_user_space_instrumentation::AttachAndStopProcess;
 using orbit_user_space_instrumentation::DetachAndContinueProcess;
 using orbit_user_space_instrumentation::DlopenInTracee;
 using orbit_user_space_instrumentation::DlsymInTracee;
 using orbit_user_space_instrumentation::ExecuteInProcess;
+using orbit_user_space_instrumentation::ExecuteInProcessWithMicrosoftCallingConvention;
 
 namespace {
 
@@ -82,7 +87,7 @@ ErrorMessageOr<void> SetApiEnabledInTracee(const CaptureOptions& capture_options
 
   int32_t pid = orbit_base::ToNativeProcessId(capture_options.pid());
 
-  OUTCOME_TRY(AttachAndStopProcess(pid));
+  OUTCOME_TRY(auto&& already_attached_tids, AttachAndStopProcess(pid));
 
   // Make sure we resume the target process, even on early-outs.
   orbit_base::unique_resource scope_exit{pid, [](int32_t pid) {
@@ -93,17 +98,20 @@ ErrorMessageOr<void> SetApiEnabledInTracee(const CaptureOptions& capture_options
 
   // Load liborbit.so and find api table initialization function.
   OUTCOME_TRY(auto&& liborbit_path, GetLibOrbitPath());
-  constexpr const char* kSetEnabledFunction = "orbit_api_set_enabled";
   OUTCOME_TRY(auto&& handle, DlopenInTracee(pid, liborbit_path, RTLD_NOW));
+  constexpr const char* kSetEnabledFunction = "orbit_api_set_enabled";
   OUTCOME_TRY(auto&& orbit_api_set_enabled_function,
               DlsymInTracee(pid, handle, kSetEnabledFunction));
+  constexpr const char* kSetEnabledWineFunction = "orbit_api_set_enabled_wine";
+  OUTCOME_TRY(auto&& orbit_api_set_enabled_wine_function,
+              DlsymInTracee(pid, handle, kSetEnabledWineFunction));
 
   // Initialize all api function tables.
   OUTCOME_TRY(auto&& modules_by_path, GetModulesByPathForPid(pid));
   for (const ApiFunction& api_function : capture_options.api_functions()) {
     // Filter api functions.
-    constexpr const char* kOrbitApiGetAddressPrefix = "orbit_api_get_function_table_address_v";
-    CHECK(absl::StartsWith(api_function.name(), kOrbitApiGetAddressPrefix));
+    CHECK(absl::StartsWith(api_function.name(), kOrbitApiGetFunctionTableAddressPrefix) ||
+          absl::StartsWith(api_function.name(), kOrbitApiGetFunctionTableAddressWinPrefix));
 
     // Get ModuleInfo associated with function.
     const ModuleInfo* module_info = FindModuleInfoForApiFunction(api_function, modules_by_path);
@@ -116,11 +124,36 @@ ErrorMessageOr<void> SetApiEnabledInTracee(const CaptureOptions& capture_options
         absl::bit_cast<void*>(orbit_object_utils::SymbolVirtualAddressToAbsoluteAddress(
             api_function.address(), module_info->address_start(), module_info->load_bias(),
             module_info->executable_segment_offset()));
-    OUTCOME_TRY(auto&& function_table_address, ExecuteInProcess(pid, api_function_address));
+    uint64_t function_table_address = 0;
+    if (absl::StartsWith(api_function.name(), kOrbitApiGetFunctionTableAddressPrefix)) {
+      // The target is a native Linux binary.
+      OUTCOME_TRY(function_table_address, ExecuteInProcess(pid, api_function_address));
+    } else if (absl::StartsWith(api_function.name(), kOrbitApiGetFunctionTableAddressWinPrefix)) {
+      // The target is a Windows binary running on Wine.
+      OUTCOME_TRY(function_table_address,
+                  ExecuteInProcessWithMicrosoftCallingConvention(pid, api_function_address));
+    } else {
+      UNREACHABLE();
+    }
 
     // Call "orbit_api_set_enabled" in tracee.
-    OUTCOME_TRY(ExecuteInProcess(pid, orbit_api_set_enabled_function, function_table_address,
-                                 api_function.api_version(), enabled ? 1 : 0));
+    if (absl::StartsWith(api_function.name(), kOrbitApiGetFunctionTableAddressPrefix)) {
+      // Again, Linux binary.
+      OUTCOME_TRY(ExecuteInProcess(pid, orbit_api_set_enabled_function, function_table_address,
+                                   api_function.api_version(), enabled ? 1 : 0));
+    } else if (absl::StartsWith(api_function.name(), kOrbitApiGetFunctionTableAddressWinPrefix)) {
+      // Windows binary running on Wine.
+      OUTCOME_TRY(ExecuteInProcess(pid, orbit_api_set_enabled_wine_function, function_table_address,
+                                   api_function.api_version(), enabled ? 1 : 0));
+    } else {
+      UNREACHABLE();
+    }
+
+    // `orbit_api_set_enabled` could spawn new threads (and will, the first time it's called). Stop
+    // those too, as this loop could be executed again and the assumption is that the target process
+    // is completely stopped.
+    OUTCOME_TRY(already_attached_tids,
+                AttachAndStopNewThreadsOfProcess(pid, already_attached_tids));
   }
 
   return outcome::success();

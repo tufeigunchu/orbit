@@ -4,8 +4,8 @@
 
 #include "PerfEventProcessor.h"
 
-#include <memory>
 #include <utility>
+#include <variant>
 
 #include "OrbitBase/Logging.h"
 #include "OrbitBase/Profiling.h"
@@ -13,14 +13,14 @@
 
 namespace orbit_linux_tracing {
 
-void PerfEventProcessor::AddEvent(std::unique_ptr<PerfEvent> event) {
-  if (last_processed_timestamp_ns_ > 0 && event->GetTimestamp() < last_processed_timestamp_ns_) {
+void PerfEventProcessor::AddEvent(PerfEvent&& event) {
+  const uint64_t timestamp = event.timestamp;
+  if (last_processed_timestamp_ns_ > 0 && timestamp < last_processed_timestamp_ns_) {
     if (discarded_out_of_order_counter_ != nullptr) {
       ++(*discarded_out_of_order_counter_);
     }
 
-    std::optional<std::unique_ptr<DiscardedPerfEvent>> discarded_perf_event =
-        HandleOutOfOrderEvent(event->GetTimestamp());
+    std::optional<DiscardedPerfEvent> discarded_perf_event = HandleOutOfOrderEvent(timestamp);
     if (discarded_perf_event.has_value()) {
       event_queue_.PushEvent(std::move(discarded_perf_event.value()));
     }
@@ -39,27 +39,39 @@ void PerfEventProcessor::AddEvent(std::unique_ptr<PerfEvent> event) {
 // burst of events coming (late) all one after the other and all from the same ring buffer, hence
 // generally in order. So even from a considerable amount of discarded PerfEvents result only few
 // DiscardedPerfEvents.
-std::optional<std::unique_ptr<DiscardedPerfEvent>> PerfEventProcessor::HandleOutOfOrderEvent(
+std::optional<DiscardedPerfEvent> PerfEventProcessor::HandleOutOfOrderEvent(
     uint64_t event_timestamp_ns) {
-  uint64_t discarded_begin = event_timestamp_ns;
-  uint64_t discarded_end = last_processed_timestamp_ns_;
+  const uint64_t discarded_begin = event_timestamp_ns;
+  const uint64_t discarded_end = last_processed_timestamp_ns_;
 
-  std::optional<std::unique_ptr<DiscardedPerfEvent>> optional_discarded_event = std::nullopt;
+  std::optional<DiscardedPerfEvent> optional_discarded_event = std::nullopt;
 
   CHECK(discarded_end >= last_discarded_end_);
   if (discarded_end == last_discarded_end_ && discarded_begin < last_discarded_begin_) {
-    optional_discarded_event = std::make_unique<DiscardedPerfEvent>(discarded_begin, discarded_end);
+    optional_discarded_event = optional_discarded_event = DiscardedPerfEvent{
+        .timestamp = discarded_end,
+        .data = {.begin_timestamp_ns = discarded_begin},
+    };
     last_discarded_begin_ = discarded_begin;
   } else if (discarded_end == last_discarded_end_ && discarded_begin >= last_discarded_begin_) {
     // This is the only case that doesn't generate a DiscardedPerfEvent.
   } else if (discarded_end > last_discarded_end_ && discarded_begin < last_discarded_begin_) {
-    optional_discarded_event = std::make_unique<DiscardedPerfEvent>(discarded_begin, discarded_end);
+    optional_discarded_event = DiscardedPerfEvent{
+        .timestamp = discarded_end,
+        .data = {.begin_timestamp_ns = discarded_begin},
+    };
     last_discarded_begin_ = discarded_begin;
   } else if (discarded_end > last_discarded_end_ && discarded_begin <= last_discarded_end_) {
-    optional_discarded_event = std::make_unique<DiscardedPerfEvent>(discarded_begin, discarded_end);
+    optional_discarded_event = DiscardedPerfEvent{
+        .timestamp = discarded_end,
+        .data = {.begin_timestamp_ns = discarded_begin},
+    };
     // Don't update last_discarded_begin_.
   } else if (discarded_end > last_discarded_end_ && discarded_begin > last_discarded_end_) {
-    optional_discarded_event = std::make_unique<DiscardedPerfEvent>(discarded_begin, discarded_end);
+    optional_discarded_event = DiscardedPerfEvent{
+        .timestamp = discarded_end,
+        .data = {.begin_timestamp_ns = discarded_begin},
+    };
     last_discarded_begin_ = discarded_begin;
   } else {
     UNREACHABLE();
@@ -75,35 +87,37 @@ std::optional<std::unique_ptr<DiscardedPerfEvent>> PerfEventProcessor::HandleOut
 void PerfEventProcessor::ProcessAllEvents() {
   CHECK(!visitors_.empty());
   while (event_queue_.HasEvent()) {
-    std::unique_ptr<PerfEvent> event = event_queue_.PopEvent();
+    const PerfEvent& event = event_queue_.TopEvent();
     // Events are guaranteed to be processed in order of timestamp
     // as out-of-order events are discarded in AddEvent.
-    CHECK(event->GetTimestamp() >= last_processed_timestamp_ns_);
-    last_processed_timestamp_ns_ = event->GetTimestamp();
+    CHECK(event.timestamp >= last_processed_timestamp_ns_);
+    last_processed_timestamp_ns_ = event.timestamp;
     for (PerfEventVisitor* visitor : visitors_) {
-      event->Accept(visitor);
+      event.Accept(visitor);
     }
+    event_queue_.PopEvent();
   }
 }
 
 void PerfEventProcessor::ProcessOldEvents() {
   CHECK(!visitors_.empty());
-  uint64_t current_timestamp_ns = orbit_base::CaptureTimestampNs();
+  const uint64_t current_timestamp_ns = orbit_base::CaptureTimestampNs();
 
   while (event_queue_.HasEvent()) {
-    PerfEvent* event = event_queue_.TopEvent();
+    const PerfEvent& event = event_queue_.TopEvent();
+    const uint64_t timestamp = event.timestamp;
 
     // Do not read the most recent events as out-of-order events could (and will) arrive.
-    if (event->GetTimestamp() + kProcessingDelayMs * 1'000'000 >= current_timestamp_ns) {
+    if (timestamp + kProcessingDelayMs * 1'000'000 >= current_timestamp_ns) {
       break;
     }
     // Events are guaranteed to be processed in order of timestamp
     // as out-of-order events are discarded in AddEvent.
-    CHECK(event->GetTimestamp() >= last_processed_timestamp_ns_);
-    last_processed_timestamp_ns_ = event->GetTimestamp();
+    CHECK(timestamp >= last_processed_timestamp_ns_);
+    last_processed_timestamp_ns_ = timestamp;
 
     for (PerfEventVisitor* visitor : visitors_) {
-      event->Accept(visitor);
+      event.Accept(visitor);
     }
     event_queue_.PopEvent();
   }

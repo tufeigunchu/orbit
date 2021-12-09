@@ -4,6 +4,7 @@
 
 #include "SessionSetup/ConnectToStadiaWidget.h"
 
+#include <absl/strings/match.h>
 #include <absl/strings/str_format.h>
 #include <grpcpp/create_channel.h>
 #include <grpcpp/security/credentials.h>
@@ -11,6 +12,8 @@
 
 #include <QApplication>
 #include <QCheckBox>
+#include <QComboBox>
+#include <QEventLoop>
 #include <QHBoxLayout>
 #include <QItemSelectionModel>
 #include <QLayout>
@@ -22,21 +25,30 @@
 #include <QTableView>
 #include <QVariant>
 #include <Qt>
+#include <algorithm>
 #include <filesystem>
 #include <memory>
 #include <optional>
 #include <system_error>
 #include <utility>
 
+#include "MainThreadExecutor.h"
+#include "OrbitBase/Future.h"
 #include "OrbitBase/Logging.h"
 #include "OrbitBase/Result.h"
 #include "OrbitGgp/Client.h"
 #include "OrbitGgp/InstanceItemModel.h"
+#include "OrbitGgp/Project.h"
 #include "OrbitSsh/AddrAndPort.h"
+#include "OrbitSsh/Credentials.h"
 #include "OrbitSshQt/ScopedConnection.h"
+#include "QtUtils/MainThreadExecutorImpl.h"
 #include "SessionSetup/Error.h"
+#include "SessionSetup/OtherUserDialog.h"
 #include "SessionSetup/OverlayWidget.h"
+#include "SessionSetup/RetrieveInstancesWidget.h"
 #include "SessionSetup/ServiceDeployManager.h"
+#include "SessionSetup/SessionSetupUtils.h"
 #include "ui_ConnectToStadiaWidget.h"
 
 namespace {
@@ -45,7 +57,12 @@ const QString kRememberChosenInstance{"RememberChosenInstance"};
 
 namespace orbit_session_setup {
 
+using orbit_base::Future;
+using orbit_ggp::Account;
 using orbit_ggp::Instance;
+using orbit_ggp::Project;
+using orbit_ggp::SshInfo;
+using orbit_ssh::Credentials;
 using orbit_ssh_qt::ScopedConnection;
 
 // The destructor needs to be defined here because it needs to see the type
@@ -55,10 +72,11 @@ ConnectToStadiaWidget::~ConnectToStadiaWidget() = default;
 ConnectToStadiaWidget::ConnectToStadiaWidget(QWidget* parent)
     : QWidget(parent),
       ui_(std::make_unique<Ui::ConnectToStadiaWidget>()),
+      main_thread_executor_(orbit_qt_utils::MainThreadExecutorImpl::Create()),
       s_idle_(&state_machine_),
       s_instances_loading_(&state_machine_),
       s_instance_selected_(&state_machine_),
-      s_waiting_for_creds_(&state_machine_),
+      s_loading_credentials_(&state_machine_),
       s_deploying_(&state_machine_),
       s_connected_(&state_machine_) {
   ui_->setupUi(this);
@@ -72,6 +90,10 @@ ConnectToStadiaWidget::ConnectToStadiaWidget(QWidget* parent)
 
   instance_proxy_model_.setSourceModel(&instance_model_);
   instance_proxy_model_.setSortRole(Qt::DisplayRole);
+  instance_proxy_model_.setFilterCaseSensitivity(Qt::CaseInsensitive);
+  // -1 means to filter based on *all* columns
+  // (https://doc.qt.io/qt-5/qsortfilterproxymodel.html#filterKeyColumn-prop)
+  instance_proxy_model_.setFilterKeyColumn(-1);
 
   ui_->instancesTableView->setModel(&instance_proxy_model_);
   ui_->instancesTableView->setSortingEnabled(true);
@@ -87,8 +109,14 @@ ConnectToStadiaWidget::ConnectToStadiaWidget(QWidget* parent)
                    this, &ConnectToStadiaWidget::OnSelectionChanged);
   QObject::connect(ui_->rememberCheckBox, &QCheckBox::toggled, this,
                    &ConnectToStadiaWidget::UpdateRememberInstance);
-  QObject::connect(ui_->refreshButton, &QPushButton::clicked, this,
-                   [this]() { emit InstanceReloadRequested(); });
+  QObject::connect(ui_->retrieveInstancesWidget, &RetrieveInstancesWidget::LoadingSuccessful, this,
+                   &ConnectToStadiaWidget::OnInstancesLoaded);
+  QObject::connect(ui_->retrieveInstancesWidget, &RetrieveInstancesWidget::FilterTextChanged,
+                   &instance_proxy_model_, &QSortFilterProxyModel::setFilterFixedString);
+  QObject::connect(ui_->connectButton, &QPushButton::clicked, this,
+                   &ConnectToStadiaWidget::Connect);
+  QObject::connect(ui_->instancesTableView, &QTableView::doubleClicked, this,
+                   &ConnectToStadiaWidget::Connect);
 
   SetupStateMachine();
 }
@@ -119,18 +147,15 @@ void ConnectToStadiaWidget::SetConnection(StadiaConnection connection) {
 }
 
 void ConnectToStadiaWidget::Start() {
-  if (ssh_connection_artifacts_ == nullptr) {
-    ERROR("Unable to start ConnectToStadiaWidget: ssh_connection_artifacts_ is nullptr");
-    return;
-  }
+  CHECK(ssh_connection_artifacts_ != nullptr);
 
-  auto client_result = orbit_ggp::Client::Create(this);
+  auto client_result = orbit_ggp::CreateClient();
   if (client_result.has_error()) {
     ui_->radioButton->setToolTip(QString::fromStdString(client_result.error().message()));
     setEnabled(false);
     return;
   }
-  ggp_client_ = client_result.value();
+  ggp_client_ = std::move(client_result.value());
 
   if (grpc_channel_ != nullptr && grpc_channel_->GetState(false) == GRPC_CHANNEL_READY) {
     state_machine_.setInitialState(&s_connected_);
@@ -139,6 +164,10 @@ void ConnectToStadiaWidget::Start() {
   }
 
   state_machine_.start();
+
+  retrieve_instances_ = RetrieveInstances::Create(ggp_client_.get(), main_thread_executor_.get());
+  ui_->retrieveInstancesWidget->SetRetrieveInstances(retrieve_instances_.get());
+  ui_->retrieveInstancesWidget->Start();
 }
 
 std::optional<StadiaConnection> ConnectToStadiaWidget::StopAndClearConnection() {
@@ -155,23 +184,12 @@ std::optional<StadiaConnection> ConnectToStadiaWidget::StopAndClearConnection() 
                           std::move(grpc_channel_));
 }
 
-void ConnectToStadiaWidget::DetachRadioButton() {
-  ui_->titleBarLayout->removeWidget(ui_->radioButton);
-  ui_->radioButton->setParent(ui_->mainFrame);
-  int left = 0;
-  int top = 0;
-  ui_->mainFrame->layout()->getContentsMargins(&left, &top, nullptr, nullptr);
-  int frame_border_width = ui_->mainFrame->lineWidth();
-  ui_->radioButton->move(left + frame_border_width, top + frame_border_width);
-  ui_->radioButton->show();
-}
-
 void ConnectToStadiaWidget::SetupStateMachine() {
   state_machine_.setGlobalRestorePolicy(QStateMachine::RestoreProperties);
 
   // PROPERTIES of states
   // STATE s_idle
-  s_idle_.assignProperty(ui_->refreshButton, "enabled", true);
+  s_idle_.assignProperty(ui_->retrieveInstancesWidget, "enabled", true);
   s_idle_.assignProperty(ui_->rememberCheckBox, "enabled", false);
   // STATE s_instances_loading
   s_instances_loading_.assignProperty(ui_->instancesTableOverlay, "visible", true);
@@ -180,13 +198,13 @@ void ConnectToStadiaWidget::SetupStateMachine() {
   s_instances_loading_.assignProperty(ui_->instancesTableOverlay, "cancelable", false);
   s_instances_loading_.assignProperty(ui_->rememberCheckBox, "enabled", false);
   // STATE s_instance_selected
-  s_instance_selected_.assignProperty(ui_->refreshButton, "enabled", true);
+  s_instance_selected_.assignProperty(ui_->retrieveInstancesWidget, "enabled", true);
   s_instance_selected_.assignProperty(ui_->connectButton, "enabled", true);
   // STATE s_waiting_for_creds
-  s_waiting_for_creds_.assignProperty(ui_->instancesTableOverlay, "visible", true);
-  s_waiting_for_creds_.assignProperty(ui_->instancesTableOverlay, "statusMessage",
-                                      "Loading encryption credentials for instance...");
-  s_waiting_for_creds_.assignProperty(ui_->instancesTableOverlay, "cancelable", true);
+  s_loading_credentials_.assignProperty(ui_->instancesTableOverlay, "visible", true);
+  s_loading_credentials_.assignProperty(ui_->instancesTableOverlay, "statusMessage",
+                                        "Loading encryption credentials for instance...");
+  s_loading_credentials_.assignProperty(ui_->instancesTableOverlay, "cancelable", true);
   // STATE s_deploying
   s_deploying_.assignProperty(ui_->instancesTableOverlay, "visible", true);
   s_deploying_.assignProperty(ui_->instancesTableOverlay, "cancelable", true);
@@ -198,41 +216,39 @@ void ConnectToStadiaWidget::SetupStateMachine() {
 
   // TRANSITIONS (and entered/exit events)
   // STATE s_idle_
-  s_idle_.addTransition(ui_->refreshButton, &QPushButton::clicked, &s_instances_loading_);
+  s_idle_.addTransition(ui_->retrieveInstancesWidget, &RetrieveInstancesWidget::LoadingStarted,
+                        &s_instances_loading_);
   s_idle_.addTransition(this, &ConnectToStadiaWidget::InstanceSelected, &s_instance_selected_);
 
   // STATE s_instances_loading_
-  QObject::connect(&s_instances_loading_, &QState::entered, this,
-                   &ConnectToStadiaWidget::ReloadInstances);
-
-  s_instances_loading_.addTransition(this, &ConnectToStadiaWidget::ErrorOccurred, &s_idle_);
+  s_instances_loading_.addTransition(ui_->retrieveInstancesWidget,
+                                     &RetrieveInstancesWidget::LoadingFailed, &s_idle_);
   s_instances_loading_.addTransition(this, &ConnectToStadiaWidget::ReceivedInstances, &s_idle_);
 
   // STATE s_instance_selected_
-  s_instance_selected_.addTransition(this, &ConnectToStadiaWidget::InstanceReloadRequested,
+  s_instance_selected_.addTransition(this, &ConnectToStadiaWidget::InstancesLoading,
                                      &s_instances_loading_);
-  s_instance_selected_.addTransition(ui_->connectButton, &QPushButton::clicked,
-                                     &s_waiting_for_creds_);
-  s_instance_selected_.addTransition(ui_->instancesTableView, &QTableView::doubleClicked,
-                                     &s_waiting_for_creds_);
-  s_instance_selected_.addTransition(this, &ConnectToStadiaWidget::Connect, &s_waiting_for_creds_);
+  s_instance_selected_.addTransition(ui_->retrieveInstancesWidget,
+                                     &RetrieveInstancesWidget::LoadingStarted,
+                                     &s_instances_loading_);
+  s_instance_selected_.addTransition(this, &ConnectToStadiaWidget::Connecting,
+                                     &s_loading_credentials_);
   QObject::connect(&s_instance_selected_, &QState::entered, this, [this]() {
     if (instance_model_.rowCount() == 0) {
-      emit InstanceReloadRequested();
+      emit InstancesLoading();
     }
   });
 
   // STATE s_waiting_for_creds_
-  QObject::connect(&s_waiting_for_creds_, &QState::entered, this,
-                   &ConnectToStadiaWidget::CheckCredentialsAvailableOrLoad);
+  QObject::connect(&s_loading_credentials_, &QState::entered, this,
+                   &ConnectToStadiaWidget::LoadCredentials);
 
-  s_waiting_for_creds_.addTransition(this, &ConnectToStadiaWidget::ReceivedSshInfo,
-                                     &s_waiting_for_creds_);
-  s_waiting_for_creds_.addTransition(this, &ConnectToStadiaWidget::ReadyToDeploy, &s_deploying_);
-  s_waiting_for_creds_.addTransition(ui_->instancesTableOverlay, &OverlayWidget::Cancelled,
-                                     &s_instance_selected_);
-  s_waiting_for_creds_.addTransition(this, &ConnectToStadiaWidget::ErrorOccurred,
-                                     &s_instance_selected_);
+  s_loading_credentials_.addTransition(this, &ConnectToStadiaWidget::CredentialsLoaded,
+                                       &s_deploying_);
+  s_loading_credentials_.addTransition(ui_->instancesTableOverlay, &OverlayWidget::Cancelled,
+                                       &s_instance_selected_);
+  s_loading_credentials_.addTransition(this, &ConnectToStadiaWidget::ErrorOccurred,
+                                       &s_instance_selected_);
 
   // STATE s_deploying_
   QObject::connect(&s_deploying_, &QState::entered, this,
@@ -255,51 +271,32 @@ void ConnectToStadiaWidget::SetupStateMachine() {
   s_connected_.addTransition(this, &ConnectToStadiaWidget::ErrorOccurred, &s_instance_selected_);
 }
 
-void ConnectToStadiaWidget::ReloadInstances() {
-  CHECK(ggp_client_ != nullptr);
-  instance_model_.SetInstances({});
-
-  ggp_client_->GetInstancesAsync([this](ErrorMessageOr<QVector<Instance>> instances) {
-    OnInstancesLoaded(std::move(instances));
-  });
-}
-
-void ConnectToStadiaWidget::CheckCredentialsAvailableOrLoad() {
+void ConnectToStadiaWidget::LoadCredentials() {
   CHECK(selected_instance_.has_value());
 
-  const std::string instance_id = selected_instance_->id.toStdString();
+  const std::string instance_id{selected_instance_->id.toStdString()};
 
-  if (!instance_credentials_.contains(instance_id)) {
-    if (!instance_credentials_loading_.contains(instance_id)) {
-      instance_credentials_loading_.emplace(instance_id);
-      ggp_client_->GetSshInfoAsync(
-          selected_instance_.value(),
-          [this, instance_id](ErrorMessageOr<orbit_ggp::SshInfo> ssh_info_result) {
-            OnSshInfoLoaded(std::move(ssh_info_result), instance_id);
-          });
-    }
+  if (instance_credentials_.contains(instance_id)) {
+    emit CredentialsLoaded();
     return;
   }
 
-  if (instance_credentials_.at(instance_id).has_error()) {
-    emit ErrorOccurred(
-        QString::fromStdString(instance_credentials_.at(instance_id).error().message()));
-    return;
-  }
-
-  emit ReadyToDeploy();
+  auto future = ggp_client_->GetSshInfoAsync(selected_instance_.value().id, selected_project_);
+  future.Then(main_thread_executor_.get(),
+              [this, instance_id](ErrorMessageOr<orbit_ggp::SshInfo> ssh_info_result) {
+                OnSshInfoLoaded(std::move(ssh_info_result), instance_id);
+              });
 }
 
 void ConnectToStadiaWidget::DeployOrbitService() {
+  CHECK(ssh_connection_artifacts_ != nullptr);
   CHECK(service_deploy_manager_ == nullptr);
   CHECK(selected_instance_.has_value());
   const std::string instance_id = selected_instance_->id.toStdString();
   CHECK(instance_credentials_.contains(instance_id));
-  CHECK(instance_credentials_.at(instance_id).has_value());
 
-  const orbit_ssh::Credentials& credentials{instance_credentials_.at(instance_id).value()};
+  const Credentials& credentials{instance_credentials_.at(instance_id)};
 
-  CHECK(ssh_connection_artifacts_ != nullptr);
   service_deploy_manager_ = std::make_unique<ServiceDeployManager>(
       ssh_connection_artifacts_->GetDeploymentConfiguration(),
       ssh_connection_artifacts_->GetSshContext(), credentials,
@@ -312,7 +309,7 @@ void ConnectToStadiaWidget::DeployOrbitService() {
       QObject::connect(ui_->instancesTableOverlay, &OverlayWidget::Cancelled,
                        service_deploy_manager_.get(), &ServiceDeployManager::Cancel)};
 
-  const auto deployment_result = service_deploy_manager_->Exec();
+  const auto deployment_result = service_deploy_manager_->Exec(metrics_uploader_);
   if (!deployment_result) {
     Disconnect();
     if (deployment_result.error() == make_error_code(Error::kUserCanceledServiceDeployment)) {
@@ -332,13 +329,8 @@ void ConnectToStadiaWidget::DeployOrbitService() {
                                .arg(QString::fromStdString(error.message())));
       });
 
-  LOG("Deployment successful, grpc_port: %d", deployment_result.value().grpc_port);
   CHECK(grpc_channel_ == nullptr);
-  std::string grpc_server_address =
-      absl::StrFormat("127.0.0.1:%d", deployment_result.value().grpc_port);
-  LOG("Starting gRPC channel to: %s", grpc_server_address);
-  grpc_channel_ = grpc::CreateCustomChannel(grpc_server_address, grpc::InsecureChannelCredentials(),
-                                            grpc::ChannelArguments());
+  grpc_channel_ = CreateGrpcChannel(deployment_result.value().grpc_port);
   CHECK(grpc_channel_ != nullptr);
 
   emit Connected();
@@ -346,11 +338,6 @@ void ConnectToStadiaWidget::DeployOrbitService() {
 
 void ConnectToStadiaWidget::Disconnect() {
   grpc_channel_ = nullptr;
-
-  // TODO(b/174561221) currently does not work
-  // if (service_deploy_manager_ != nullptr) {
-  //   service_deploy_manager_->Shutdown();
-  // }
   service_deploy_manager_ = nullptr;
   ui_->rememberCheckBox->setChecked(false);
 
@@ -392,16 +379,8 @@ void ConnectToStadiaWidget::UpdateRememberInstance(bool value) {
   }
 }
 
-void ConnectToStadiaWidget::OnInstancesLoaded(
-    ErrorMessageOr<QVector<orbit_ggp::Instance>> instances) {
-  if (instances.has_error()) {
-    emit ErrorOccurred(QString("Orbit was unable to retrieve the list of available Stadia "
-                               "instances. The error message was: %1")
-                           .arg(QString::fromStdString(instances.error().message())));
-    return;
-  }
-
-  instance_model_.SetInstances(instances.value());
+void ConnectToStadiaWidget::OnInstancesLoaded(QVector<orbit_ggp::Instance> instances) {
+  instance_model_.SetInstances(std::move(instances));
   emit ReceivedInstances();
 
   TrySelectRememberedInstance();
@@ -409,28 +388,21 @@ void ConnectToStadiaWidget::OnInstancesLoaded(
 
 void ConnectToStadiaWidget::OnSshInfoLoaded(ErrorMessageOr<orbit_ggp::SshInfo> ssh_info_result,
                                             std::string instance_id) {
-  instance_credentials_loading_.erase(instance_id);
-
   if (ssh_info_result.has_error()) {
     std::string error_message =
         absl::StrFormat("Unable to load encryption credentials for instance with id %s: %s",
                         instance_id, ssh_info_result.error().message());
     ERROR("%s", error_message);
-    instance_credentials_.emplace(instance_id, ErrorMessage(error_message));
-  } else {
-    LOG("Received ssh info for instance with id: %s", instance_id);
-
-    orbit_ggp::SshInfo& ssh_info{ssh_info_result.value()};
-    orbit_ssh::Credentials credentials;
-    credentials.addr_and_port = {ssh_info.host.toStdString(), ssh_info.port};
-    credentials.key_path = ssh_info.key_path.toStdString();
-    credentials.known_hosts_path = ssh_info.known_hosts_path.toStdString();
-    credentials.user = ssh_info.user.toStdString();
-
-    instance_credentials_.emplace(instance_id, std::move(credentials));
+    emit ErrorOccurred(QString::fromStdString(error_message));
+    return;
   }
 
-  emit ReceivedSshInfo();
+  LOG("Received ssh info for instance with id: %s", instance_id);
+
+  orbit_ggp::SshInfo& ssh_info{ssh_info_result.value()};
+  instance_credentials_.emplace(instance_id, CredentialsFromSshInfo(ssh_info));
+
+  emit CredentialsLoaded();
 }
 
 void ConnectToStadiaWidget::TrySelectRememberedInstance() {
@@ -444,19 +416,47 @@ void ConnectToStadiaWidget::TrySelectRememberedInstance() {
 
   ui_->instancesTableView->selectionModel()->setCurrentIndex(
       matches[0], {QItemSelectionModel::SelectCurrent, QItemSelectionModel::Rows});
-  emit Connect();
+  emit Connecting();
   remembered_instance_id_ = std::nullopt;
 }
 
-void ConnectToStadiaWidget::showEvent(QShowEvent* event) {
-  QWidget::showEvent(event);
-  // It is important that the call to DetachRadioButton is done here and not during construction.
-  // For high dpi display settings in Windows (scaling) the the actual width and height of the radio
-  // button is not known during construction. Hence the call is done when the widget is shown, not
-  // when its constructed
-  DetachRadioButton();
+bool ConnectToStadiaWidget::IsActive() const { return ui_->contentFrame->isEnabled(); }
+
+void ConnectToStadiaWidget::Connect() {
+  CHECK(selected_instance_.has_value());
+
+  auto account_result = GetAccountSync();
+  if (account_result.has_error()) {
+    emit ErrorOccurred(QString::fromStdString(account_result.error().message()));
+    return;
+  }
+
+  if (!absl::StartsWith(account_result.value().email.toStdString(),
+                        selected_instance_->owner.toStdString())) {
+    OtherUserDialog dialog{selected_instance_->owner, this};
+    auto dialog_result = dialog.Exec();
+    if (dialog_result.has_error()) return;
+  }
+
+  emit Connecting();
 }
 
-bool ConnectToStadiaWidget::IsActive() const { return ui_->contentFrame->isEnabled(); }
+ErrorMessageOr<Account> ConnectToStadiaWidget::GetAccountSync() {
+  if (cached_account_ != std::nullopt) return cached_account_.value();
+
+  // This async call is not doing network calls, only reads local config files, hence it is fast and
+  // used in a syncronous manner here. A timeout of 3 is used anyways
+  ErrorMessageOr<Account> future_result = ErrorMessage{"Call to \"ggp auth list\" timed out."};
+  auto account_future = ggp_client_->GetDefaultAccountAsync().Then(
+      main_thread_executor_.get(), [&future_result](ErrorMessageOr<Account> result) -> void {
+        future_result = std::move(result);
+      });
+
+  main_thread_executor_->WaitFor(account_future, std::chrono::seconds(3));
+
+  OUTCOME_TRY(cached_account_, future_result);
+
+  return cached_account_.value();
+}
 
 }  // namespace orbit_session_setup

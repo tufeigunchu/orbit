@@ -12,12 +12,12 @@
 #include <string_view>
 
 #include "CallstackThreadBar.h"
+#include "ClientProtos/capture_data.pb.h"
 #include "CoreMath.h"
 #include "GpuDebugMarkerTrack.h"
 #include "PickingManager.h"
 #include "StringManager/StringManager.h"
 #include "Track.h"
-#include "capture_data.pb.h"
 
 class OrbitApp;
 class TextRenderer;
@@ -29,10 +29,11 @@ class TextRenderer;
 // This track is meant to be used as a subtrack of `GpuTrack`.
 class GpuSubmissionTrack : public TimerTrack {
  public:
-  explicit GpuSubmissionTrack(Track* parent, TimeGraph* time_graph, orbit_gl::Viewport* viewport,
-                              TimeGraphLayout* layout, uint64_t timeline_hash, OrbitApp* app,
+  explicit GpuSubmissionTrack(Track* parent, const orbit_gl::TimelineInfoInterface* timeline_info,
+                              orbit_gl::Viewport* viewport, TimeGraphLayout* layout,
+                              uint64_t timeline_hash, OrbitApp* app,
                               const orbit_client_data::CaptureData* capture_data,
-                              orbit_client_data::TrackData* track_data);
+                              orbit_client_data::TimerData* timer_data);
   ~GpuSubmissionTrack() override = default;
 
   [[nodiscard]] Track* GetParent() const override { return parent_; }
@@ -57,7 +58,7 @@ class GpuSubmissionTrack : public TimerTrack {
   void OnTimer(const orbit_client_protos::TimerInfo& timer_info) override;
 
   [[nodiscard]] bool IsCollapsible() const override {
-    return track_data_->GetMaxDepth() > 1 || has_vulkan_layer_command_buffer_timers_;
+    return GetDepth() > 1 || has_vulkan_layer_command_buffer_timers_;
   }
   [[nodiscard]] bool IsCollapsed() const override {
     return Track::IsCollapsed() || GetParent()->IsCollapsed();
@@ -66,7 +67,8 @@ class GpuSubmissionTrack : public TimerTrack {
  protected:
   [[nodiscard]] bool IsTimerActive(const orbit_client_protos::TimerInfo& timer) const override;
   [[nodiscard]] Color GetTimerColor(const orbit_client_protos::TimerInfo& timer, bool is_selected,
-                                    bool is_highlighted) const override;
+                                    bool is_highlighted,
+                                    const internal::DrawData& draw_data) const override;
   [[nodiscard]] bool TimerFilter(const orbit_client_protos::TimerInfo& timer) const override;
 
   [[nodiscard]] std::string GetTimesliceText(

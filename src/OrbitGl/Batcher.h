@@ -17,11 +17,12 @@
 #include <utility>
 #include <vector>
 
-#include "BlockChain.h"
+#include "ClientProtos/capture_data.pb.h"
+#include "Containers/BlockChain.h"
 #include "CoreMath.h"
 #include "Geometry.h"
 #include "PickingManager.h"
-#include "capture_data.pb.h"
+#include "TranslationStack.h"
 
 using TooltipCallback = std::function<std::string(PickingId)>;
 
@@ -43,9 +44,9 @@ struct LineBuffer {
   }
 
   static const int NUM_LINES_PER_BLOCK = 64 * 1024;
-  BlockChain<Line, NUM_LINES_PER_BLOCK> lines_;
-  BlockChain<Color, 2 * NUM_LINES_PER_BLOCK> colors_;
-  BlockChain<Color, 2 * NUM_LINES_PER_BLOCK> picking_colors_;
+  orbit_containers::BlockChain<Line, NUM_LINES_PER_BLOCK> lines_;
+  orbit_containers::BlockChain<Color, 2 * NUM_LINES_PER_BLOCK> colors_;
+  orbit_containers::BlockChain<Color, 2 * NUM_LINES_PER_BLOCK> picking_colors_;
 };
 
 struct BoxBuffer {
@@ -56,9 +57,9 @@ struct BoxBuffer {
   }
 
   static const int NUM_BOXES_PER_BLOCK = 64 * 1024;
-  BlockChain<Box, NUM_BOXES_PER_BLOCK> boxes_;
-  BlockChain<Color, 4 * NUM_BOXES_PER_BLOCK> colors_;
-  BlockChain<Color, 4 * NUM_BOXES_PER_BLOCK> picking_colors_;
+  orbit_containers::BlockChain<Box, NUM_BOXES_PER_BLOCK> boxes_;
+  orbit_containers::BlockChain<Color, 4 * NUM_BOXES_PER_BLOCK> colors_;
+  orbit_containers::BlockChain<Color, 4 * NUM_BOXES_PER_BLOCK> picking_colors_;
 };
 
 struct TriangleBuffer {
@@ -69,9 +70,9 @@ struct TriangleBuffer {
   }
 
   static const int NUM_TRIANGLES_PER_BLOCK = 64 * 1024;
-  BlockChain<Triangle, NUM_TRIANGLES_PER_BLOCK> triangles_;
-  BlockChain<Color, 3 * NUM_TRIANGLES_PER_BLOCK> colors_;
-  BlockChain<Color, 3 * NUM_TRIANGLES_PER_BLOCK> picking_colors_;
+  orbit_containers::BlockChain<Triangle, NUM_TRIANGLES_PER_BLOCK> triangles_;
+  orbit_containers::BlockChain<Color, 3 * NUM_TRIANGLES_PER_BLOCK> colors_;
+  orbit_containers::BlockChain<Color, 3 * NUM_TRIANGLES_PER_BLOCK> picking_colors_;
 };
 
 struct PrimitiveBuffers {
@@ -117,8 +118,8 @@ class Batcher {
   Batcher(const Batcher&) = delete;
   Batcher(Batcher&&) = delete;
 
-  void PushTranslation(float x, float y, float z = 0.f);
-  void PopTranslation();
+  void PushTranslation(float x, float y, float z = 0.f) { translations_.PushTranslation(x, y, z); }
+  void PopTranslation() { translations_.PopTranslation(); }
 
   void AddLine(Vec2 from, Vec2 to, float z, const Color& color,
                std::unique_ptr<PickingUserData> user_data = nullptr);
@@ -196,8 +197,6 @@ class Batcher {
                    const Color& picking_color,
                    std::unique_ptr<PickingUserData> user_data = nullptr);
 
-  [[nodiscard]] Vec3 TransformVertex(const Vec3& input) const;
-
   BatcherId batcher_id_;
   PickingManager* picking_manager_;
   std::unordered_map<float, PrimitiveBuffers> primitive_buffers_by_layer_;
@@ -206,8 +205,7 @@ class Batcher {
 
   std::vector<Vec2> circle_points;
 
-  std::vector<Vec3> translation_stack_;
-  Vec3 current_translation_ = Vec3(0.f, 0.f, 0.f);
+  orbit_gl::TranslationStack translations_;
 };
 
 #endif

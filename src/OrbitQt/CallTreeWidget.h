@@ -18,6 +18,7 @@
 #include <QString>
 #include <QStyleOptionViewItem>
 #include <QStyledItemDelegate>
+#include <QTimer>
 #include <QVariant>
 #include <QWidget>
 #include <Qt>
@@ -53,9 +54,10 @@ class CallTreeWidget : public QWidget {
   void resizeEvent(QResizeEvent* event) override;
 
  private slots:
-  void onCopyKeySequencePressed();
-  void onCustomContextMenuRequested(const QPoint& point);
-  void onSearchLineEditTextEdited(const QString& text);
+  void OnCopyKeySequencePressed();
+  void OnCustomContextMenuRequested(const QPoint& point);
+  void OnSearchLineEditTextEdited(const QString& text);
+  void OnSearchTypingFinishedTimerTimout();
 
  private:
   static const QString kActionExpandRecursively;
@@ -117,6 +119,7 @@ class CallTreeWidget : public QWidget {
   void ResizeColumnsIfNecessary();
 
   std::unique_ptr<Ui::CallTreeWidget> ui_;
+  QTimer* search_typing_finished_timer_ = new QTimer{this};
   OrbitApp* app_ = nullptr;
   std::unique_ptr<CallTreeViewItemModel> model_;
   std::unique_ptr<QIdentityProxyModel> hide_values_proxy_model_;

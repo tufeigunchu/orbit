@@ -12,25 +12,26 @@
 #include <string_view>
 
 #include "CallstackThreadBar.h"
+#include "ClientProtos/capture_data.pb.h"
 #include "CoreMath.h"
 #include "PickingManager.h"
 #include "StringManager/StringManager.h"
 #include "TimerTrack.h"
 #include "Track.h"
-#include "capture_data.pb.h"
 
 class OrbitApp;
 class TextRenderer;
 
 // This is a thin implementation of a `TimerTrack` to display Vulkan debug markers, used in the
 // `GpuTrack`.
-class GpuDebugMarkerTrack : public TimerTrack {
+class GpuDebugMarkerTrack final : public TimerTrack {
  public:
-  explicit GpuDebugMarkerTrack(CaptureViewElement* parent, TimeGraph* time_graph,
+  explicit GpuDebugMarkerTrack(CaptureViewElement* parent,
+                               const orbit_gl::TimelineInfoInterface* timeline_info,
                                orbit_gl::Viewport* viewport, TimeGraphLayout* layout,
                                uint64_t timeline_hash, OrbitApp* app,
                                const orbit_client_data::CaptureData* capture_data,
-                               orbit_client_data::TrackData* track_data);
+                               orbit_client_data::TimerData* timer_data);
 
   ~GpuDebugMarkerTrack() override = default;
 
@@ -48,7 +49,8 @@ class GpuDebugMarkerTrack : public TimerTrack {
       const orbit_client_protos::TimerInfo& timer_info) const override;
   [[nodiscard]] bool TimerFilter(const orbit_client_protos::TimerInfo& timer) const override;
   [[nodiscard]] Color GetTimerColor(const orbit_client_protos::TimerInfo& timer, bool is_selected,
-                                    bool is_highlighted) const override;
+                                    bool is_highlighted,
+                                    const internal::DrawData& draw_data) const override;
   [[nodiscard]] std::string GetTimesliceText(
       const orbit_client_protos::TimerInfo& timer) const override;
 

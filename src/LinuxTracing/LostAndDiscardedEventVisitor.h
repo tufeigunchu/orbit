@@ -5,10 +5,10 @@
 #ifndef LINUX_TRACING_LOST_AND_DISCARDED_EVENT_VISITOR_H_
 #define LINUX_TRACING_LOST_AND_DISCARDED_EVENT_VISITOR_H_
 
+#include "GrpcProtos/capture.pb.h"
+#include "LinuxTracing/TracerListener.h"
 #include "PerfEvent.h"
 #include "PerfEventVisitor.h"
-#include "TracingInterface/TracerListener.h"
-#include "capture.pb.h"
 
 namespace orbit_linux_tracing {
 
@@ -16,32 +16,31 @@ namespace orbit_linux_tracing {
 // MetadataEvents to the TracerListener.
 class LostAndDiscardedEventVisitor : public PerfEventVisitor {
  public:
-  explicit LostAndDiscardedEventVisitor(orbit_tracing_interface::TracerListener* listener)
-      : listener_{listener} {
+  explicit LostAndDiscardedEventVisitor(TracerListener* listener) : listener_{listener} {
     CHECK(listener_ != nullptr);
   }
 
-  void Visit(LostPerfEvent* event) override {
+  void Visit(uint64_t event_timestamp, const LostPerfEventData& event_data) override {
     orbit_grpc_protos::LostPerfRecordsEvent lost_perf_records_event;
-    lost_perf_records_event.set_duration_ns(event->GetTimestamp() - event->GetPreviousTimestamp());
-    lost_perf_records_event.set_end_timestamp_ns(event->GetTimestamp());
+    lost_perf_records_event.set_duration_ns(event_timestamp - event_data.previous_timestamp);
+    lost_perf_records_event.set_end_timestamp_ns(event_timestamp);
 
     CHECK(listener_ != nullptr);
     listener_->OnLostPerfRecordsEvent(std::move(lost_perf_records_event));
   }
 
-  void Visit(DiscardedPerfEvent* event) override {
+  void Visit(uint64_t event_timestamp, const DiscardedPerfEventData& event_data) override {
     orbit_grpc_protos::OutOfOrderEventsDiscardedEvent out_of_order_events_discarded_event;
-    out_of_order_events_discarded_event.set_duration_ns(event->GetEndTimestampNs() -
-                                                        event->GetBeginTimestampNs());
-    out_of_order_events_discarded_event.set_end_timestamp_ns(event->GetEndTimestampNs());
+    out_of_order_events_discarded_event.set_duration_ns(event_timestamp -
+                                                        event_data.begin_timestamp_ns);
+    out_of_order_events_discarded_event.set_end_timestamp_ns(event_timestamp);
 
     CHECK(listener_ != nullptr);
     listener_->OnOutOfOrderEventsDiscardedEvent(std::move(out_of_order_events_discarded_event));
   }
 
  private:
-  orbit_tracing_interface::TracerListener* listener_;
+  TracerListener* listener_;
 };
 
 }  // namespace orbit_linux_tracing

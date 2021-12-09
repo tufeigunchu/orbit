@@ -17,7 +17,9 @@
 #include "GlSlider.h"
 #include "OrbitAccessibility/AccessibleWidgetBridge.h"
 #include "PickingManager.h"
+#include "SimpleTimings.h"
 #include "TimeGraph.h"
+#include "absl/container/btree_map.h"
 
 class OrbitApp;
 
@@ -62,6 +64,8 @@ class CaptureWindow : public GlCanvas {
   void UpdateChildrenPosAndSize();
 
   virtual void DrawScreenSpace();
+  void RenderAllLayers();
+
   [[nodiscard]] float GetRightMargin() const { return right_margin_; }
   void UpdateRightMargin(float margin) { right_margin_ = margin; }
   virtual void RenderText(float layer);
@@ -98,6 +102,8 @@ class CaptureWindow : public GlCanvas {
   uint64_t select_start_time_ = 0;
   uint64_t select_stop_time_ = 0;
 
+  uint64_t last_frame_start_time_ = 0;
+
   bool click_was_drag_ = false;
   bool background_clicked_ = false;
 
@@ -105,6 +111,8 @@ class CaptureWindow : public GlCanvas {
   [[nodiscard]] std::unique_ptr<orbit_accessibility::AccessibleInterface>
   CreateAccessibleInterface() override;
   CaptureStats selection_stats_;
+
+  absl::btree_map<std::string, std::unique_ptr<orbit_gl::SimpleTimings>> scoped_frame_times_;
 };
 
 #endif  // ORBIT_GL_CAPTURE_WINDOW_H_

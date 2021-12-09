@@ -10,39 +10,14 @@ project(ServiceLib)
 add_library(ServiceLib STATIC)
 
 target_sources(ServiceLib PRIVATE
-        CaptureEventBuffer.h
-        CaptureEventSender.h
-        CaptureServiceImpl.cpp
-        CaptureServiceImpl.h
-        CaptureStartStopListener.h
-        CrashServiceImpl.cpp
-        CrashServiceImpl.h
-        FramePointerValidatorServiceImpl.cpp
-        FramePointerValidatorServiceImpl.h
-        MemoryInfoHandler.cpp
-        MemoryInfoHandler.h
         OrbitGrpcServer.cpp
         OrbitGrpcServer.h
         OrbitService.cpp
         OrbitService.h
-        Process.cpp
-        Process.h
-        ProcessList.cpp
-        ProcessList.h
-        ProcessServiceImpl.cpp
-        ProcessServiceImpl.h
-        ProducerEventProcessor.cpp
-        ProducerEventProcessor.h
         ProducerSideServer.cpp
         ProducerSideServer.h
         ProducerSideServiceImpl.cpp
-        ProducerSideServiceImpl.h
-        TracepointServiceImpl.h
-        TracepointServiceImpl.cpp
-        TracingHandler.cpp
-        TracingHandler.h
-        ServiceUtils.cpp
-        ServiceUtils.h)
+        ProducerSideServiceImpl.h)
 
 if(CMAKE_CXX_COMPILER_ID MATCHES "MSVC")
   set_target_properties(ServiceLib PROPERTIES COMPILE_FLAGS /wd4127)
@@ -51,16 +26,14 @@ endif()
 target_include_directories(ServiceLib PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 
 target_link_libraries(ServiceLib PUBLIC
-        ApiLoader
-        FramePointerValidator
+        CrashService
+        FramePointerValidatorService
         GrpcProtos
-        Introspection
-        LinuxTracing
-        MemoryTracing
-        ObjectUtils
+        LinuxCaptureService
         OrbitVersion
+        ProcessService
         ProducerSideChannel
-        UserSpaceInstrumentation)
+        TracepointService)
 
 project(OrbitService)
 add_executable(OrbitService main.cpp)
@@ -71,20 +44,11 @@ strip_symbols(OrbitService)
 add_executable(ServiceTests)
 
 target_sources(ServiceTests PRIVATE
-        ProcessListTest.cpp
-        ProcessTest.cpp
-        ProducerEventProcessorTest.cpp
-        ProducerSideServiceImplTest.cpp
-        ServiceUtilsTest.cpp)
+        ProducerSideServiceImplTest.cpp)
 
 target_link_libraries(ServiceTests PRIVATE
         ServiceLib
+        TestUtils
         GTest::Main)
 
 register_test(ServiceTests PROPERTIES TIMEOUT 10)
-
-add_fuzzer(OrbitServiceUtilsFindSymbolsFilePathFuzzer
-           OrbitServiceUtilsFindSymbolsFilePathFuzzer.cpp)
-target_link_libraries(
-        OrbitServiceUtilsFindSymbolsFilePathFuzzer PRIVATE ServiceLib
-        FuzzingUtils)

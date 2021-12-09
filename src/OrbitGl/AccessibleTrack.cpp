@@ -12,7 +12,6 @@
 #include "AccessibleTimeGraph.h"
 #include "CoreMath.h"
 #include "OrbitBase/Logging.h"
-#include "TimeGraph.h"
 #include "Track.h"
 #include "Viewport.h"
 
@@ -26,8 +25,7 @@ namespace {
 class FakeTrackTab : public CaptureViewElement {
  public:
   explicit FakeTrackTab(Track* track, TimeGraphLayout* layout)
-      : CaptureViewElement(track, track->GetTimeGraph(), track->GetViewport(), layout),
-        track_(track) {
+      : CaptureViewElement(track, track->GetViewport(), layout), track_(track) {
     // Compute and set the size (which would usually be done by the parent). As the position may
     // change, we override the GetPos() function.
     SetWidth(layout_->GetTrackTabWidth());
@@ -52,16 +50,18 @@ class FakeTrackTab : public CaptureViewElement {
 class FakeTimerPane : public CaptureViewElement {
  public:
   explicit FakeTimerPane(Track* track, TimeGraphLayout* layout, CaptureViewElement* track_tab)
-      : CaptureViewElement(track, track->GetTimeGraph(), track->GetViewport(), layout),
+      : CaptureViewElement(track, track->GetViewport(), layout),
         track_(track),
-        track_tab_(track_tab) {}
+        track_tab_(track_tab) {
+    SetWidth(track->GetWidth());
+  }
 
   std::unique_ptr<AccessibleInterface> CreateAccessibleInterface() override {
     return std::make_unique<AccessibleTimerPane>(this);
   }
 
   [[nodiscard]] Vec2 GetPos() const override {
-    std::vector<CaptureViewElement*> track_children = track_->GetVisibleChildren();
+    std::vector<CaptureViewElement*> track_children = track_->GetNonHiddenChildren();
 
     // We are looking for the track's child that is right above the timer pane.
     CaptureViewElement* predecessor = track_tab_;
@@ -70,13 +70,13 @@ class FakeTimerPane : public CaptureViewElement {
       predecessor = track_children[track_children.size() - 1];
     }
 
-    Vec2 pos{track_->GetPos()[0], predecessor->GetPos()[1] - predecessor->GetSize()[1]};
+    Vec2 pos{track_->GetPos()[0], predecessor->GetPos()[1] + predecessor->GetSize()[1]};
     return pos;
   }
 
   [[nodiscard]] float GetHeight() const override {
     float height = track_->GetHeight();
-    float track_header_height = track_->GetPos()[1] - GetPos()[1];
+    float track_header_height = GetPos()[1] - track_->GetPos()[1];
     height -= track_header_height;
     return height;
   }
@@ -91,10 +91,7 @@ class FakeTimerPane : public CaptureViewElement {
 AccessibleTrackTab::AccessibleTrackTab(CaptureViewElement* fake_track_tab, Track* track)
     : AccessibleCaptureViewElement(fake_track_tab), track_(track) {}
 
-const AccessibleInterface* AccessibleTrackTab::AccessibleChild(int index) const {
-  if (index == 0) {
-    return track_->GetTriangleToggle()->GetOrCreateAccessibleInterface();
-  }
+const AccessibleInterface* AccessibleTrackTab::AccessibleChild(int /*unused*/) const {
   return nullptr;
 }
 
@@ -117,10 +114,10 @@ int AccessibleTrack::AccessibleChildCount() const {
 
   // Only expose the "Timer" pane if any timers were rendered in the visible field
   if (track_->GetVisiblePrimitiveCount() > 0) {
-    return static_cast<int>(track_->GetVisibleChildren().size()) + 2;
+    return static_cast<int>(track_->GetNonHiddenChildren().size()) + 2;
   }
 
-  return static_cast<int>(track_->GetVisibleChildren().size()) + 1;
+  return static_cast<int>(track_->GetNonHiddenChildren().size()) + 1;
 }
 
 const AccessibleInterface* AccessibleTrack::AccessibleChild(int index) const {
@@ -131,7 +128,7 @@ const AccessibleInterface* AccessibleTrack::AccessibleChild(int index) const {
     return fake_tab_->GetOrCreateAccessibleInterface();
   }
 
-  const auto& children = track_->GetVisibleChildren();
+  const auto& children = track_->GetNonHiddenChildren();
   auto child_count = static_cast<int>(children.size());
 
   // The last child is the timer pane if it has timers.

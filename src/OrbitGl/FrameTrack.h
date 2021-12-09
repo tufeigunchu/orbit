@@ -13,22 +13,23 @@
 
 #include "CallstackThreadBar.h"
 #include "ClientData/TimerChain.h"
+#include "ClientProtos/capture_data.pb.h"
 #include "CoreMath.h"
 #include "PickingManager.h"
 #include "TimerTrack.h"
 #include "Track.h"
 #include "Viewport.h"
-#include "capture_data.pb.h"
 
 class OrbitApp;
 
 class FrameTrack : public TimerTrack {
  public:
-  explicit FrameTrack(CaptureViewElement* parent, TimeGraph* time_graph,
+  explicit FrameTrack(CaptureViewElement* parent,
+                      const orbit_gl::TimelineInfoInterface* timeline_info,
                       orbit_gl::Viewport* viewport, TimeGraphLayout* layout,
                       orbit_grpc_protos::InstrumentedFunction function, OrbitApp* app,
                       const orbit_client_data::CaptureData* capture_data,
-                      orbit_client_data::TrackData* track_data);
+                      orbit_client_data::TimerData* timer_data);
 
   [[nodiscard]] std::string GetName() const override {
     return absl::StrFormat("Frame track based on %s", function_.function_name());
@@ -52,12 +53,16 @@ class FrameTrack : public TimerTrack {
   [[nodiscard]] std::string GetTooltip() const override;
   [[nodiscard]] std::string GetBoxTooltip(const Batcher& batcher, PickingId id) const override;
 
-  void Draw(Batcher& batcher, TextRenderer& text_renderer,
-            const DrawContext& draw_context) override;
-
  protected:
+  void DoUpdatePrimitives(Batcher& batcher, TextRenderer& text_renderer, uint64_t min_tick,
+                          uint64_t max_tick, PickingMode picking_mode) override;
+
+  void DoDraw(Batcher& batcher, TextRenderer& text_renderer,
+              const DrawContext& draw_context) override;
+
   [[nodiscard]] Color GetTimerColor(const orbit_client_protos::TimerInfo& timer_info,
-                                    bool is_selected, bool is_highlighted) const override;
+                                    bool is_selected, bool is_highlighted,
+                                    const internal::DrawData& draw_data) const override;
   [[nodiscard]] float GetHeight() const override;
 
  private:

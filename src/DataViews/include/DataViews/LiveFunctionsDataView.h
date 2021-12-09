@@ -13,12 +13,12 @@
 #include <utility>
 #include <vector>
 
+#include "ClientProtos/capture_data.pb.h"
 #include "DataViews/AppInterface.h"
 #include "DataViews/DataView.h"
 #include "DataViews/LiveFunctionsInterface.h"
+#include "GrpcProtos/capture.pb.h"
 #include "MetricsUploader/MetricsUploader.h"
-#include "capture.pb.h"
-#include "capture_data.pb.h"
 
 namespace orbit_data_views {
 
@@ -29,8 +29,8 @@ class LiveFunctionsDataView : public DataView {
 
   const std::vector<Column>& GetColumns() override;
   int GetDefaultSortingColumn() override { return kColumnCount; }
-  std::vector<std::string> GetContextMenu(int clicked_index,
-                                          const std::vector<int>& selected_indices) override;
+  std::vector<std::vector<std::string>> GetContextMenuWithGrouping(
+      int clicked_index, const std::vector<int>& selected_indices) override;
   std::string GetValue(int row, int column) override;
   // As we allow single selection on Live tab, this method returns either an empty vector or a
   // single-value vector.
@@ -39,8 +39,6 @@ class LiveFunctionsDataView : public DataView {
   void UpdateSelectedFunctionId();
 
   void OnSelect(const std::vector<int>& rows) override;
-  void OnContextMenu(const std::string& action, int menu_index,
-                     const std::vector<int>& item_indices) override;
   void OnDataChanged() override;
   void OnTimer() override;
   void OnRefresh(const std::vector<int>& visible_selected_indices,
@@ -49,12 +47,16 @@ class LiveFunctionsDataView : public DataView {
   std::optional<int> GetRowFromFunctionId(uint64_t function_id);
   void AddFunction(uint64_t function_id, orbit_client_protos::FunctionInfo function_info);
 
+  void OnIteratorRequested(const std::vector<int>& selection) override;
+  void OnJumpToRequested(const std::string& action, const std::vector<int>& selection) override;
+  // Export all events (including the function name, thread name and id, start timestamp, end
+  // timestamp, and duration) associated with the selected rows in to a CSV file.
+  void OnExportEventsToCsvRequested(const std::vector<int>& selection) override;
+
  protected:
   void DoFilter() override;
   void DoSort() override;
   [[nodiscard]] uint64_t GetInstrumentedFunctionId(uint32_t row) const;
-  [[nodiscard]] const orbit_client_protos::FunctionInfo& GetInstrumentedFunction(
-      uint32_t row) const;
   [[nodiscard]] std::optional<orbit_client_protos::FunctionInfo>
   CreateFunctionInfoFromInstrumentedFunction(
       const orbit_grpc_protos::InstrumentedFunction& instrumented_function);
@@ -78,19 +80,9 @@ class LiveFunctionsDataView : public DataView {
     kNumColumns
   };
 
-  static const std::string kMenuActionSelect;
-  static const std::string kMenuActionUnselect;
-  static const std::string kMenuActionJumpToFirst;
-  static const std::string kMenuActionJumpToLast;
-  static const std::string kMenuActionJumpToMin;
-  static const std::string kMenuActionJumpToMax;
-  static const std::string kMenuActionDisassembly;
-  static const std::string kMenuActionSourceCode;
-  static const std::string kMenuActionIterate;
-  static const std::string kMenuActionEnableFrameTrack;
-  static const std::string kMenuActionDisableFrameTrack;
-
  private:
+  [[nodiscard]] const orbit_client_protos::FunctionInfo* GetFunctionInfoFromRow(int row) override;
+
   orbit_metrics_uploader::MetricsUploader* metrics_uploader_;
 };
 

@@ -22,13 +22,20 @@
 #include <optional>
 #include <string>
 
-#include "Connections.h"
+#include "MetricsUploader/MetricsUploader.h"
+#include "OrbitBase/Executor.h"
 #include "OrbitBase/Result.h"
+#include "OrbitGgp/Account.h"
 #include "OrbitGgp/Client.h"
 #include "OrbitGgp/Instance.h"
 #include "OrbitGgp/InstanceItemModel.h"
+#include "OrbitGgp/Project.h"
 #include "OrbitGgp/SshInfo.h"
 #include "OrbitSsh/Credentials.h"
+#include "QtUtils/MainThreadExecutorImpl.h"
+#include "SessionSetup/Connections.h"
+#include "SessionSetup/RetrieveInstances.h"
+#include "SessionSetup/RetrieveInstancesWidget.h"
 #include "SessionSetup/ServiceDeployManager.h"
 
 namespace Ui {
@@ -50,6 +57,9 @@ class ConnectToStadiaWidget : public QWidget {
   void SetSshConnectionArtifacts(SshConnectionArtifacts* ssh_connection_artifacts);
   void ClearSshConnectionArtifacts() { ssh_connection_artifacts_ = nullptr; }
   void SetConnection(StadiaConnection connection);
+  void SetMetricsUploader(orbit_metrics_uploader::MetricsUploader* metrics_uploader) {
+    metrics_uploader_ = metrics_uploader;
+  }
   void Start();
   [[nodiscard]] std::optional<orbit_ggp::Instance> GetSelectedInstance() const {
     return selected_instance_;
@@ -59,8 +69,8 @@ class ConnectToStadiaWidget : public QWidget {
   void SetActive(bool value);
 
  private slots:
-  void ReloadInstances();
-  void CheckCredentialsAvailableOrLoad();
+  void Connect();
+  void LoadCredentials();
   void DeployOrbitService();
   void Disconnect();
   void OnConnectToStadiaRadioButtonClicked(bool checked);
@@ -72,16 +82,14 @@ class ConnectToStadiaWidget : public QWidget {
   void ErrorOccurred(const QString& message);
   void ReceivedInstances();
   void InstanceSelected();
-  void ReceivedSshInfo();
-  void ReadyToDeploy();
-  void Connect();
+  void CredentialsLoaded();
+  void Connecting();
   void Activated();
   void Connected();
   void Disconnected();
-  void InstanceReloadRequested();
+  void InstancesLoading();
 
  private:
-  void showEvent(QShowEvent* event) override;
   std::unique_ptr<Ui::ConnectToStadiaWidget> ui_;
 
   orbit_ggp::InstanceItemModel instance_model_;
@@ -91,26 +99,31 @@ class ConnectToStadiaWidget : public QWidget {
   std::optional<orbit_ggp::Instance> selected_instance_;
   std::unique_ptr<ServiceDeployManager> service_deploy_manager_;
   std::shared_ptr<grpc::Channel> grpc_channel_;
-  QPointer<orbit_ggp::Client> ggp_client_ = nullptr;
+  std::unique_ptr<orbit_ggp::Client> ggp_client_;
   std::optional<QString> remembered_instance_id_;
+  QVector<orbit_ggp::Project> projects_;
+  std::optional<orbit_ggp::Project> selected_project_;
+  std::shared_ptr<orbit_qt_utils::MainThreadExecutorImpl> main_thread_executor_;
+  orbit_metrics_uploader::MetricsUploader* metrics_uploader_ = nullptr;
 
   // State Machine & States
   QStateMachine state_machine_;
   QState s_idle_;
   QState s_instances_loading_;
   QState s_instance_selected_;
-  QState s_waiting_for_creds_;
+  QState s_loading_credentials_;
   QState s_deploying_;
   QState s_connected_;
 
-  absl::flat_hash_set<std::string> instance_credentials_loading_;
-  absl::flat_hash_map<std::string, ErrorMessageOr<orbit_ssh::Credentials>> instance_credentials_;
+  absl::flat_hash_map<std::string, orbit_ssh::Credentials> instance_credentials_;
+  std::optional<orbit_ggp::Account> cached_account_;
+  std::unique_ptr<RetrieveInstances> retrieve_instances_;
 
-  void DetachRadioButton();
   void SetupStateMachine();
-  void OnInstancesLoaded(ErrorMessageOr<QVector<orbit_ggp::Instance>> instances);
+  void OnInstancesLoaded(QVector<orbit_ggp::Instance> instances);
   void OnSshInfoLoaded(ErrorMessageOr<orbit_ggp::SshInfo> ssh_info_result, std::string instance_id);
   void TrySelectRememberedInstance();
+  ErrorMessageOr<orbit_ggp::Account> GetAccountSync();
 };
 
 }  // namespace orbit_session_setup

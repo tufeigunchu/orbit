@@ -17,6 +17,7 @@
 #include <utility>
 #include <vector>
 
+#include "ClientData/ModuleData.h"
 #include "DataViews/AppInterface.h"
 #include "DataViews/DataViewType.h"
 #include "OrbitBase/Logging.h"
@@ -25,6 +26,35 @@
 enum class RefreshMode { kOnFilter, kOnSort, kOther };
 
 namespace orbit_data_views {
+
+// Hooking related actions
+constexpr std::string_view kMenuActionLoadSymbols = "Load Symbols";
+constexpr std::string_view kMenuActionSelect = "Hook";
+constexpr std::string_view kMenuActionUnselect = "Unhook";
+constexpr std::string_view kMenuActionEnableFrameTrack = "Enable frame track(s)";
+constexpr std::string_view kMenuActionDisableFrameTrack = "Disable frame track(s)";
+constexpr std::string_view kMenuActionAddIterator = "Add iterator(s)";
+
+constexpr std::string_view kMenuActionVerifyFramePointers = "Verify Frame Pointers";
+
+constexpr std::string_view kMenuActionDisassembly = "Go to Disassembly";
+constexpr std::string_view kMenuActionSourceCode = "Go to Source code";
+
+// Navigating related actions
+constexpr std::string_view kMenuActionJumpToFirst = "Jump to first";
+constexpr std::string_view kMenuActionJumpToLast = "Jump to last";
+constexpr std::string_view kMenuActionJumpToMin = "Jump to min";
+constexpr std::string_view kMenuActionJumpToMax = "Jump to max";
+
+// Preset related actions
+constexpr std::string_view kMenuActionLoadPreset = "Load Preset";
+constexpr std::string_view kMenuActionDeletePreset = "Delete Preset";
+constexpr std::string_view kMenuActionShowInExplorer = "Show in Explorer";
+
+// Exporting relate actions
+constexpr std::string_view kMenuActionCopySelection = "Copy Selection";
+constexpr std::string_view kMenuActionExportToCsv = "Export to CSV";
+constexpr std::string_view kMenuActionExportEventsToCsv = "Export events to CSV";
 
 // Values in the DataView may contain commas, for example, functions with arguments. We quote all
 // values in the output and also escape quotes (with a second quote) in values to ensure the CSV
@@ -57,8 +87,8 @@ class DataView {
   virtual const std::vector<Column>& GetColumns() = 0;
   virtual bool IsSortingAllowed() { return true; }
   virtual int GetDefaultSortingColumn() { return 0; }
-  virtual std::vector<std::string> GetContextMenu(int clicked_index,
-                                                  const std::vector<int>& selected_indices);
+  virtual std::vector<std::vector<std::string>> GetContextMenuWithGrouping(
+      int clicked_index, const std::vector<int>& selected_indices);
   virtual size_t GetNumElements() { return indices_.size(); }
   virtual std::string GetValue(int /*row*/, int /*column*/) { return ""; }
   virtual std::string GetValueForCopy(int row, int column) { return GetValue(row, column); }
@@ -75,8 +105,8 @@ class DataView {
                          const RefreshMode& /*mode*/) {}
 
   void OnSort(int column, std::optional<SortingOrder> new_order);
-  virtual void OnContextMenu(const std::string& action, int menu_index,
-                             const std::vector<int>& item_indices);
+  void OnContextMenu(const std::string& action, int menu_index,
+                     const std::vector<int>& item_indices);
   virtual void OnSelect(const std::vector<int>& /*indices*/) {}
   // This method returns the intersection of selected indices and visible indices. The returned
   // value contains 0 or 1 index for a DataView with single selection, and contains 0 or
@@ -97,14 +127,38 @@ class DataView {
   virtual void LinkDataView(DataView* /*data_view*/) {}
   virtual bool ScrollToBottom() { return false; }
   virtual bool SkipTimer() { return false; }
-  virtual ErrorMessageOr<void> ExportCsv(const std::filesystem::path& file_path);
-  virtual void CopySelection(const std::vector<int>& selection);
 
   int GetUpdatePeriodMs() const { return update_period_ms_; }
   [[nodiscard]] DataViewType GetType() const { return type_; }
   [[nodiscard]] virtual bool ResetOnRefresh() const { return true; }
 
+  void OnLoadSymbolsRequested(const std::vector<int>& selection);
+  virtual void OnSelectRequested(const std::vector<int>& selection);
+  virtual void OnUnselectRequested(const std::vector<int>& selection);
+  void OnEnableFrameTrackRequested(const std::vector<int>& selection);
+  void OnDisableFrameTrackRequested(const std::vector<int>& selection);
+  virtual void OnIteratorRequested(const std::vector<int>& /*selection*/) {}
+  void OnVerifyFramePointersRequested(const std::vector<int>& selection);
+  void OnDisassemblyRequested(const std::vector<int>& selection);
+  void OnSourceCodeRequested(const std::vector<int>& selection);
+  virtual void OnJumpToRequested(const std::string& /*action*/,
+                                 const std::vector<int>& /*selection*/) {}
+  virtual void OnLoadPresetRequested(const std::vector<int>& /*selection*/) {}
+  virtual void OnDeletePresetRequested(const std::vector<int>& /*selection*/) {}
+  virtual void OnShowInExplorerRequested(const std::vector<int>& /*selection*/) {}
+  void OnCopySelectionRequested(const std::vector<int>& selection);
+  void OnExportToCsvRequested();
+  virtual void OnExportEventsToCsvRequested(const std::vector<int>& /*selection*/) {}
+
  protected:
+  [[nodiscard]] virtual orbit_client_data::ModuleData* GetModuleDataFromRow(int /*row*/) const {
+    return nullptr;
+  }
+  [[nodiscard]] virtual const orbit_client_protos::FunctionInfo* GetFunctionInfoFromRow(
+      int /*row*/) {
+    return nullptr;
+  }
+
   void InitSortingOrders();
   virtual void DoSort() {}
   virtual void DoFilter() {}
@@ -117,9 +171,6 @@ class DataView {
   int update_period_ms_;
   absl::flat_hash_set<int> selected_indices_;
   DataViewType type_;
-
-  static const std::string kMenuActionCopySelection;
-  static const std::string kMenuActionExportToCsv;
 
   orbit_data_views::AppInterface* app_ = nullptr;
 };

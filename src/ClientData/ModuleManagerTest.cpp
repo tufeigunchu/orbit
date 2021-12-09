@@ -2,29 +2,21 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-#include <absl/strings/str_format.h>
 #include <gtest/gtest.h>
 #include <stdint.h>
 
 #include <string>
 #include <vector>
 
-#include "ClientData/FunctionUtils.h"
 #include "ClientData/ModuleData.h"
 #include "ClientData/ModuleManager.h"
-#include "ClientData/ProcessData.h"
-#include "capture_data.pb.h"
-#include "module.pb.h"
-#include "process.pb.h"
-#include "symbol.pb.h"
+#include "GrpcProtos/module.pb.h"
+#include "GrpcProtos/symbol.pb.h"
 
 namespace orbit_client_data {
 
-using orbit_client_protos::FunctionInfo;
 using orbit_grpc_protos::ModuleInfo;
 using orbit_grpc_protos::ModuleSymbols;
-using orbit_grpc_protos::ProcessInfo;
-using orbit_grpc_protos::SymbolInfo;
 
 TEST(ModuleManager, GetModuleByPathAndBuildId) {
   std::string name = "name of module";
@@ -43,21 +35,42 @@ TEST(ModuleManager, GetModuleByPathAndBuildId) {
   ModuleManager module_manager;
   EXPECT_TRUE(module_manager.AddOrUpdateModules({module_info}).empty());
 
-  const ModuleData* module = module_manager.GetModuleByPathAndBuildId(file_path, build_id);
-  ASSERT_NE(module, nullptr);
-  EXPECT_EQ(module->name(), name);
-  EXPECT_EQ(module->file_path(), file_path);
-  EXPECT_EQ(module->file_size(), file_size);
-  EXPECT_EQ(module->build_id(), build_id);
-  EXPECT_EQ(module->load_bias(), load_bias);
+  {
+    const ModuleData* module = module_manager.GetModuleByPathAndBuildId(file_path, build_id);
+    const ModuleData* mutable_module =
+        module_manager.GetMutableModuleByPathAndBuildId(file_path, build_id);
+    ASSERT_NE(module, nullptr);
+    EXPECT_EQ(module, mutable_module);
+    EXPECT_EQ(module->name(), name);
+    EXPECT_EQ(module->file_path(), file_path);
+    EXPECT_EQ(module->file_size(), file_size);
+    EXPECT_EQ(module->build_id(), build_id);
+    EXPECT_EQ(module->load_bias(), load_bias);
+  }
 
-  const ModuleData* module_invalid_path =
-      module_manager.GetModuleByPathAndBuildId("wrong/path", build_id);
-  EXPECT_EQ(module_invalid_path, nullptr);
+  {
+    const ModuleData* module_invalid_path =
+        module_manager.GetModuleByPathAndBuildId("wrong/path", build_id);
+    EXPECT_EQ(module_invalid_path, nullptr);
+  }
 
-  const ModuleData* module_invalid_build_id =
-      module_manager.GetModuleByPathAndBuildId(file_path, "wrong buildid");
-  EXPECT_EQ(module_invalid_build_id, nullptr);
+  {
+    const ModuleData* mutable_module_invalid_path =
+        module_manager.GetMutableModuleByPathAndBuildId("wrong/path", build_id);
+    EXPECT_EQ(mutable_module_invalid_path, nullptr);
+  }
+
+  {
+    const ModuleData* module_invalid_build_id =
+        module_manager.GetModuleByPathAndBuildId(file_path, "wrong buildid");
+    EXPECT_EQ(module_invalid_build_id, nullptr);
+  }
+
+  {
+    const ModuleData* module_invalid_build_id =
+        module_manager.GetMutableModuleByPathAndBuildId(file_path, "wrong buildid");
+    EXPECT_EQ(module_invalid_build_id, nullptr);
+  }
 }
 
 TEST(ModuleManager, GetMutableModuleByPathAndBuildId) {
@@ -91,6 +104,61 @@ TEST(ModuleManager, GetMutableModuleByPathAndBuildId) {
 
   EXPECT_EQ(module_manager.GetMutableModuleByPathAndBuildId("wrong/path", build_id), nullptr);
   EXPECT_EQ(module_manager.GetMutableModuleByPathAndBuildId(file_path, "wrong build_id"), nullptr);
+}
+
+TEST(ModuleManager, GetModuleByModuleInMemoryAndAddress) {
+  constexpr const char* kName = "name of module";
+  constexpr const char* kFilePath = "path/of/module";
+  constexpr uint64_t kFileSize = 300;
+  constexpr const char* kBuildId = "build id 1";
+  constexpr uint64_t kLoadBias = 0x4000;
+  constexpr uint64_t kExecutableSegmentOffset = 0x25;
+
+  ModuleInfo module_info;
+  module_info.set_name(kName);
+  module_info.set_file_path(kFilePath);
+  module_info.set_file_size(kFileSize);
+  module_info.set_build_id(kBuildId);
+  module_info.set_load_bias(kLoadBias);
+  module_info.set_executable_segment_offset(kExecutableSegmentOffset);
+
+  ModuleManager module_manager;
+  EXPECT_TRUE(module_manager.AddOrUpdateModules({module_info}).empty());
+
+  ModuleInMemory module_in_memory{0x1000, 0x2000, kFilePath, kBuildId};
+
+  EXPECT_NE(module_manager.GetModuleByPathAndBuildId(module_in_memory.file_path(),
+                                                     module_in_memory.build_id()),
+            nullptr);
+  EXPECT_EQ(module_manager.GetModuleByModuleInMemoryAndAbsoluteAddress(module_in_memory, 0x1000),
+            nullptr);
+  EXPECT_EQ(module_manager.GetModuleByModuleInMemoryAndAbsoluteAddress(module_in_memory, 0x1010),
+            nullptr);
+  EXPECT_EQ(module_manager.GetModuleByModuleInMemoryAndAbsoluteAddress(module_in_memory, 0x1024),
+            nullptr);
+  EXPECT_EQ(
+      module_manager.GetMutableModuleByModuleInMemoryAndAbsoluteAddress(module_in_memory, 0x1000),
+      nullptr);
+  EXPECT_EQ(
+      module_manager.GetMutableModuleByModuleInMemoryAndAbsoluteAddress(module_in_memory, 0x1010),
+      nullptr);
+  EXPECT_EQ(
+      module_manager.GetMutableModuleByModuleInMemoryAndAbsoluteAddress(module_in_memory, 0x1024),
+      nullptr);
+
+  const ModuleData* target_module =
+      module_manager.GetModuleByModuleInMemoryAndAbsoluteAddress(module_in_memory, 0x1025);
+  EXPECT_NE(target_module, nullptr);
+  EXPECT_EQ(
+      module_manager.GetMutableModuleByModuleInMemoryAndAbsoluteAddress(module_in_memory, 0x1025),
+      target_module);
+
+  EXPECT_EQ(target_module->name(), kName);
+  EXPECT_EQ(target_module->file_path(), kFilePath);
+  EXPECT_EQ(target_module->file_size(), kFileSize);
+  EXPECT_EQ(target_module->build_id(), kBuildId);
+  EXPECT_EQ(target_module->load_bias(), kLoadBias);
+  EXPECT_EQ(target_module->executable_segment_offset(), kExecutableSegmentOffset);
 }
 
 TEST(ModuleManager, AddOrUpdateModules) {

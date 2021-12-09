@@ -16,9 +16,10 @@
 #include "ClientData/FunctionInfoSet.h"
 #include "ClientData/TracepointCustom.h"
 #include "ClientData/UserDefinedCaptureData.h"
+#include "ClientProtos/capture_data.pb.h"
 #include "GrpcProtos/Constants.h"
-#include "capture_data.pb.h"
-#include "tracepoint.pb.h"
+#include "GrpcProtos/capture.pb.h"
+#include "GrpcProtos/tracepoint.pb.h"
 
 namespace orbit_client_data {
 
@@ -51,6 +52,11 @@ class DataManager final {
   void SelectTracepoint(const orbit_grpc_protos::TracepointInfo& info);
   void DeselectTracepoint(const orbit_grpc_protos::TracepointInfo& info);
 
+  void SelectCallstackEvents(
+      const std::vector<orbit_client_protos::CallstackEvent>& selected_callstack_events);
+  [[nodiscard]] const std::vector<orbit_client_protos::CallstackEvent>& GetSelectedCallstackEvents(
+      uint32_t thread_id);
+
   [[nodiscard]] bool IsTracepointSelected(const orbit_grpc_protos::TracepointInfo& info) const;
 
   [[nodiscard]] const TracepointInfoSet& selected_tracepoints() const;
@@ -70,10 +76,20 @@ class DataManager final {
     return user_defined_capture_data_;
   }
 
+  void set_collect_scheduler_info(bool collect_scheduler_info) {
+    collect_scheduler_info_ = collect_scheduler_info;
+  }
+  [[nodiscard]] bool collect_scheduler_info() const { return collect_scheduler_info_; }
+
   void set_collect_thread_states(bool collect_thread_states) {
     collect_thread_states_ = collect_thread_states;
   }
   [[nodiscard]] bool collect_thread_states() const { return collect_thread_states_; }
+
+  void set_trace_gpu_submissions(bool trace_gpu_submissions) {
+    trace_gpu_submissions_ = trace_gpu_submissions;
+  }
+  [[nodiscard]] bool trace_gpu_submissions() const { return trace_gpu_submissions_; }
 
   void set_enable_api(bool enable_api) { enable_api_ = enable_api; }
   [[nodiscard]] bool get_enable_api() const { return enable_api_; }
@@ -83,11 +99,13 @@ class DataManager final {
   }
   [[nodiscard]] bool get_enable_introspection() const { return enable_introspection_; }
 
-  void set_enable_user_space_instrumentation(bool enable) {
-    enable_user_space_instrumentation_ = enable;
+  void set_dynamic_instrumentation_method(
+      orbit_grpc_protos::CaptureOptions::DynamicInstrumentationMethod method) {
+    dynamic_instrumentation_method_ = method;
   }
-  [[nodiscard]] bool enable_user_space_instrumentation() const {
-    return enable_user_space_instrumentation_;
+  [[nodiscard]] orbit_grpc_protos::CaptureOptions::DynamicInstrumentationMethod
+  dynamic_instrumentation_method() const {
+    return dynamic_instrumentation_method_;
   }
 
   void set_samples_per_second(double samples_per_second) {
@@ -98,10 +116,12 @@ class DataManager final {
   void set_stack_dump_size(uint16_t stack_dump_size) { stack_dump_size_ = stack_dump_size; }
   [[nodiscard]] uint16_t stack_dump_size() const { return stack_dump_size_; }
 
-  void set_unwinding_method(orbit_grpc_protos::UnwindingMethod method) {
+  void set_unwinding_method(orbit_grpc_protos::CaptureOptions::UnwindingMethod method) {
     unwinding_method_ = method;
   }
-  orbit_grpc_protos::UnwindingMethod unwinding_method() const { return unwinding_method_; }
+  orbit_grpc_protos::CaptureOptions::UnwindingMethod unwinding_method() const {
+    return unwinding_method_;
+  }
 
   void set_max_local_marker_depth_per_command_buffer(
       uint64_t max_local_marker_depth_per_command_buffer) {
@@ -145,18 +165,23 @@ class DataManager final {
   // captures.
   UserDefinedCaptureData user_defined_capture_data_;
 
+  bool collect_scheduler_info_ = false;
   bool collect_thread_states_ = false;
+  bool trace_gpu_submissions_ = false;
   bool enable_api_ = false;
   bool enable_introspection_ = false;
-  bool enable_user_space_instrumentation_ = false;
+  orbit_grpc_protos::CaptureOptions::DynamicInstrumentationMethod dynamic_instrumentation_method_{};
   uint64_t max_local_marker_depth_per_command_buffer_ = std::numeric_limits<uint64_t>::max();
   double samples_per_second_ = 0;
   uint16_t stack_dump_size_ = 0;
-  orbit_grpc_protos::UnwindingMethod unwinding_method_{};
+  orbit_grpc_protos::CaptureOptions::UnwindingMethod unwinding_method_{};
 
   bool collect_memory_info_ = false;
   uint64_t memory_sampling_period_ms_ = 10;
   uint64_t memory_warning_threshold_kb_ = 1024 * 1024 * 8;
+
+  absl::flat_hash_map<uint32_t, std::vector<orbit_client_protos::CallstackEvent>>
+      selected_callstack_events_by_thread_id_;
 };
 
 }  // namespace orbit_client_data

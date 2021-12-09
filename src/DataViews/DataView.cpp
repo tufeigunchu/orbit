@@ -11,6 +11,10 @@
 #include "OrbitBase/File.h"
 #include "OrbitBase/Logging.h"
 
+using orbit_client_data::ModuleData;
+using orbit_client_data::ProcessData;
+using orbit_client_protos::FunctionInfo;
+
 namespace orbit_data_views {
 
 std::string FormatValueForCsv(std::string_view value) {
@@ -68,27 +72,57 @@ void DataView::OnDataChanged() {
   OnSort(sorting_column_, std::optional<SortingOrder>{});
 }
 
-const std::string DataView::kMenuActionCopySelection = "Copy Selection";
-const std::string DataView::kMenuActionExportToCsv = "Export to CSV";
+std::vector<std::vector<std::string>> DataView::GetContextMenuWithGrouping(
+    int /*clicked_index*/, const std::vector<int>& selected_indices) {
+  // GetContextmenuWithGrouping is called when OrbitTreeView::indexAt returns a valid index and
+  // hence the selected_indices retrieved from OrbitTreeView::selectionModel()->selectedIndexes()
+  // should not be empty.
+  CHECK(!selected_indices.empty());
 
-std::vector<std::string> DataView::GetContextMenu(int /*clicked_index*/,
-                                                  const std::vector<int>& /*selected_indices*/) {
-  static std::vector<std::string> menu = {kMenuActionCopySelection, kMenuActionExportToCsv};
-  return menu;
+  static std::vector<std::string> default_group = {std::string{kMenuActionCopySelection},
+                                                   std::string{kMenuActionExportToCsv}};
+  return {default_group};
 }
 
 void DataView::OnContextMenu(const std::string& action, int /*menu_index*/,
                              const std::vector<int>& item_indices) {
-  if (action == kMenuActionExportToCsv) {
-    std::string save_file = app_->GetSaveFile(".csv");
-    if (!save_file.empty()) {
-      auto result = ExportCsv(save_file);
-      if (result.has_error()) {
-        app_->SendErrorToUi("Export to CSV", result.error().message());
-      }
-    }
+  if (action == kMenuActionLoadSymbols) {
+    OnLoadSymbolsRequested(item_indices);
+  } else if (action == kMenuActionSelect) {
+    OnSelectRequested(item_indices);
+  } else if (action == kMenuActionUnselect) {
+    OnUnselectRequested(item_indices);
+  } else if (action == kMenuActionEnableFrameTrack) {
+    OnEnableFrameTrackRequested(item_indices);
+  } else if (action == kMenuActionDisableFrameTrack) {
+    OnDisableFrameTrackRequested(item_indices);
+  } else if (action == kMenuActionAddIterator) {
+    OnIteratorRequested(item_indices);
+  } else if (action == kMenuActionVerifyFramePointers) {
+    OnVerifyFramePointersRequested(item_indices);
+
+  } else if (action == kMenuActionDisassembly) {
+    OnDisassemblyRequested(item_indices);
+  } else if (action == kMenuActionSourceCode) {
+    OnSourceCodeRequested(item_indices);
+
+  } else if (action == kMenuActionJumpToFirst || action == kMenuActionJumpToLast ||
+             action == kMenuActionJumpToMin || action == kMenuActionJumpToMax) {
+    OnJumpToRequested(action, item_indices);
+
+  } else if (action == kMenuActionLoadPreset) {
+    OnLoadPresetRequested(item_indices);
+  } else if (action == kMenuActionDeletePreset) {
+    OnDeletePresetRequested(item_indices);
+  } else if (action == kMenuActionShowInExplorer) {
+    OnShowInExplorerRequested(item_indices);
+
+  } else if (action == kMenuActionExportToCsv) {
+    OnExportToCsvRequested();
   } else if (action == kMenuActionCopySelection) {
-    CopySelection(item_indices);
+    OnCopySelectionRequested(item_indices);
+  } else if (action == kMenuActionExportEventsToCsv) {
+    OnExportEventsToCsvRequested(item_indices);
   }
 }
 
@@ -102,11 +136,111 @@ std::vector<int> DataView::GetVisibleSelectedIndices() {
   return visible_selected_indices;
 }
 
-ErrorMessageOr<void> DataView::ExportCsv(const std::filesystem::path& file_path) {
-  ErrorMessageOr<orbit_base::unique_fd> result = orbit_base::OpenFileForWriting(file_path);
+void DataView::OnLoadSymbolsRequested(const std::vector<int>& selection) {
+  std::vector<ModuleData*> modules_to_load;
+  for (int index : selection) {
+    ModuleData* module_data = GetModuleDataFromRow(index);
+    if (module_data != nullptr && !module_data->is_loaded()) {
+      modules_to_load.push_back(module_data);
+    }
+  }
+  app_->RetrieveModulesAndLoadSymbols(modules_to_load);
+}
+
+void DataView::OnSelectRequested(const std::vector<int>& selection) {
+  for (int i : selection) {
+    const FunctionInfo* function = GetFunctionInfoFromRow(i);
+    // Only hook functions for which we have symbols loaded.
+    if (function != nullptr) {
+      app_->SelectFunction(*function);
+    }
+  }
+}
+
+void DataView::OnUnselectRequested(const std::vector<int>& selection) {
+  for (int i : selection) {
+    const FunctionInfo* function = GetFunctionInfoFromRow(i);
+    // If the frame belongs to a function for which no symbol is loaded 'function' is nullptr and
+    // we can skip it since it can't be instrumented.
+    if (function != nullptr) {
+      app_->DeselectFunction(*function);
+      // Unhooking a function implies disabling (and removing) the frame track for this function.
+      // While it would be possible to keep the current frame track in the capture data, this would
+      // lead to a somewhat inconsistent state where the frame track for this function is enabled
+      // for the current capture but disabled for the next one.
+      app_->DisableFrameTrack(*function);
+      app_->RemoveFrameTrack(*function);
+    }
+  }
+}
+
+void DataView::OnEnableFrameTrackRequested(const std::vector<int>& selection) {
+  for (int i : selection) {
+    const FunctionInfo& function = *GetFunctionInfoFromRow(i);
+    // Functions used as frame tracks must be hooked (selected), otherwise the
+    // data to produce the frame track will not be captured.
+    if (app_->IsCaptureConnected(app_->GetCaptureData())) {
+      app_->SelectFunction(function);
+    }
+    app_->EnableFrameTrack(function);
+    app_->AddFrameTrack(function);
+  }
+}
+
+void DataView::OnDisableFrameTrackRequested(const std::vector<int>& selection) {
+  for (int i : selection) {
+    const FunctionInfo& function = *GetFunctionInfoFromRow(i);
+    // When we remove a frame track, we do not unhook (deselect) the function as
+    // it may have been selected manually (not as part of adding a frame track).
+    // However, disable the frame track, so it is not recreated on the next capture.
+    app_->DisableFrameTrack(function);
+    app_->RemoveFrameTrack(function);
+  }
+}
+
+void DataView::OnVerifyFramePointersRequested(const std::vector<int>& selection) {
+  std::vector<const ModuleData*> modules_to_validate;
+  modules_to_validate.reserve(selection.size());
+  for (int i : selection) {
+    const ModuleData* module = GetModuleDataFromRow(i);
+    modules_to_validate.push_back(module);
+  }
+
+  if (!modules_to_validate.empty()) {
+    app_->OnValidateFramePointers(modules_to_validate);
+  }
+}
+
+void DataView::OnDisassemblyRequested(const std::vector<int>& selection) {
+  const ProcessData* process_data = app_->GetTargetProcess();
+  const uint32_t pid =
+      process_data == nullptr ? app_->GetCaptureData().process_id() : process_data->pid();
+  for (int i : selection) {
+    const FunctionInfo* function = GetFunctionInfoFromRow(i);
+    if (function != nullptr) app_->Disassemble(pid, *function);
+  }
+}
+
+void DataView::OnSourceCodeRequested(const std::vector<int>& selection) {
+  for (int i : selection) {
+    const FunctionInfo* function = GetFunctionInfoFromRow(i);
+    if (function != nullptr) app_->ShowSourceCode(*function);
+  }
+}
+
+void DataView::OnExportToCsvRequested() {
+  std::string save_file = app_->GetSaveFile(".csv");
+  if (save_file.empty()) return;
+
+  auto send_error = [&](const std::string& error_msg) {
+    app_->SendErrorToUi(std::string{kMenuActionExportToCsv}, error_msg);
+  };
+
+  ErrorMessageOr<orbit_base::unique_fd> result = orbit_base::OpenFileForWriting(save_file);
   if (result.has_error()) {
-    return ErrorMessage{absl::StrFormat("Failed to open \"%s\" file: %s", file_path.string(),
-                                        result.error().message())};
+    send_error(
+        absl::StrFormat("Failed to open \"%s\" file: %s", save_file, result.error().message()));
+    return;
   }
 
   const orbit_base::unique_fd& fd = result.value();
@@ -116,7 +250,6 @@ ErrorMessageOr<void> DataView::ExportCsv(const std::filesystem::path& file_path)
   constexpr const char* kLineSeparator = "\r\n";
 
   size_t num_columns = GetColumns().size();
-
   {
     std::string header_line;
     for (size_t i = 0; i < num_columns; ++i) {
@@ -127,8 +260,9 @@ ErrorMessageOr<void> DataView::ExportCsv(const std::filesystem::path& file_path)
     header_line.append(kLineSeparator);
     auto write_result = orbit_base::WriteFully(fd, header_line);
     if (write_result.has_error()) {
-      return ErrorMessage{absl::StrFormat("Error writing to \"%s\": %s", file_path.string(),
-                                          write_result.error().message())};
+      send_error(absl::StrFormat("Error writing to \"%s\": %s", save_file,
+                                 write_result.error().message()));
+      return;
     }
   }
 
@@ -142,15 +276,14 @@ ErrorMessageOr<void> DataView::ExportCsv(const std::filesystem::path& file_path)
     line.append(kLineSeparator);
     auto write_result = orbit_base::WriteFully(fd, line);
     if (write_result.has_error()) {
-      return ErrorMessage{absl::StrFormat("Error writing to \"%s\": %s", file_path.string(),
-                                          write_result.error().message())};
+      send_error(absl::StrFormat("Error writing to \"%s\": %s", save_file,
+                                 write_result.error().message()));
+      return;
     }
   }
-
-  return outcome::success();
 }
 
-void DataView::CopySelection(const std::vector<int>& selection) {
+void DataView::OnCopySelectionRequested(const std::vector<int>& selection) {
   constexpr const char* kFieldSeparator = "\t";
   constexpr const char* kLineSeparator = "\n";
 

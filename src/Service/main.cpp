@@ -58,8 +58,9 @@ int main(int argc, char** argv) {
   InstallSigintHandler();
 
   uint16_t grpc_port = absl::GetFlag(FLAGS_grpc_port);
+  bool dev_mode = absl::GetFlag(FLAGS_devmode);
 
   exit_requested = false;
-  orbit_service::OrbitService service{grpc_port};
-  service.Run(&exit_requested);
+  orbit_service::OrbitService service{grpc_port, dev_mode};
+  return service.Run(&exit_requested);
 }

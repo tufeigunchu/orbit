@@ -13,9 +13,9 @@
 
 #include "CaptureClient/ApiEventProcessor.h"
 #include "CaptureClient/GpuQueueSubmissionProcessor.h"
+#include "ClientProtos/capture_data.pb.h"
 #include "GrpcProtos/Constants.h"
 #include "OrbitBase/Logging.h"
-#include "capture_data.pb.h"
 
 namespace orbit_capture_client {
 
@@ -81,6 +81,9 @@ class CaptureEventProcessorForListener : public CaptureEventProcessor {
       const orbit_grpc_protos::ErrorEnablingOrbitApiEvent& error_enabling_orbit_api_event);
   void ProcessErrorEnablingUserSpaceInstrumentationEvent(
       const orbit_grpc_protos::ErrorEnablingUserSpaceInstrumentationEvent& error_event);
+  void ProcessWarningInstrumentingWithUserSpaceInstrumentationEvent(
+      const orbit_grpc_protos::WarningInstrumentingWithUserSpaceInstrumentationEvent&
+          warning_event);
   void ProcessLostPerfRecordsEvent(
       const orbit_grpc_protos::LostPerfRecordsEvent& lost_perf_records_event);
   void ProcessOutOfOrderEventsDiscardedEvent(
@@ -220,6 +223,10 @@ void CaptureEventProcessorForListener::ProcessEvent(const ClientCaptureEvent& ev
     case ClientCaptureEvent::kErrorEnablingUserSpaceInstrumentationEvent:
       ProcessErrorEnablingUserSpaceInstrumentationEvent(
           event.error_enabling_user_space_instrumentation_event());
+      break;
+    case ClientCaptureEvent::kWarningInstrumentingWithUserSpaceInstrumentationEvent:
+      ProcessWarningInstrumentingWithUserSpaceInstrumentationEvent(
+          event.warning_instrumenting_with_user_space_instrumentation_event());
       break;
     case ClientCaptureEvent::kLostPerfRecordsEvent:
       ProcessLostPerfRecordsEvent(event.lost_perf_records_event());
@@ -621,8 +628,11 @@ void CaptureEventProcessorForListener::SendCallstackToListenerIfNecessary(
     case orbit_grpc_protos::Callstack::kInUprobes:
       callstack_info.set_type(CallstackInfo::kInUprobes);
       break;
-    case orbit_grpc_protos::Callstack::kUprobesPatchingFailed:
-      callstack_info.set_type(CallstackInfo::kUprobesPatchingFailed);
+    case orbit_grpc_protos::Callstack::kInUserSpaceInstrumentation:
+      callstack_info.set_type(CallstackInfo::kInUserSpaceInstrumentation);
+      break;
+    case orbit_grpc_protos::Callstack::kCallstackPatchingFailed:
+      callstack_info.set_type(CallstackInfo::kCallstackPatchingFailed);
       break;
     case orbit_grpc_protos::Callstack::kStackTopForDwarfUnwindingTooSmall:
       callstack_info.set_type(CallstackInfo::kStackTopForDwarfUnwindingTooSmall);
@@ -685,6 +695,11 @@ void CaptureEventProcessorForListener::ProcessErrorEnablingOrbitApiEvent(
 void CaptureEventProcessorForListener::ProcessErrorEnablingUserSpaceInstrumentationEvent(
     const orbit_grpc_protos::ErrorEnablingUserSpaceInstrumentationEvent& error_event) {
   capture_listener_->OnErrorEnablingUserSpaceInstrumentationEvent(error_event);
+}
+
+void CaptureEventProcessorForListener::ProcessWarningInstrumentingWithUserSpaceInstrumentationEvent(
+    const orbit_grpc_protos::WarningInstrumentingWithUserSpaceInstrumentationEvent& warning_event) {
+  capture_listener_->OnWarningInstrumentingWithUserSpaceInstrumentationEvent(warning_event);
 }
 
 void CaptureEventProcessorForListener::ProcessLostPerfRecordsEvent(

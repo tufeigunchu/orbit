@@ -13,9 +13,9 @@
 #include "ClientData/CaptureData.h"
 #include "ClientData/PostProcessedSamplingData.h"
 #include "ClientModel/SamplingDataPostProcessor.h"
+#include "ClientProtos/capture_data.pb.h"
+#include "GrpcProtos/capture.pb.h"
 #include "QtUtils/AssertNoQtLogWarnings.h"
-#include "capture.pb.h"
-#include "capture_data.pb.h"
 
 constexpr uint64_t kCallstackId = 1;
 constexpr uint64_t kFunctionAbsoluteAddress = 0x30;
@@ -31,7 +31,8 @@ using orbit_client_data::CaptureData;
 
 std::unique_ptr<CaptureData> GenerateTestCaptureData() {
   auto capture_data = std::make_unique<CaptureData>(nullptr, orbit_grpc_protos::CaptureStarted{},
-                                                    std::nullopt, absl::flat_hash_set<uint64_t>{});
+                                                    std::nullopt, absl::flat_hash_set<uint64_t>{},
+                                                    CaptureData::DataSource::kLiveCapture);
 
   // AddressInfo
   orbit_client_protos::LinuxAddressInfo address_info;

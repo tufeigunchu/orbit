@@ -13,9 +13,9 @@
 #include "CaptureClient/ApiEventProcessor.h"
 #include "CaptureClient/CaptureEventProcessor.h"
 #include "CaptureClient/CaptureListener.h"
+#include "GrpcProtos/capture.pb.h"
 #include "OrbitBase/Profiling.h"
 #include "OrbitBase/ThreadUtils.h"
-#include "capture.pb.h"
 
 namespace orbit_capture_client {
 
@@ -73,6 +73,10 @@ class MockCaptureListener : public CaptureListener {
   MOCK_METHOD(void, OnErrorEnablingUserSpaceInstrumentationEvent,
               (orbit_grpc_protos::ErrorEnablingUserSpaceInstrumentationEvent /*error_event*/),
               (override));
+  MOCK_METHOD(
+      void, OnWarningInstrumentingWithUserSpaceInstrumentationEvent,
+      (orbit_grpc_protos::WarningInstrumentingWithUserSpaceInstrumentationEvent /*warning_event*/),
+      (override));
   MOCK_METHOD(void, OnLostPerfRecordsEvent,
               (orbit_grpc_protos::LostPerfRecordsEvent /*lost_perf_records_event*/), (override));
   MOCK_METHOD(

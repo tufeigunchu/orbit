@@ -11,13 +11,19 @@ target_sources(
   SessionSetup
   PUBLIC  include/SessionSetup/Connections.h
           include/SessionSetup/ConnectToStadiaWidget.h
+          include/SessionSetup/ConnectToTargetDialog.h
           include/SessionSetup/DeploymentConfigurations.h
           include/SessionSetup/DoubleClickableLabel.h
           include/SessionSetup/Error.h
           include/SessionSetup/OverlayWidget.h
+          include/SessionSetup/OtherUserDialog.h
+          include/SessionSetup/PersistentStorage.h
           include/SessionSetup/ProcessItemModel.h
+          include/SessionSetup/RetrieveInstances.h
+          include/SessionSetup/RetrieveInstancesWidget.h
           include/SessionSetup/ServiceDeployManager.h
           include/SessionSetup/SessionSetupDialog.h
+          include/SessionSetup/SessionSetupUtils.h
           include/SessionSetup/TargetConfiguration.h
           include/SessionSetup/TargetLabel.h)
 
@@ -27,14 +33,23 @@ target_sources(
   SessionSetup
   PRIVATE ConnectToStadiaWidget.cpp
           ConnectToStadiaWidget.ui
+          ConnectToTargetDialog.cpp
+          ConnectToTargetDialog.ui
           DeploymentConfigurations.cpp
           Error.cpp
+          OtherUserDialog.cpp
+          OtherUserDialog.ui
           OverlayWidget.cpp
           OverlayWidget.ui
+          PersistentStorage.cpp
           ProcessItemModel.cpp
+          RetrieveInstances.cpp
+          RetrieveInstancesWidget.cpp
+          RetrieveInstancesWidget.ui
           ServiceDeployManager.cpp
           SessionSetupDialog.cpp
           SessionSetupDialog.ui
+          SessionSetupUtils.cpp
           TargetLabel.cpp
           TargetLabel.ui
           ../../icons/orbiticons.qrc)
@@ -43,6 +58,7 @@ target_link_libraries(
   SessionSetup
   PUBLIC  CaptureFileInfo
           ClientData
+          ClientFlags
           ClientServices
           MetricsUploader
           OrbitBase
@@ -63,15 +79,20 @@ target_sources(
   SessionSetupTest
   PRIVATE ConnectToStadiaWidgetTest.cpp
           DoubleClickableLabelTest.cpp
+          PersistentStorageTest.cpp
           ProcessItemModelTest.cpp
+          OtherUserDialogTest.cpp
+          RetrieveInstancesTest.cpp
+          RetrieveInstancesWidgetTest.cpp
           SessionSetupDialogTest.cpp
-          TargetLabelTest.cpp
-          TestEnvironmentAbslFlags.cpp)
+          SessionSetupUtilsTest.cpp
+          TargetLabelTest.cpp)
 
 
 target_link_libraries(
   SessionSetupTest
   PRIVATE SessionSetup
+          TestUtils
           GTest::QtGuiMain
           Qt5::Test)
 
@@ -82,3 +103,5 @@ endif()
 if (NOT WIN32)
   register_test(SessionSetupTest PROPERTIES ENVIRONMENT QT_QPA_PLATFORM=offscreen)
 endif()
+
+add_subdirectory(RetrieveInstancesWidgetDemo)

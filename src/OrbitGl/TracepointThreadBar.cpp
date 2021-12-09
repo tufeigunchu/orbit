@@ -14,31 +14,30 @@
 #include "Batcher.h"
 #include "CaptureViewElement.h"
 #include "ClientData/CaptureData.h"
+#include "ClientProtos/capture_data.pb.h"
 #include "ClientServices/TracepointServiceClient.h"
 #include "CoreMath.h"
 #include "Geometry.h"
 #include "GlCanvas.h"
+#include "GrpcProtos/tracepoint.pb.h"
 #include "OrbitBase/Logging.h"
 #include "OrbitBase/ThreadConstants.h"
-#include "TimeGraph.h"
 #include "TimeGraphLayout.h"
 #include "Viewport.h"
-#include "capture_data.pb.h"
-#include "tracepoint.pb.h"
 
 namespace orbit_gl {
 
 TracepointThreadBar::TracepointThreadBar(CaptureViewElement* parent, OrbitApp* app,
-                                         TimeGraph* time_graph, orbit_gl::Viewport* viewport,
-                                         TimeGraphLayout* layout,
+                                         const orbit_gl::TimelineInfoInterface* timeline_info,
+                                         orbit_gl::Viewport* viewport, TimeGraphLayout* layout,
                                          const orbit_client_data::CaptureData* capture_data,
                                          uint32_t thread_id, const Color& color)
-    : ThreadBar(parent, app, time_graph, viewport, layout, capture_data, thread_id, "Tracepoints",
-                color) {}
+    : ThreadBar(parent, app, timeline_info, viewport, layout, capture_data, thread_id,
+                "Tracepoints", color) {}
 
-void TracepointThreadBar::Draw(Batcher& batcher, TextRenderer& text_renderer,
-                               const DrawContext& draw_context) {
-  ThreadBar::Draw(batcher, text_renderer, draw_context);
+void TracepointThreadBar::DoDraw(Batcher& batcher, TextRenderer& text_renderer,
+                                 const DrawContext& draw_context) {
+  ThreadBar::DoDraw(batcher, text_renderer, draw_context);
 
   if (IsEmpty()) {
     return;
@@ -47,17 +46,18 @@ void TracepointThreadBar::Draw(Batcher& batcher, TextRenderer& text_renderer,
   float event_bar_z = draw_context.picking_mode == PickingMode::kClick
                           ? GlCanvas::kZValueEventBarPicking
                           : GlCanvas::kZValueEventBar;
-  event_bar_z += draw_context.z_offset;
   Color color = GetColor();
   Box box(GetPos(), Vec2(GetWidth(), -GetHeight()), event_bar_z);
   batcher.AddBox(box, color, shared_from_this());
 }
 
-void TracepointThreadBar::UpdatePrimitives(Batcher* batcher, uint64_t min_tick, uint64_t max_tick,
-                                           PickingMode picking_mode, float z_offset) {
-  ThreadBar::UpdatePrimitives(batcher, min_tick, max_tick, picking_mode, z_offset);
+void TracepointThreadBar::DoUpdatePrimitives(Batcher& batcher, TextRenderer& text_renderer,
+                                             uint64_t min_tick, uint64_t max_tick,
+                                             PickingMode picking_mode) {
+  ORBIT_SCOPE_WITH_COLOR("TracepointThreadBar::DoUpdatePrimitives", kOrbitColorIndigo);
+  ThreadBar::DoUpdatePrimitives(batcher, text_renderer, min_tick, max_tick, picking_mode);
 
-  float z = GlCanvas::kZValueEvent + z_offset;
+  float z = GlCanvas::kZValueEvent;
   float track_height = layout_->GetEventTrackHeightFromTid(GetThreadId());
   const bool picking = picking_mode != PickingMode::kNone;
 
@@ -73,16 +73,16 @@ void TracepointThreadBar::UpdatePrimitives(Batcher* batcher, uint64_t min_tick, 
         [&](const orbit_client_protos::TracepointEventInfo& tracepoint) {
           uint64_t time = tracepoint.time();
           float radius = track_height / 4;
-          const Vec2 pos(time_graph_->GetWorldFromTick(time), GetPos()[1]);
+          const Vec2 pos(timeline_info_->GetWorldFromTick(time), GetPos()[1]);
           if (GetThreadId() == orbit_base::kAllThreadsOfAllProcessesTid) {
             const Color color = tracepoint.pid() == capture_data_->process_id() ? kGrey : kWhite;
-            batcher->AddVerticalLine(pos, -track_height, z, color);
+            batcher.AddVerticalLine(pos, -track_height, z, color);
           } else {
-            batcher->AddVerticalLine(pos, -radius, z, kWhiteTransparent);
-            batcher->AddVerticalLine(Vec2(pos[0], pos[1] - track_height), radius, z,
-                                     kWhiteTransparent);
-            batcher->AddCircle(Vec2(pos[0], pos[1] - track_height / 2), radius, z,
-                               kWhiteTransparent);
+            batcher.AddVerticalLine(pos, -radius, z, kWhiteTransparent);
+            batcher.AddVerticalLine(Vec2(pos[0], pos[1] - track_height), radius, z,
+                                    kWhiteTransparent);
+            batcher.AddCircle(Vec2(pos[0], pos[1] - track_height / 2), radius, z,
+                              kWhiteTransparent);
           }
         });
 
@@ -94,21 +94,20 @@ void TracepointThreadBar::UpdatePrimitives(Batcher* batcher, uint64_t min_tick, 
         GetThreadId(), min_tick, max_tick,
         [&](const orbit_client_protos::TracepointEventInfo& tracepoint) {
           uint64_t time = tracepoint.time();
-          Vec2 pos(time_graph_->GetWorldFromTick(time) - kPickingBoxOffset,
+          Vec2 pos(timeline_info_->GetWorldFromTick(time) - kPickingBoxOffset,
                    GetPos()[1] - track_height + 1);
           Vec2 size(kPickingBoxWidth, track_height);
-          auto user_data =
-              std::make_unique<PickingUserData>(nullptr, [&, batcher](PickingId id) -> std::string {
-                return GetTracepointTooltip(batcher, id);
-              });
+          auto user_data = std::make_unique<PickingUserData>(
+              nullptr,
+              [&](PickingId id) -> std::string { return GetTracepointTooltip(batcher, id); });
           user_data->custom_data_ = &tracepoint;
-          batcher->AddShadedBox(pos, size, z, kWhite, std::move(user_data));
+          batcher.AddShadedBox(pos, size, z, kWhite, std::move(user_data));
         });
   }
 }
 
-std::string TracepointThreadBar::GetTracepointTooltip(Batcher* batcher, PickingId id) const {
-  auto* user_data = batcher->GetUserData(id);
+std::string TracepointThreadBar::GetTracepointTooltip(Batcher& batcher, PickingId id) const {
+  auto* user_data = batcher.GetUserData(id);
   CHECK(user_data && user_data->custom_data_);
 
   const auto* tracepoint_event_info =

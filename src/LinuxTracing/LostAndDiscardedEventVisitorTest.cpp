@@ -7,57 +7,36 @@
 #include <stdint.h>
 
 #include <memory>
-#include <string>
-#include <utility>
 
+#include "GrpcProtos/capture.pb.h"
 #include "LostAndDiscardedEventVisitor.h"
-#include "OrbitBase/Logging.h"
+#include "MockTracerListener.h"
 #include "PerfEvent.h"
-#include "TracingInterface/TracerListener.h"
-#include "capture.pb.h"
 
 namespace orbit_linux_tracing {
 
 namespace {
 
-class MockTracerListener : public orbit_tracing_interface::TracerListener {
- public:
-  MOCK_METHOD(void, OnSchedulingSlice, (orbit_grpc_protos::SchedulingSlice), (override));
-  MOCK_METHOD(void, OnCallstackSample, (orbit_grpc_protos::FullCallstackSample), (override));
-  MOCK_METHOD(void, OnFunctionCall, (orbit_grpc_protos::FunctionCall), (override));
-  MOCK_METHOD(void, OnGpuJob, (orbit_grpc_protos::FullGpuJob full_gpu_job), (override));
-  MOCK_METHOD(void, OnThreadName, (orbit_grpc_protos::ThreadName), (override));
-  MOCK_METHOD(void, OnThreadNamesSnapshot, (orbit_grpc_protos::ThreadNamesSnapshot), (override));
-  MOCK_METHOD(void, OnThreadStateSlice, (orbit_grpc_protos::ThreadStateSlice), (override));
-  MOCK_METHOD(void, OnAddressInfo, (orbit_grpc_protos::FullAddressInfo), (override));
-  MOCK_METHOD(void, OnTracepointEvent, (orbit_grpc_protos::FullTracepointEvent), (override));
-  MOCK_METHOD(void, OnModuleUpdate, (orbit_grpc_protos::ModuleUpdateEvent), (override));
-  MOCK_METHOD(void, OnModulesSnapshot, (orbit_grpc_protos::ModulesSnapshot), (override));
-  MOCK_METHOD(void, OnErrorsWithPerfEventOpenEvent,
-              (orbit_grpc_protos::ErrorsWithPerfEventOpenEvent), (override));
-  MOCK_METHOD(void, OnLostPerfRecordsEvent, (orbit_grpc_protos::LostPerfRecordsEvent), (override));
-  MOCK_METHOD(void, OnOutOfOrderEventsDiscardedEvent,
-              (orbit_grpc_protos::OutOfOrderEventsDiscardedEvent), (override));
-};
-
-[[nodiscard]] std::unique_ptr<LostPerfEvent> MakeFakeLostPerfEvent(uint64_t previous_timestamp_ns,
-                                                                   uint64_t timestamp_ns) {
-  auto event = std::make_unique<LostPerfEvent>();
-  event->ring_buffer_record.sample_id.time = timestamp_ns;
-  CHECK(event->GetTimestamp() == timestamp_ns);
-  event->SetPreviousTimestamp(previous_timestamp_ns);
-  CHECK(event->GetPreviousTimestamp() == previous_timestamp_ns);
-  return event;
+[[nodiscard]] LostPerfEvent MakeFakeLostPerfEvent(uint64_t previous_timestamp_ns,
+                                                  uint64_t timestamp_ns) {
+  return LostPerfEvent{
+      .timestamp = timestamp_ns,
+      .data =
+          {
+              .previous_timestamp = previous_timestamp_ns,
+          },
+  };
 }
 
-[[nodiscard]] std::unique_ptr<DiscardedPerfEvent> MakeFakeDiscardedPerfEvent(
-    uint64_t begin_timestamp_ns, uint64_t end_timestamp_ns) {
-  auto event = std::make_unique<DiscardedPerfEvent>(begin_timestamp_ns, end_timestamp_ns);
-  CHECK(event->GetTimestamp() == end_timestamp_ns);
-  CHECK(event->GetBeginTimestampNs() == begin_timestamp_ns);
-  CHECK(event->GetEndTimestampNs() == end_timestamp_ns);
-  CHECK(event->GetTimestamp() == end_timestamp_ns);
-  return event;
+[[nodiscard]] DiscardedPerfEvent MakeFakeDiscardedPerfEvent(uint64_t begin_timestamp_ns,
+                                                            uint64_t end_timestamp_ns) {
+  return DiscardedPerfEvent{
+      .timestamp = end_timestamp_ns,
+      .data =
+          {
+              .begin_timestamp_ns = begin_timestamp_ns,
+          },
+  };
 }
 
 class LostAndDiscardedEventVisitorTest : public ::testing::Test {
@@ -80,7 +59,7 @@ TEST_F(LostAndDiscardedEventVisitorTest, VisitLostPerfEventCallsOnLostPerfRecord
 
   constexpr uint64_t kPreviousTimestampNs = 1111;
   constexpr uint64_t kTimestampNs = 1234;
-  MakeFakeLostPerfEvent(kPreviousTimestampNs, kTimestampNs)->Accept(&visitor_);
+  PerfEvent{MakeFakeLostPerfEvent(kPreviousTimestampNs, kTimestampNs)}.Accept(&visitor_);
 
   EXPECT_EQ(actual_lost_perf_records_event.end_timestamp_ns(), kTimestampNs);
   EXPECT_EQ(actual_lost_perf_records_event.duration_ns(), kTimestampNs - kPreviousTimestampNs);
@@ -95,7 +74,7 @@ TEST_F(LostAndDiscardedEventVisitorTest,
 
   constexpr uint64_t kBeginTimestampNs = 1111;
   constexpr uint64_t kEndTimestampNs = 1234;
-  MakeFakeDiscardedPerfEvent(kBeginTimestampNs, kEndTimestampNs)->Accept(&visitor_);
+  PerfEvent{MakeFakeDiscardedPerfEvent(kBeginTimestampNs, kEndTimestampNs)}.Accept(&visitor_);
 
   EXPECT_EQ(actual_out_of_order_events_discarded_event.end_timestamp_ns(), kEndTimestampNs);
   EXPECT_EQ(actual_out_of_order_events_discarded_event.duration_ns(),

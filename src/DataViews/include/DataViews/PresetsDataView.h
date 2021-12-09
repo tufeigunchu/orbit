@@ -12,11 +12,11 @@
 #include <utility>
 #include <vector>
 
+#include "ClientProtos/preset.pb.h"
 #include "DataViews/AppInterface.h"
 #include "DataViews/DataView.h"
 #include "MetricsUploader/MetricsUploader.h"
 #include "PresetFile/PresetFile.h"
-#include "preset.pb.h"
 
 namespace orbit_data_views {
 class PresetsDataView : public DataView {
@@ -26,15 +26,13 @@ class PresetsDataView : public DataView {
 
   const std::vector<Column>& GetColumns() override;
   int GetDefaultSortingColumn() override { return kColumnPresetName; }
-  std::vector<std::string> GetContextMenu(int clicked_index,
-                                          const std::vector<int>& selected_indices) override;
+  std::vector<std::vector<std::string>> GetContextMenuWithGrouping(
+      int clicked_index, const std::vector<int>& selected_indices) override;
   std::string GetValue(int row, int column) override;
   std::string GetToolTip(int row, int column) override;
   std::string GetLabel() override { return "Presets"; }
 
   void OnDataChanged() override;
-  void OnContextMenu(const std::string& action, int menu_index,
-                     const std::vector<int>& item_indices) override;
   void OnDoubleClicked(int index) override;
 
   bool WantsDisplayColor() override { return true; }
@@ -42,6 +40,10 @@ class PresetsDataView : public DataView {
                        unsigned char& /*green*/, unsigned char& /*blue*/) override;
 
   void SetPresets(std::vector<orbit_preset_file::PresetFile> presets);
+
+  void OnLoadPresetRequested(const std::vector<int>& selection) override;
+  void OnDeletePresetRequested(const std::vector<int>& selection) override;
+  void OnShowInExplorerRequested(const std::vector<int>& selection) override;
 
  protected:
   struct ModuleView {
@@ -69,9 +71,6 @@ class PresetsDataView : public DataView {
     kColumnDateModified,
     kNumColumns
   };
-
-  static const std::string kMenuActionLoad;
-  static const std::string kMenuActionDelete;
 
  private:
   orbit_metrics_uploader::MetricsUploader* metrics_uploader_;

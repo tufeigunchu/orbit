@@ -18,7 +18,6 @@
 #include "GlCanvas.h"
 #include "GlUtils.h"
 #include "TextRenderer.h"
-#include "TimeGraph.h"
 #include "TimeGraphLayout.h"
 #include "TriangleToggle.h"
 
@@ -28,14 +27,13 @@ using orbit_grpc_protos::InstrumentedFunction;
 
 namespace {
 constexpr const double kHeightCapAverageMultipleDouble = 6.0;
-constexpr const double kFrameTrackExpandedScaleFactor = 6.0;
 constexpr const uint64_t kHeightCapAverageMultipleUint64 = 6;
 constexpr const float kBoxHeightMultiplier = 3.f;
 }  // namespace
 
 float FrameTrack::GetCappedMaximumToAverageRatio() const {
   if (stats_.average_time_ns() == 0) {
-    return std::numeric_limits<float>::max();
+    return 0.f;
   }
   // Compute the scale factor in double first as we convert time values in nanoseconds to
   // floating point. Single-precision floating point (float type) can only exactly
@@ -49,7 +47,7 @@ float FrameTrack::GetCappedMaximumToAverageRatio() const {
 
 float FrameTrack::GetMaximumBoxHeight() const {
   const bool is_collapsed = collapse_toggle_->IsCollapsed();
-  float scale_factor = is_collapsed ? 1.f : kFrameTrackExpandedScaleFactor;
+  float scale_factor = is_collapsed ? 1.f : GetCappedMaximumToAverageRatio();
   return scale_factor * GetDefaultBoxHeight();
 }
 
@@ -57,11 +55,12 @@ float FrameTrack::GetAverageBoxHeight() const {
   return GetMaximumBoxHeight() / GetCappedMaximumToAverageRatio();
 }
 
-FrameTrack::FrameTrack(CaptureViewElement* parent, TimeGraph* time_graph,
+FrameTrack::FrameTrack(CaptureViewElement* parent,
+                       const orbit_gl::TimelineInfoInterface* timeline_info,
                        orbit_gl::Viewport* viewport, TimeGraphLayout* layout,
                        InstrumentedFunction function, OrbitApp* app,
-                       const CaptureData* capture_data, orbit_client_data::TrackData* track_data)
-    : TimerTrack(parent, time_graph, viewport, layout, app, capture_data, track_data),
+                       const CaptureData* capture_data, orbit_client_data::TimerData* timer_data)
+    : TimerTrack(parent, timeline_info, viewport, layout, app, capture_data, timer_data),
       function_(std::move(function)) {
   // TODO(b/169554463): Support manual instrumentation.
 
@@ -94,7 +93,8 @@ float FrameTrack::GetDynamicBoxHeight(const TimerInfo& timer_info) const {
 }
 
 Color FrameTrack::GetTimerColor(const orbit_client_protos::TimerInfo& timer_info,
-                                bool /*is_selected*/, bool /*is_highlighted*/) const {
+                                bool /*is_selected*/, bool /*is_highlighted*/,
+                                const internal::DrawData& /*draw_data*/) const {
   Vec4 min_color(76.f, 175.f, 80.f, 255.f);
   Vec4 max_color(63.f, 81.f, 181.f, 255.f);
   Vec4 warn_color(244.f, 67.f, 54.f, 255.f);
@@ -205,9 +205,16 @@ std::string FrameTrack::GetBoxTooltip(const Batcher& batcher, PickingId id) cons
           TicksToDuration(timer_info->start(), timer_info->end())));
 }
 
-void FrameTrack::Draw(Batcher& batcher, TextRenderer& text_renderer,
-                      const DrawContext& draw_context) {
-  TimerTrack::Draw(batcher, text_renderer, draw_context);
+void FrameTrack::DoUpdatePrimitives(Batcher& batcher, TextRenderer& text_renderer,
+                                    uint64_t min_tick, uint64_t max_tick,
+                                    PickingMode picking_mode) {
+  ORBIT_SCOPE_WITH_COLOR("FrameTrack::DoUpdatePrimitives", kOrbitColorAmber);
+  TimerTrack::DoUpdatePrimitives(batcher, text_renderer, min_tick, max_tick, picking_mode);
+}
+
+void FrameTrack::DoDraw(Batcher& batcher, TextRenderer& text_renderer,
+                        const DrawContext& draw_context) {
+  TimerTrack::DoDraw(batcher, text_renderer, draw_context);
 
   const Color kWhiteColor(255, 255, 255, 255);
   const Color kBlackColor(0, 0, 0, 255);
@@ -217,7 +224,7 @@ void FrameTrack::Draw(Batcher& batcher, TextRenderer& text_renderer,
   const float y = pos[1] + GetHeaderHeight() + GetMaximumBoxHeight() - GetAverageBoxHeight();
   Vec2 from(x, y);
   Vec2 to(x + GetWidth(), y);
-  float text_z = GlCanvas::kZValueTrackText + draw_context.z_offset;
+  float text_z = GlCanvas::kZValueTrackText;
 
   std::string avg_time =
       orbit_display_formats::GetDisplayTime(absl::Nanoseconds(stats_.average_time_ns()));

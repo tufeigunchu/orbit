@@ -10,9 +10,9 @@
 #include <utility>
 #include <vector>
 
+#include "LinuxTracing/TracerListener.h"
 #include "OrbitBase/Logging.h"
-#include "OrbitBase/ThreadUtils.h"
-#include "TracingInterface/TracerListener.h"
+#include "OrbitBase/ThreadConstants.h"
 
 namespace orbit_linux_tracing {
 
@@ -27,9 +27,10 @@ void SwitchesStatesNamesVisitor::ProcessInitialTidToPidAssociation(pid_t tid, pi
   }
 }
 
-void SwitchesStatesNamesVisitor::Visit(ForkPerfEvent* event) {
-  pid_t pid = event->GetPid();
-  pid_t tid = event->GetTid();
+void SwitchesStatesNamesVisitor::Visit(uint64_t /*event_timestamp*/,
+                                       const ForkPerfEventData& event_data) {
+  pid_t pid = event_data.pid;
+  pid_t tid = event_data.tid;
   bool new_insertion = tid_to_pid_association_.insert_or_assign(tid, pid).second;
   if (!new_insertion) {
     ERROR("Overwriting previous pid for tid %d with pid %d from PERF_RECORD_FORK", tid, pid);
@@ -44,9 +45,10 @@ void SwitchesStatesNamesVisitor::Visit(ForkPerfEvent* event) {
 // thread exit the pid field of the PERF_RECORD_SAMPLE has value -1. In such special cases we can
 // still use the pid from PERF_RECORD_EXIT and update the association just in time, as
 // PERF_RECORD_EXIT events precede context switches with pid -1.
-void SwitchesStatesNamesVisitor::Visit(ExitPerfEvent* event) {
-  pid_t pid = event->GetPid();
-  pid_t tid = event->GetTid();
+void SwitchesStatesNamesVisitor::Visit(uint64_t /*event_timestamp*/,
+                                       const ExitPerfEventData& event_data) {
+  pid_t pid = event_data.pid;
+  pid_t tid = event_data.tid;
   tid_to_pid_association_.insert_or_assign(tid, pid);
   // Don't log an error on overwrite, as it's expected that the pid was already known.
 }
@@ -86,42 +88,42 @@ void SwitchesStatesNamesVisitor::ProcessInitialState(uint64_t timestamp_ns, pid_
   state_manager_.OnInitialState(timestamp_ns, tid, initial_state.value());
 }
 
-void SwitchesStatesNamesVisitor::Visit(TaskNewtaskPerfEvent* event) {
-  std::optional<pid_t> new_pid = GetPidOfTid(event->GetNewTid());
+void SwitchesStatesNamesVisitor::Visit(uint64_t event_timestamp,
+                                       const TaskNewtaskPerfEventData& event_data) {
+  std::optional<pid_t> new_pid = GetPidOfTid(event_data.new_tid);
   ThreadName thread_name;
   thread_name.set_pid(new_pid.value_or(-1));
-  thread_name.set_tid(event->GetNewTid());
-  thread_name.set_name(event->GetComm());
-  thread_name.set_timestamp_ns(event->GetTimestamp());
+  thread_name.set_tid(event_data.new_tid);
+  thread_name.set_name(event_data.comm);
+  thread_name.set_timestamp_ns(event_timestamp);
   listener_->OnThreadName(std::move(thread_name));
 
-  if (!TidMatchesPidFilter(event->GetNewTid())) {
+  if (!TidMatchesPidFilter(event_data.new_tid)) {
     return;
   }
-  state_manager_.OnNewTask(event->GetTimestamp(), event->GetNewTid());
+  state_manager_.OnNewTask(event_timestamp, event_data.new_tid);
 }
 
-void SwitchesStatesNamesVisitor::Visit(SchedSwitchPerfEvent* event) {
+void SwitchesStatesNamesVisitor::Visit(uint64_t event_timestamp,
+                                       const SchedSwitchPerfEventData& event_data) {
   // Note that context switches with tid 0 are associated with idle CPU, so we never consider them.
 
   // Process the context switch out for scheduling slices.
-  if (produce_scheduling_slices_ && event->GetPrevTid() != 0) {
-    // TracepointPerfEvent::ring_buffer_record.sample_id.pid (which doesn't come from the tracepoint
-    // data, but from the generic field of the PERF_RECORD_SAMPLE) is the pid of the process that
-    // the thread being switched out belongs to. But when the switch out is caused by the thread
-    // exiting, it has value -1. In such cases, use the association between tid and pid that we keep
-    // internally to obtain the process id.
-    pid_t prev_pid = event->GetPrevPidOrMinusOne();
+  if (produce_scheduling_slices_ && event_data.prev_tid != 0) {
+    // SchedSwitchPerfEvent::pid (which doesn't come from the tracepoint data, but from the generic
+    // field of the PERF_RECORD_SAMPLE) is the pid of the process that the thread being switched out
+    // belongs to. But when the switch out is caused by the thread exiting, it has value -1. In such
+    // cases, use the association between tid and pid that we keep internally to obtain the pid.
+    pid_t prev_pid = event_data.prev_pid_or_minus_one;
     if (prev_pid == -1) {
-      if (std::optional<pid_t> fallback_prev_pid = GetPidOfTid(event->GetPrevTid());
+      if (std::optional<pid_t> fallback_prev_pid = GetPidOfTid(event_data.prev_tid);
           fallback_prev_pid.has_value()) {
         prev_pid = fallback_prev_pid.value();
       }
     }
     std::optional<SchedulingSlice> scheduling_slice = switch_manager_.ProcessContextSwitchOut(
-        prev_pid, event->GetPrevTid(), event->GetCpu(), event->GetTimestamp());
+        prev_pid, event_data.prev_tid, event_data.cpu, event_timestamp);
     if (scheduling_slice.has_value()) {
-      CHECK(listener_ != nullptr);
       if (scheduling_slice->pid() == orbit_base::kInvalidProcessId) {
         ERROR("SchedulingSlice with unknown pid");
       }
@@ -130,19 +132,18 @@ void SwitchesStatesNamesVisitor::Visit(SchedSwitchPerfEvent* event) {
   }
 
   // Process the context switch in for scheduling slices.
-  if (produce_scheduling_slices_ && event->GetNextTid() != 0) {
-    std::optional<pid_t> next_pid = GetPidOfTid(event->GetNextTid());
-    switch_manager_.ProcessContextSwitchIn(next_pid, event->GetNextTid(), event->GetCpu(),
-                                           event->GetTimestamp());
+  if (produce_scheduling_slices_ && event_data.next_tid != 0) {
+    std::optional<pid_t> next_pid = GetPidOfTid(event_data.next_tid);
+    switch_manager_.ProcessContextSwitchIn(next_pid, event_data.next_tid, event_data.cpu,
+                                           event_timestamp);
   }
 
   // Process the context switch out for thread state.
-  if (event->GetPrevTid() != 0 && TidMatchesPidFilter(event->GetPrevTid())) {
-    ThreadStateSlice::ThreadState new_state = GetThreadStateFromBits(event->GetPrevState());
+  if (event_data.prev_tid != 0 && TidMatchesPidFilter(event_data.prev_tid)) {
+    ThreadStateSlice::ThreadState new_state = GetThreadStateFromBits(event_data.prev_state);
     std::optional<ThreadStateSlice> out_slice =
-        state_manager_.OnSchedSwitchOut(event->GetTimestamp(), event->GetPrevTid(), new_state);
+        state_manager_.OnSchedSwitchOut(event_timestamp, event_data.prev_tid, new_state);
     if (out_slice.has_value()) {
-      CHECK(listener_ != nullptr);
       listener_->OnThreadStateSlice(std::move(out_slice.value()));
       if (thread_state_counter_ != nullptr) {
         ++(*thread_state_counter_);
@@ -151,11 +152,10 @@ void SwitchesStatesNamesVisitor::Visit(SchedSwitchPerfEvent* event) {
   }
 
   // Process the context switch in for thread state.
-  if (event->GetNextTid() != 0 && TidMatchesPidFilter(event->GetNextTid())) {
+  if (event_data.next_tid != 0 && TidMatchesPidFilter(event_data.next_tid)) {
     std::optional<ThreadStateSlice> in_slice =
-        state_manager_.OnSchedSwitchIn(event->GetTimestamp(), event->GetNextTid());
+        state_manager_.OnSchedSwitchIn(event_timestamp, event_data.next_tid);
     if (in_slice.has_value()) {
-      CHECK(listener_ != nullptr);
       listener_->OnThreadStateSlice(std::move(in_slice.value()));
       if (thread_state_counter_ != nullptr) {
         ++(*thread_state_counter_);
@@ -164,15 +164,15 @@ void SwitchesStatesNamesVisitor::Visit(SchedSwitchPerfEvent* event) {
   }
 }
 
-void SwitchesStatesNamesVisitor::Visit(SchedWakeupPerfEvent* event) {
-  if (!TidMatchesPidFilter(event->GetWokenTid())) {
+void SwitchesStatesNamesVisitor::Visit(uint64_t event_timestamp,
+                                       const SchedWakeupPerfEventData& event_data) {
+  if (!TidMatchesPidFilter(event_data.woken_tid)) {
     return;
   }
 
   std::optional<ThreadStateSlice> state_slice =
-      state_manager_.OnSchedWakeup(event->GetTimestamp(), event->GetWokenTid());
+      state_manager_.OnSchedWakeup(event_timestamp, event_data.woken_tid);
   if (state_slice.has_value()) {
-    CHECK(listener_ != nullptr);
     listener_->OnThreadStateSlice(std::move(state_slice.value()));
     if (thread_state_counter_ != nullptr) {
       ++(*thread_state_counter_);
@@ -183,7 +183,6 @@ void SwitchesStatesNamesVisitor::Visit(SchedWakeupPerfEvent* event) {
 void SwitchesStatesNamesVisitor::ProcessRemainingOpenStates(uint64_t timestamp_ns) {
   std::vector<ThreadStateSlice> state_slices = state_manager_.OnCaptureFinished(timestamp_ns);
   for (ThreadStateSlice& slice : state_slices) {
-    CHECK(listener_ != nullptr);
     listener_->OnThreadStateSlice(slice);
     if (thread_state_counter_ != nullptr) {
       ++(*thread_state_counter_);
@@ -191,13 +190,14 @@ void SwitchesStatesNamesVisitor::ProcessRemainingOpenStates(uint64_t timestamp_n
   }
 }
 
-void SwitchesStatesNamesVisitor::Visit(TaskRenamePerfEvent* event) {
-  std::optional<pid_t> renamed_pid = GetPidOfTid(event->GetRenamedTid());
+void SwitchesStatesNamesVisitor::Visit(uint64_t event_timestamp,
+                                       const TaskRenamePerfEventData& event_data) {
+  std::optional<pid_t> renamed_pid = GetPidOfTid(event_data.renamed_tid);
   ThreadName thread_name;
   thread_name.set_pid(renamed_pid.value_or(-1));
-  thread_name.set_tid(event->GetRenamedTid());
-  thread_name.set_name(event->GetNewComm());
-  thread_name.set_timestamp_ns(event->GetTimestamp());
+  thread_name.set_tid(event_data.renamed_tid);
+  thread_name.set_name(event_data.newcomm);
+  thread_name.set_timestamp_ns(event_timestamp);
   listener_->OnThreadName(std::move(thread_name));
 }
 

@@ -12,16 +12,13 @@
 #include "ClientData/ProcessData.h"
 #include "ClientData/TracepointCustom.h"
 #include "ClientData/UserDefinedCaptureData.h"
+#include "ClientProtos/capture_data.pb.h"
 #include "FuzzingUtils/ProtoFuzzer.h"
+#include "GrpcProtos/capture.pb.h"
+#include "GrpcProtos/services.pb.h"
+#include "GrpcProtos/tracepoint.pb.h"
 #include "OrbitBase/Result.h"
 #include "absl/flags/flag.h"
-#include "capture.pb.h"
-#include "capture_data.pb.h"
-#include "services.pb.h"
-#include "tracepoint.pb.h"
-
-ABSL_FLAG(uint16_t, sampling_rate, 1000, "Frequency of callstack sampling in samples per second");
-ABSL_FLAG(bool, frame_pointer_unwinding, false, "Use frame pointers for unwinding");
 
 namespace orbit_capture_client {
 
@@ -67,6 +64,9 @@ class MyCaptureListener : public CaptureListener {
       orbit_grpc_protos::ErrorEnablingOrbitApiEvent /*error_enabling_orbit_api_event*/) override {}
   void OnErrorEnablingUserSpaceInstrumentationEvent(
       orbit_grpc_protos::ErrorEnablingUserSpaceInstrumentationEvent /*error_event*/) override {}
+  void OnWarningInstrumentingWithUserSpaceInstrumentationEvent(
+      orbit_grpc_protos::WarningInstrumentingWithUserSpaceInstrumentationEvent /*warning_event*/)
+      override {}
   void OnLostPerfRecordsEvent(
       orbit_grpc_protos::LostPerfRecordsEvent /*lost_perf_records_event*/) override {}
   void OnOutOfOrderEventsDiscardedEvent(orbit_grpc_protos::OutOfOrderEventsDiscardedEvent

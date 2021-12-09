@@ -22,6 +22,7 @@
 #include "CaptureViewElement.h"
 #include "ClientData/CallstackData.h"
 #include "ClientData/CaptureData.h"
+#include "ClientProtos/capture_data.pb.h"
 #include "CoreMath.h"
 #include "DisplayFormats/DisplayFormats.h"
 #include "Geometry.h"
@@ -31,17 +32,20 @@
 #include "OrbitAccessibility/AccessibleInterface.h"
 #include "OrbitBase/Append.h"
 #include "OrbitBase/Logging.h"
+#include "OrbitBase/Profiling.h"
 #include "OrbitBase/ThreadConstants.h"
 #include "TextRenderer.h"
-#include "TimeGraph.h"
 #include "TimeGraphLayout.h"
 #include "absl/base/casts.h"
-#include "capture_data.pb.h"
 
 using orbit_accessibility::AccessibleInterface;
 using orbit_accessibility::AccessibleWidgetBridge;
 
 using orbit_client_data::CaptureData;
+
+constexpr const char* kTimingDraw = "Draw";
+constexpr const char* kTimingDrawAndUpdatePrimitives = "Draw & Update Primitives";
+constexpr const char* kTimingFrame = "Complete Frame";
 
 class AccessibleCaptureWindow : public AccessibleWidgetBridge {
  public:
@@ -69,6 +73,11 @@ using orbit_client_protos::TimerInfo;
 
 CaptureWindow::CaptureWindow(OrbitApp* app) : GlCanvas(), app_{app} {
   draw_help_ = true;
+
+  scoped_frame_times_[kTimingDraw] = std::make_unique<orbit_gl::SimpleTimings>(30);
+  scoped_frame_times_[kTimingDrawAndUpdatePrimitives] =
+      std::make_unique<orbit_gl::SimpleTimings>(30);
+  scoped_frame_times_[kTimingFrame] = std::make_unique<orbit_gl::SimpleTimings>(30);
 
   slider_ = std::make_shared<orbit_gl::GlHorizontalSlider>(viewport_);
   vertical_slider_ = std::make_shared<orbit_gl::GlVerticalSlider>(viewport_);
@@ -109,9 +118,11 @@ void CaptureWindow::MouseMoved(int x, int y, bool left, bool right, bool middle)
 
   // Pan
   if (left && !picking_manager_.IsDragging() && !app_->IsCapturing()) {
-    Vec2i mouse_click_screen = viewport_.WorldToScreenPos(mouse_click_pos_world_);
+    Vec2i mouse_click_screen = viewport_.WorldToScreen(mouse_click_pos_world_);
+    Vec2 mouse_pos_world = viewport_.ScreenToWorld({x, y});
+    time_graph_->SetVerticalScrollingOffset(timegraph_click_scrolling_offset_ +
+                                            mouse_click_pos_world_[1] - mouse_pos_world[1]);
     time_graph_->PanTime(mouse_click_screen[0], x, viewport_.GetScreenWidth(), ref_time_click_);
-    RequestUpdatePrimitives();
 
     click_was_drag_ = true;
   }
@@ -129,6 +140,7 @@ void CaptureWindow::LeftDown(int x, int y) {
 
   if (time_graph_ == nullptr) return;
   ref_time_click_ = time_graph_->GetTime(static_cast<double>(x) / viewport_.GetScreenWidth());
+  timegraph_click_scrolling_offset_ = time_graph_->GetVerticalScrollingOffset();
 }
 
 void CaptureWindow::LeftUp() {
@@ -380,6 +392,8 @@ std::unique_ptr<AccessibleInterface> CaptureWindow::CreateAccessibleInterface() 
 
 void CaptureWindow::Draw() {
   ORBIT_SCOPE("CaptureWindow::Draw");
+  uint64_t start_time_ns = orbit_base::CaptureTimestampNs();
+  bool time_graph_was_redrawn = false;
 
   text_renderer_.Init();
 
@@ -392,18 +406,17 @@ void CaptureWindow::Draw() {
   }
 
   if (time_graph_ != nullptr) {
-    // We need to update the visible track list to know the total height of them (used in the
-    // viewport).
-    time_graph_->GetTrackManager()->UpdateTracksForRendering();
-
-    viewport_.SetWorldExtents(viewport_.GetScreenWidth(), time_graph_->GetHeight());
-
+    time_graph_->UpdateLayout();
     UpdateChildrenPosAndSize();
 
+    if (time_graph_->IsRedrawNeeded()) {
+      time_graph_was_redrawn = true;
+    }
+
     uint64_t timegraph_current_mouse_time_ns =
-        time_graph_->GetTickFromWorld(viewport_.ScreenToWorldPos(GetMouseScreenPos())[0]);
-    time_graph_->Draw(GetBatcher(), GetTextRenderer(),
-                      {timegraph_current_mouse_time_ns, picking_mode_, 0, 0});
+        time_graph_->GetTickFromWorld(viewport_.ScreenToWorld(GetMouseScreenPos())[0]);
+    time_graph_->DrawAllElements(GetBatcher(), GetTextRenderer(), picking_mode_,
+                                 timegraph_current_mouse_time_ns);
   }
 
   RenderSelectionOverlay();
@@ -411,10 +424,9 @@ void CaptureWindow::Draw() {
   if (picking_mode_ == PickingMode::kNone) {
     RenderTimeBar();
 
-    Vec2 pos = viewport_.ScreenToWorldPos(Vec2i(mouse_move_pos_screen_[0], 0));
+    Vec2 pos = viewport_.ScreenToWorld(Vec2i(mouse_move_pos_screen_[0], 0));
     // Vertical green line at mouse x position
-    ui_batcher_.AddVerticalLine(pos, viewport_.GetVisibleWorldHeight(), kZValueUi,
-                                Color(0, 255, 0, 127));
+    ui_batcher_.AddVerticalLine(pos, viewport_.GetWorldHeight(), kZValueUi, Color(0, 255, 0, 127));
 
     if (draw_help_) {
       RenderHelpUi();
@@ -427,42 +439,26 @@ void CaptureWindow::Draw() {
     text_renderer_.RenderDebug(&ui_batcher_);
   }
 
-  // Get all layers.
-  std::vector<float> all_layers{};
-  if (time_graph_ != nullptr) {
-    all_layers = time_graph_->GetBatcher().GetLayers();
-    orbit_base::Append(all_layers, time_graph_->GetTextRenderer()->GetLayers());
-  }
-  orbit_base::Append(all_layers, ui_batcher_.GetLayers());
-  orbit_base::Append(all_layers, text_renderer_.GetLayers());
-
-  // Sort and remove duplicates.
-  std::sort(all_layers.begin(), all_layers.end());
-  auto it = std::unique(all_layers.begin(), all_layers.end());
-  all_layers.resize(std::distance(all_layers.begin(), it));
-  if (all_layers.size() > GlCanvas::kMaxNumberRealZLayers) {
-    ERROR("Too many z-layers. The current number is %d", all_layers.size());
-  }
-
-  for (float layer : all_layers) {
-    // We use different coordinate systems for ScreenSpace items (margin, scrollbar, ...)
-    // and for the text than the rest of items inside CaptureWindow. So, we have to switch
-    // between these 2 systems while the layer is changing (with these "Prepare.." functions).
-    if (layer < GlCanvas::kScreenSpaceCutPoint) {
-      PrepareWorldSpaceViewport();
-    }
-    if (time_graph_ != nullptr) {
-      time_graph_->GetBatcher().DrawLayer(layer, picking_mode_ != PickingMode::kNone);
-    }
-    ui_batcher_.DrawLayer(layer, picking_mode_ != PickingMode::kNone);
-
-    PrepareScreenSpaceViewport();
-    // Text needs to be drawn in screen space.
-    if (picking_mode_ == PickingMode::kNone) {
-      text_renderer_.RenderLayer(layer);
-      RenderText(layer);
+  if (picking_mode_ == PickingMode::kNone) {
+    double update_duration_in_ms = (orbit_base::CaptureTimestampNs() - start_time_ns) / 1000000.0;
+    if (time_graph_was_redrawn) {
+      scoped_frame_times_[kTimingDrawAndUpdatePrimitives]->PushTimeMs(update_duration_in_ms);
+    } else {
+      scoped_frame_times_[kTimingDraw]->PushTimeMs(update_duration_in_ms);
     }
   }
+
+  RenderAllLayers();
+
+  if (picking_mode_ == PickingMode::kNone) {
+    if (last_frame_start_time_ != 0) {
+      double frame_duration_in_ms =
+          (orbit_base::CaptureTimestampNs() - last_frame_start_time_) / 1000000.0;
+      scoped_frame_times_[kTimingFrame]->PushTimeMs(frame_duration_in_ms);
+    }
+  }
+
+  last_frame_start_time_ = orbit_base::CaptureTimestampNs();
 }
 
 void CaptureWindow::UpdateChildrenPosAndSize() {
@@ -479,8 +475,16 @@ void CaptureWindow::UpdateChildrenPosAndSize() {
 
   UpdateRightMargin(right_margin);
 
-  time_graph_->SetPos(0, 0);
-  time_graph_->SetWidth(viewport_.GetScreenWidth() - right_margin);
+  time_graph_->SetWidth(viewport_.GetWorldWidth() - right_margin);
+  // HACK: This needs to be done as long as TimeGraph does not properly report its children.
+  // The line above may change the width of TimeGraph (due to the vertical scrollbar
+  // disappearing) and calls TimeGraph::SetWidth().
+  // Usually, TimeGraph::SetWidth() should update the size of all tracks, but due to an
+  // incomplete implementation, this does not happen. Instead, UpdateLayout() resizes the
+  // tracks.
+  // This will be removed once the TimeGraph is implementing the API
+  // correctly.
+  time_graph_->UpdateLayout();
 }
 
 void CaptureWindow::DrawScreenSpace() {
@@ -517,6 +521,36 @@ void CaptureWindow::DrawScreenSpace() {
   }
 }
 
+void CaptureWindow::RenderAllLayers() {
+  std::vector<float> all_layers{};
+  if (time_graph_ != nullptr) {
+    all_layers = time_graph_->GetBatcher().GetLayers();
+    orbit_base::Append(all_layers, time_graph_->GetTextRenderer()->GetLayers());
+  }
+  orbit_base::Append(all_layers, ui_batcher_.GetLayers());
+  orbit_base::Append(all_layers, text_renderer_.GetLayers());
+
+  // Sort and remove duplicates.
+  std::sort(all_layers.begin(), all_layers.end());
+  auto it = std::unique(all_layers.begin(), all_layers.end());
+  all_layers.resize(std::distance(all_layers.begin(), it));
+  if (all_layers.size() > GlCanvas::kMaxNumberRealZLayers) {
+    ERROR("Too many z-layers. The current number is %d", all_layers.size());
+  }
+
+  for (float layer : all_layers) {
+    if (time_graph_ != nullptr) {
+      time_graph_->GetBatcher().DrawLayer(layer, picking_mode_ != PickingMode::kNone);
+    }
+    ui_batcher_.DrawLayer(layer, picking_mode_ != PickingMode::kNone);
+
+    if (picking_mode_ == PickingMode::kNone) {
+      text_renderer_.RenderLayer(layer);
+      RenderText(layer);
+    }
+  }
+}
+
 void CaptureWindow::UpdateHorizontalScroll(float ratio) {
   if (time_graph_ == nullptr) return;
   time_graph_->UpdateHorizontalScroll(ratio);
@@ -524,11 +558,9 @@ void CaptureWindow::UpdateHorizontalScroll(float ratio) {
 
 void CaptureWindow::UpdateVerticalScroll(float ratio) {
   if (time_graph_ == nullptr) return;
-  float min = viewport_.GetWorldMin()[1];
-  float max = viewport_.GetWorldExtents()[1] - viewport_.GetVisibleWorldHeight() - min;
-  float range = max - min;
-  float new_top_left_y = min + ratio * range;
-  viewport_.SetWorldTopLeftY(new_top_left_y);
+  float range = std::max(0.f, time_graph_->GetHeight() - viewport_.GetWorldHeight());
+  float new_scrolling_offset = ratio * range;
+  time_graph_->SetVerticalScrollingOffset(new_scrolling_offset);
 }
 
 void CaptureWindow::UpdateHorizontalZoom(float normalized_start, float normalized_end) {
@@ -571,14 +603,14 @@ void CaptureWindow::ProcessSliderMouseMoveEvents(int x, int y) {
 
 void CaptureWindow::UpdateVerticalSliderFromWorld() {
   if (time_graph_ == nullptr) return;
-  float min = 0.0f;
-  float max = viewport_.GetWorldExtents()[1] - viewport_.GetVisibleWorldHeight();
-  float ratio = (viewport_.GetWorldTopLeft()[1] - min) / (max - min);
-  float vertical_ratio = viewport_.GetVisibleWorldHeight() / viewport_.GetWorldExtents()[1];
+  float max = std::max(0.f, time_graph_->GetHeight() - viewport_.GetWorldHeight());
+  float pos_ratio = max > 0 ? time_graph_->GetVerticalScrollingOffset() / max : 0.f;
+  float size_ratio =
+      time_graph_->GetHeight() > 0 ? viewport_.GetWorldHeight() / time_graph_->GetHeight() : 1.f;
   int slider_width = static_cast<int>(time_graph_->GetLayout().GetSliderWidth());
   vertical_slider_->SetPixelHeight(slider_width);
-  vertical_slider_->SetNormalizedPosition(ratio);
-  vertical_slider_->SetNormalizedLength(vertical_ratio);
+  vertical_slider_->SetNormalizedPosition(pos_ratio);
+  vertical_slider_->SetNormalizedLength(size_ratio);
   vertical_slider_->SetOrthogonalSliderPixelHeight(slider_width);
 }
 
@@ -653,16 +685,12 @@ void CaptureWindow::RenderImGuiDebugUI() {
   if (ImGui::CollapsingHeader("Capture Info")) {
     IMGUI_VAR_TO_TEXT(viewport_.GetScreenWidth());
     IMGUI_VAR_TO_TEXT(viewport_.GetScreenHeight());
-    IMGUI_VAR_TO_TEXT(viewport_.GetVisibleWorldHeight());
-    IMGUI_VAR_TO_TEXT(viewport_.GetVisibleWorldWidth());
-    IMGUI_VAR_TO_TEXT(viewport_.GetWorldTopLeft()[0]);
-    IMGUI_VAR_TO_TEXT(viewport_.GetWorldTopLeft()[1]);
-    IMGUI_VAR_TO_TEXT(viewport_.GetWorldExtents()[0]);
-    IMGUI_VAR_TO_TEXT(viewport_.GetWorldExtents()[1]);
+    IMGUI_VAR_TO_TEXT(viewport_.GetWorldWidth());
+    IMGUI_VAR_TO_TEXT(viewport_.GetWorldHeight());
     IMGUI_VAR_TO_TEXT(mouse_move_pos_screen_[0]);
     IMGUI_VAR_TO_TEXT(mouse_move_pos_screen_[1]);
     if (time_graph_ != nullptr) {
-      IMGUI_VAR_TO_TEXT(time_graph_->GetNumDrawnTextBoxes());
+      IMGUI_VAR_TO_TEXT(time_graph_->GetNumVisiblePrimitives());
       IMGUI_VAR_TO_TEXT(time_graph_->GetTrackManager()->GetAllTracks().size());
       IMGUI_VAR_TO_TEXT(time_graph_->GetMinTimeUs());
       IMGUI_VAR_TO_TEXT(time_graph_->GetMaxTimeUs());
@@ -673,6 +701,17 @@ void CaptureWindow::RenderImGuiDebugUI() {
       if (capture_data != nullptr) {
         IMGUI_VAR_TO_TEXT(capture_data->GetCallstackData().GetCallstackEventsCount());
       }
+    }
+  }
+
+  if (ImGui::CollapsingHeader("Performance")) {
+    for (auto& item : scoped_frame_times_) {
+      IMGUI_VARN_TO_TEXT(item.second->GetAverageTimeMs(),
+                         (std::string("Avg time in ms: ") + item.first));
+      IMGUI_VARN_TO_TEXT(item.second->GetMinTimeMs(),
+                         (std::string("Min time in ms: ") + item.first));
+      IMGUI_VARN_TO_TEXT(item.second->GetMaxTimeMs(),
+                         (std::string("Max time in ms: ") + item.first));
     }
   }
 
@@ -698,7 +737,7 @@ void CaptureWindow::RenderText(float layer) {
 
 void CaptureWindow::RenderHelpUi() {
   constexpr int kOffset = 30;
-  Vec2 world_pos = viewport_.ScreenToWorldPos(Vec2i(kOffset, kOffset));
+  Vec2 world_pos = viewport_.ScreenToWorld(Vec2i(kOffset, kOffset));
 
   Vec2 text_bounding_box_pos;
   Vec2 text_bounding_box_size;
@@ -775,10 +814,10 @@ void CaptureWindow::RenderTimeBar() {
     static constexpr int kPixelMargin = 2;
     int screen_y =
         viewport_.GetScreenHeight() - static_cast<int>(time_bar_height) - slider_->GetPixelHeight();
-    Vec2 world_pos = viewport_.ScreenToWorldPos(Vec2i(0, screen_y));
+    Vec2 world_pos = viewport_.ScreenToWorld(Vec2i(0, screen_y));
 
     float height = time_bar_height - kPixelMargin;
-    float x_margin = viewport_.ScreenToWorldWidth(4);
+    float x_margin = viewport_.ScreenToWorld({4, 0})[0];
 
     for (int i = 0; i < num_time_points; ++i) {
       double current_micros = norm_start_us + i * 1000 * norm_inc;
@@ -790,7 +829,7 @@ void CaptureWindow::RenderTimeBar() {
                              GlCanvas::kZValueTimeBar,
                              {time_graph_->GetLayout().GetFontSize(), Color(255, 255, 255, 255),
                               -1.f, TextRenderer::HAlign::Left, TextRenderer::VAlign::Bottom});
-      int screen_x = viewport_.WorldToScreenPos(Vec2(world_x, 0))[0];
+      int screen_x = viewport_.WorldToScreen(Vec2(world_x, 0))[0];
 
       ui_batcher_.AddVerticalLine(Vec2(screen_x, screen_y), height, GlCanvas::kZValueTimeBar,
                                   Color(255, 255, 255, 255));
@@ -811,8 +850,8 @@ void CaptureWindow::RenderSelectionOverlay() {
   float stop_pos_world = time_graph_->GetWorldFromTick(select_stop_time_);
 
   float size_x = to_world - from_world;
-  Vec2 pos(from_world, viewport_.GetWorldTopLeft()[1]);
-  Vec2 size(size_x, viewport_.GetVisibleWorldHeight());
+  Vec2 pos(from_world, 0);
+  Vec2 size(size_x, viewport_.GetWorldHeight());
 
   std::string text = orbit_display_formats::GetDisplayTime(TicksToDuration(min_time, max_time));
   const Color color(0, 128, 0, 128);
@@ -820,14 +859,16 @@ void CaptureWindow::RenderSelectionOverlay() {
   Box box(pos, size, GlCanvas::kZValueOverlay);
   ui_batcher_.AddBox(box, color);
 
-  const Color text_color(255, 255, 255, 255);
   TextRenderer::HAlign alignment = select_stop_pos_world_[0] < select_start_pos_world_[0]
                                        ? TextRenderer::HAlign::Left
                                        : TextRenderer::HAlign::Right;
+  TextRenderer::TextFormatting formatting;
+  formatting.font_size = time_graph_->GetLayout().CalculateZoomedFontSize();
+  formatting.color = Color(255, 255, 255, 255);
+  formatting.halign = alignment;
 
   text_renderer_.AddText(text.c_str(), stop_pos_world, select_stop_pos_world_[1],
-                         GlCanvas::kZValueTextUi,
-                         {time_graph_->GetLayout().GetFontSize(), text_color, size[0], alignment});
+                         GlCanvas::kZValueTextUi, formatting);
 
   const unsigned char g = 100;
   Color grey(g, g, g, 255);

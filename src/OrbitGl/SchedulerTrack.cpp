@@ -11,23 +11,24 @@
 #include "App.h"
 #include "Batcher.h"
 #include "ClientData/CaptureData.h"
+#include "ClientProtos/capture_data.pb.h"
 #include "OrbitBase/Logging.h"
 #include "OrbitBase/ThreadConstants.h"
-#include "TimeGraph.h"
 #include "TimeGraphLayout.h"
 #include "Viewport.h"
-#include "capture_data.pb.h"
 
 using orbit_client_protos::TimerInfo;
 
 const Color kInactiveColor(100, 100, 100, 255);
+const Color kSamePidColor(140, 140, 140, 255);
 const Color kSelectionColor(0, 128, 255, 255);
 
-SchedulerTrack::SchedulerTrack(CaptureViewElement* parent, TimeGraph* time_graph,
+SchedulerTrack::SchedulerTrack(CaptureViewElement* parent,
+                               const orbit_gl::TimelineInfoInterface* timeline_info,
                                orbit_gl::Viewport* viewport, TimeGraphLayout* layout, OrbitApp* app,
                                const orbit_client_data::CaptureData* capture_data,
-                               orbit_client_data::TrackData* track_data)
-    : TimerTrack(parent, time_graph, viewport, layout, app, capture_data, track_data),
+                               orbit_client_data::TimerData* timer_data)
+    : TimerTrack(parent, timeline_info, viewport, layout, app, capture_data, timer_data),
       num_cores_{0} {
   SetPinned(false);
 }
@@ -40,9 +41,16 @@ void SchedulerTrack::OnTimer(const orbit_client_protos::TimerInfo& timer_info) {
 }
 
 float SchedulerTrack::GetHeight() const {
-  uint32_t num_gaps = std::max(track_data_->GetMaxDepth() - 1, 0u);
-  return GetHeaderHeight() + (track_data_->GetMaxDepth() * layout_->GetTextCoresHeight()) +
+  uint32_t num_gaps = std::max(GetDepth() - 1, 0u);
+  return GetHeaderHeight() + (GetDepth() * layout_->GetTextCoresHeight()) +
          (num_gaps * layout_->GetSpaceBetweenCores()) + layout_->GetTrackContentBottomMargin();
+}
+
+void SchedulerTrack::DoUpdatePrimitives(Batcher& batcher, TextRenderer& text_renderer,
+                                        uint64_t min_tick, uint64_t max_tick,
+                                        PickingMode picking_mode) {
+  ORBIT_SCOPE_WITH_COLOR("SchedulerTrack::DoUpdatePrimitives", kOrbitColorPink);
+  TimerTrack::DoUpdatePrimitives(batcher, text_renderer, min_tick, max_tick, picking_mode);
 }
 
 bool SchedulerTrack::IsTimerActive(const TimerInfo& timer_info) const {
@@ -58,7 +66,8 @@ bool SchedulerTrack::IsTimerActive(const TimerInfo& timer_info) const {
 }
 
 Color SchedulerTrack::GetTimerColor(const TimerInfo& timer_info, bool is_selected,
-                                    bool is_highlighted) const {
+                                    bool is_highlighted,
+                                    const internal::DrawData& draw_data) const {
   if (is_highlighted) {
     return TimerTrack::kHighlightColor;
   }
@@ -66,7 +75,9 @@ Color SchedulerTrack::GetTimerColor(const TimerInfo& timer_info, bool is_selecte
     return kSelectionColor;
   }
   if (!IsTimerActive(timer_info)) {
-    return kInactiveColor;
+    const TimerInfo* selected_timer = draw_data.selected_timer;
+    bool is_same_pid = selected_timer && timer_info.process_id() == selected_timer->process_id();
+    return is_same_pid ? kSamePidColor : kInactiveColor;
   }
   return TimeGraph::GetThreadColor(timer_info.thread_id());
 }
@@ -76,6 +87,23 @@ float SchedulerTrack::GetYFromTimer(const TimerInfo& timer_info) const {
   return GetPos()[1] + GetHeaderHeight() +
          (layout_->GetTextCoresHeight() * static_cast<float>(timer_info.depth())) +
          num_gaps * layout_->GetSpaceBetweenCores();
+}
+
+std::vector<const orbit_client_protos::TimerInfo*> SchedulerTrack::GetScopesInRange(
+    uint64_t start_ns, uint64_t end_ns) const {
+  std::vector<const orbit_client_protos::TimerInfo*> result;
+  for (const orbit_client_data::TimerChain* chain : timer_data_->GetChains()) {
+    for (const auto& block : *chain) {
+      if (!block.Intersects(start_ns, end_ns)) continue;
+      for (uint64_t i = 0; i < block.size(); ++i) {
+        const orbit_client_protos::TimerInfo& timer_info = block[i];
+        if (timer_info.start() <= end_ns && timer_info.end() > start_ns) {
+          result.push_back(&timer_info);
+        }
+      }
+    }
+  }
+  return result;
 }
 
 std::string SchedulerTrack::GetTooltip() const {
